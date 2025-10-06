@@ -1015,6 +1015,8 @@ typedef struct MDB_page {
 #define	P_COUNTED	 0x80		/**< branch page stores subtree counts */
 #define	P_LOOSE		 0x4000		/**< page was dirtied then freed, can be reused */
 #define	P_KEEP		 0x8000		/**< leave this page alone during spill */
+#define MDB_COUNT_ALLOWED_FLAGS \
+	(MDB_COUNT_DISTINCT_KEYS|MDB_COUNT_LOWER_INCL|MDB_COUNT_UPPER_INCL)
 /** @} */
 	uint16_t	mp_flags;		/**< @ref mdb_page */
 #define mp_lower	mp_pb.pb.pb_lower
@@ -1228,17 +1230,6 @@ mdb_node_get_count(const MDB_page *mp, const MDB_node *node)
 	if (IS_BRANCH(mp) && IS_COUNTED(mp))
 		memcpy(&value, node->mn_data, sizeof(value));
 	return value;
-}
-
-static void
-mdb_node_adjust_count(MDB_page *mp, MDB_node *node, int64_t delta)
-{
-	if (IS_BRANCH(mp) && IS_COUNTED(mp)) {
-		uint64_t value;
-		memcpy(&value, node->mn_data, sizeof(value));
-		value = (delta >= 0) ? value + (uint64_t)delta : value - (uint64_t)(-delta);
-		memcpy(node->mn_data, &value, sizeof(value));
-	}
 }
 
 	/** Information about a single database in the environment. */
@@ -1722,6 +1713,124 @@ static void	mdb_xcursor_init2(MDB_cursor *mc, MDB_xcursor *src_mx, int force);
 static int	mdb_drop0(MDB_cursor *mc, int subs);
 static void mdb_default_cmp(MDB_txn *txn, MDB_dbi dbi);
 static int mdb_reader_check0(MDB_env *env, int rlocked, int *dead);
+
+static uint64_t
+mdb_leaf_count(const MDB_page *mp)
+{
+	return NUMKEYS(mp);
+}
+
+static uint64_t
+mdb_branch_sum(const MDB_page *mp)
+{
+	uint64_t total = 0;
+	if (!IS_BRANCH(mp) || !IS_COUNTED(mp))
+		return total;
+	for (indx_t i = 0; i < NUMKEYS(mp); ++i)
+		total += mdb_node_get_count(mp, NODEPTR(mp, i));
+	return total;
+}
+
+static uint64_t mdb_branch_child_count(MDB_cursor *mc, MDB_page *mp, MDB_node *node);
+
+static uint64_t
+mdb_page_count(MDB_cursor *mc, MDB_page *mp)
+{
+	if (IS_LEAF(mp) || IS_LEAF2(mp))
+		return mdb_leaf_count(mp);
+	if (!IS_COUNTED(mp)) {
+		uint64_t total = 0;
+		for (indx_t i = 0; i < NUMKEYS(mp); ++i) {
+			MDB_node *node = NODEPTR(mp, i);
+			total += mdb_branch_child_count(mc, mp, node);
+		}
+		return total;
+	}
+	return mdb_branch_sum(mp);
+}
+
+static uint64_t
+mdb_branch_child_count(MDB_cursor *mc, MDB_page *mp, MDB_node *node)
+{
+	uint64_t count = 0;
+	MDB_page *child;
+	if (mdb_page_get(mc, NODEPGNO(node), &child, NULL) == MDB_SUCCESS) {
+		if (IS_LEAF(child) || IS_LEAF2(child))
+			count = mdb_leaf_count(child);
+		else if (IS_COUNTED(child))
+			count = mdb_branch_sum(child);
+		else
+			count = mdb_page_count(mc, child);
+	}
+	return count;
+}
+
+static void
+mdb_refresh_branch_counts(MDB_cursor *mc, MDB_page *mp)
+{
+	if (!IS_BRANCH(mp) || !IS_COUNTED(mp))
+		return;
+	for (indx_t i = 0; i < NUMKEYS(mp); ++i) {
+		MDB_node *node = NODEPTR(mp, i);
+		uint64_t count = mdb_branch_child_count(mc, mp, node);
+		mdb_node_set_count(mp, node, count);
+	}
+}
+
+static void
+mdb_cursor_refresh_counts(MDB_cursor *mc)
+{
+	if (!(mc->mc_db->md_flags & MDB_COUNTED))
+		return;
+	if (mc->mc_db->md_flags & MDB_DUPSORT)
+		return;
+	for (int level = mc->mc_top; level >= 0; --level) {
+		MDB_page *mp = mc->mc_pg[level];
+		if (mp && IS_BRANCH(mp) && IS_COUNTED(mp))
+			mdb_refresh_branch_counts(mc, mp);
+	}
+}
+
+static int
+mdb_prefix_count(MDB_txn *txn, MDB_dbi dbi, const MDB_val *key,
+	int inclusive, uint64_t *out)
+{
+	MDB_cursor mc;
+	int rc, exact = 0;
+	uint64_t total = 0;
+
+	if (!key) {
+		*out = 0;
+		return MDB_SUCCESS;
+	}
+
+	mdb_cursor_init(&mc, txn, dbi, NULL);
+	rc = mdb_cursor_set(&mc, (MDB_val *)key, NULL, MDB_SET_RANGE, &exact);
+	if (rc == MDB_NOTFOUND) {
+		*out = txn->mt_dbs[dbi].md_entries;
+		return MDB_SUCCESS;
+	}
+	if (rc != MDB_SUCCESS)
+		return rc;
+
+	for (int level = 0; level < mc.mc_top; ++level) {
+		MDB_page *branch = mc.mc_pg[level];
+		if (!IS_COUNTED(branch))
+			continue;
+		for (indx_t i = 0; i < mc.mc_ki[level]; ++i) {
+			MDB_node *node = NODEPTR(branch, i);
+			total += mdb_node_get_count(branch, node);
+		}
+	}
+
+	indx_t idx = mc.mc_ki[mc.mc_top];
+	total += idx;
+	if (inclusive && exact)
+		total += 1;
+
+	*out = total;
+	return MDB_SUCCESS;
+}
 
 /** @cond */
 static MDB_cmp_func	mdb_cmp_memn, mdb_cmp_memnr, mdb_cmp_int, mdb_cmp_cint, mdb_cmp_long;
@@ -8197,6 +8306,10 @@ bad_sub:
 		if (rc == MDB_KEYEXIST)	/* should not happen, we deleted that item */
 			rc = MDB_PROBLEM;
 	}
+	if (rc == MDB_SUCCESS) {
+		mdb_cursor_refresh_counts(mc);
+		return rc;
+	}
 	mc->mc_txn->mt_flags |= MDB_TXN_ERROR;
 	return rc;
 }
@@ -8543,6 +8656,16 @@ update:
 			else
 				memcpy(ndata, data->mv_data, data->mv_size);
 		}
+	}
+
+	if (IS_BRANCH(mp) && IS_COUNTED(mp)) {
+		uint64_t child_count = 0;
+		if (pgno != 0) {
+			MDB_page *child;
+			if (mdb_page_get(mc, pgno, &child, NULL) == MDB_SUCCESS)
+				child_count = mdb_page_count(mc, child);
+		}
+		mdb_node_set_count(mp, node, child_count);
 	}
 
 	return MDB_SUCCESS;
@@ -9606,6 +9729,7 @@ mdb_cursor_del0(MDB_cursor *mc)
 	unsigned int nkeys;
 	MDB_cursor *m2, *m3;
 	MDB_dbi dbi = mc->mc_dbi;
+	int counted = (mc->mc_db->md_flags & MDB_COUNTED) && !(mc->mc_db->md_flags & MDB_DUPSORT);
 
 	ki = mc->mc_ki[mc->mc_top];
 	mp = mc->mc_pg[mc->mc_top];
@@ -9644,7 +9768,7 @@ mdb_cursor_del0(MDB_cursor *mc)
 	 */
 	if (!mc->mc_snum) {
 		mc->mc_flags |= C_EOF;
-		return rc;
+		goto done;
 	}
 
 	mp = mc->mc_pg[mc->mc_top];
@@ -9695,10 +9819,14 @@ mdb_cursor_del0(MDB_cursor *mc)
 		}
 	}
 	mc->mc_flags |= C_DEL;
+	goto done;
 
 fail:
 	if (rc)
 		mc->mc_txn->mt_flags |= MDB_TXN_ERROR;
+done:
+	if (rc == MDB_SUCCESS && counted)
+		mdb_cursor_refresh_counts(mc);
 	return rc;
 }
 
@@ -10941,6 +11069,8 @@ int mdb_dbi_open(MDB_txn *txn, const char *name, unsigned int flags, MDB_dbi *db
 		return EINVAL;
 	if (txn->mt_flags & MDB_TXN_BLOCKED)
 		return MDB_BAD_TXN;
+	if ((flags & MDB_COUNTED) && (flags & MDB_DUPSORT))
+		return MDB_INCOMPATIBLE;
 
 	/* main DB? */
 	if (!name) {
@@ -11036,6 +11166,11 @@ int mdb_dbi_open(MDB_txn *txn, const char *name, unsigned int flags, MDB_dbi *db
 		txn->mt_dbiseqs[slot] = seq;
 
 		memcpy(&txn->mt_dbs[slot], data.mv_data, sizeof(MDB_db));
+		if ((txn->mt_dbs[slot].md_flags & MDB_COUNTED) &&
+		    (txn->mt_dbs[slot].md_flags & MDB_DUPSORT)) {
+			rc = MDB_INCOMPATIBLE;
+			goto leave;
+		}
 		*dbi = slot;
 		mdb_default_cmp(txn, slot);
 		if (!unused) {
@@ -11045,6 +11180,106 @@ int mdb_dbi_open(MDB_txn *txn, const char *name, unsigned int flags, MDB_dbi *db
 	}
 
 	return rc;
+
+leave:
+	free(namedup);
+	return rc;
+}
+
+int ESECT
+mdb_count_all(MDB_txn *txn, MDB_dbi dbi, unsigned flags, uint64_t *out)
+{
+	MDB_db *db;
+	MDB_cursor mc;
+	MDB_page *root;
+	uint64_t total;
+	int rc;
+
+	if (!out || !TXN_DBI_EXIST(txn, dbi, DB_VALID))
+		return EINVAL;
+	if (flags & ~MDB_COUNT_ALLOWED_FLAGS)
+		return EINVAL;
+	db = &txn->mt_dbs[dbi];
+	if (!(db->md_flags & MDB_COUNTED))
+		return MDB_INCOMPATIBLE;
+	if (db->md_flags & MDB_DUPSORT)
+		return MDB_INCOMPATIBLE;
+	if (db->md_root == P_INVALID) {
+		*out = 0;
+		return MDB_SUCCESS;
+	}
+
+	mdb_cursor_init(&mc, txn, dbi, NULL);
+	rc = mdb_page_get(&mc, db->md_root, &root, NULL);
+	if (rc)
+		return rc;
+	if (IS_LEAF(root) || IS_LEAF2(root))
+		total = mdb_leaf_count(root);
+	else if (IS_COUNTED(root))
+		total = mdb_branch_sum(root);
+	else
+		total = mdb_page_count(&mc, root);
+	*out = total;
+	return MDB_SUCCESS;
+}
+
+int ESECT
+mdb_count_range(MDB_txn *txn, MDB_dbi dbi,
+	const MDB_val *low, const MDB_val *high, unsigned flags, uint64_t *out)
+{
+	MDB_db *db;
+	uint64_t lower = 0, upper = 0;
+	int rc;
+	int lower_incl = (flags & MDB_COUNT_LOWER_INCL) != 0;
+	int upper_incl = (flags & MDB_COUNT_UPPER_INCL) != 0;
+
+	if (!out || !TXN_DBI_EXIST(txn, dbi, DB_VALID))
+		return EINVAL;
+	if (flags & ~MDB_COUNT_ALLOWED_FLAGS)
+		return EINVAL;
+	db = &txn->mt_dbs[dbi];
+	if (!(db->md_flags & MDB_COUNTED))
+		return MDB_INCOMPATIBLE;
+	if (db->md_flags & MDB_DUPSORT)
+		return MDB_INCOMPATIBLE;
+
+	if (!db->md_entries) {
+		*out = 0;
+		return MDB_SUCCESS;
+	}
+
+	if (low && high) {
+		MDB_cmp_func *cmp = txn->mt_dbxs[dbi].md_cmp;
+		int c = cmp((MDB_val *)low, (MDB_val *)high);
+		if (c > 0) {
+			*out = 0;
+			return MDB_SUCCESS;
+		}
+		if (c == 0 && !(lower_incl && upper_incl)) {
+			*out = 0;
+			return MDB_SUCCESS;
+		}
+	}
+
+	if (high) {
+		rc = mdb_prefix_count(txn, dbi, high, upper_incl, &upper);
+		if (rc)
+			return rc;
+	} else {
+		rc = mdb_count_all(txn, dbi, flags, &upper);
+		if (rc)
+			return rc;
+	}
+
+	if (low) {
+		int include_self = !lower_incl; /* inclusive lower => exclude self */
+		rc = mdb_prefix_count(txn, dbi, low, include_self, &lower);
+		if (rc)
+			return rc;
+	}
+
+	*out = (upper >= lower) ? (upper - lower) : 0;
+	return MDB_SUCCESS;
 }
 
 int ESECT
