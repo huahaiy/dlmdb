@@ -8306,7 +8306,6 @@ put_sub:
 				}
 			}
 		}
-		return rc;
 bad_sub:
 		if (rc == MDB_KEYEXIST)	/* should not happen, we deleted that item */
 			rc = MDB_PROBLEM;

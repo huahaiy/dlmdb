@@ -365,6 +365,164 @@ test_custom_comparator(MDB_env *env)
     mdb_dbi_close(env, dbi);
 }
 
+static void
+test_overwrite_stability(MDB_env *env)
+{
+    MDB_txn *txn;
+    MDB_dbi dbi;
+    MDB_val key, data;
+    uint64_t total;
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "overwrite begin");
+    CHECK(mdb_dbi_open(txn, "edge_overwrite", MDB_CREATE | MDB_COUNTED, &dbi),
+          "overwrite open");
+
+    key.mv_data = "dup";
+    key.mv_size = 3;
+    data.mv_data = "v1";
+    data.mv_size = 2;
+    CHECK(mdb_put(txn, dbi, &key, &data, 0), "overwrite put initial");
+    CHECK(mdb_txn_commit(txn), "overwrite commit initial");
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "overwrite update begin");
+    data.mv_size = 6;
+    CHECK(mdb_put(txn, dbi, &key, &data, MDB_RESERVE), "overwrite reserve");
+    memset(data.mv_data, 'x', data.mv_size);
+    CHECK(mdb_txn_commit(txn), "overwrite update commit");
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "overwrite read");
+    CHECK(mdb_count_all(txn, dbi, 0, &total), "overwrite count_all");
+    expect_eq(total, 1, "overwrite count remains one");
+
+    uint64_t counted = 0;
+    CHECK(mdb_count_range(txn, dbi, &key, &key,
+                          MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
+                          &counted),
+          "overwrite range");
+    expect_eq(counted, 1, "overwrite range count one");
+
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "overwrite drop begin");
+    CHECK(mdb_drop(txn, dbi, 0), "overwrite drop");
+    CHECK(mdb_txn_commit(txn), "overwrite drop commit");
+
+    mdb_dbi_close(env, dbi);
+}
+
+static void
+test_cursor_deletions(MDB_env *env)
+{
+    const int limit = 1024;
+    MDB_txn *txn;
+    MDB_dbi dbi;
+    MDB_val key, data;
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "cursor del begin");
+    CHECK(mdb_dbi_open(txn, "edge_cursor_del", MDB_CREATE | MDB_COUNTED, &dbi),
+          "cursor del open");
+
+    char kbuf[16];
+    char vbuf[16];
+    for (int i = 0; i < limit; ++i) {
+        snprintf(kbuf, sizeof(kbuf), "c%04d", i);
+        snprintf(vbuf, sizeof(vbuf), "val%04d", i);
+        key.mv_size = strlen(kbuf);
+        key.mv_data = kbuf;
+        data.mv_size = strlen(vbuf);
+        data.mv_data = vbuf;
+        CHECK(mdb_put(txn, dbi, &key, &data, MDB_APPEND), "cursor del append");
+    }
+    CHECK(mdb_txn_commit(txn), "cursor del commit load");
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "cursor del read init");
+    uint64_t total;
+    CHECK(mdb_count_all(txn, dbi, 0, &total), "cursor del count_all init");
+    uint64_t naive_total = naive_count(txn, dbi, NULL, NULL, 1, 1, cmp_key);
+    expect_eq(naive_total, limit, "cursor del naive total");
+    expect_eq(total, limit, "cursor del initial total");
+
+    MDB_val low, high;
+    char lowbuf[16];
+    char highbuf[16];
+    snprintf(lowbuf, sizeof(lowbuf), "c%04d", 0);
+    snprintf(highbuf, sizeof(highbuf), "c%04d", 9);
+    low.mv_size = strlen(lowbuf);
+    low.mv_data = lowbuf;
+    high.mv_size = strlen(highbuf);
+    high.mv_data = highbuf;
+    uint64_t naive = naive_count(txn, dbi, &low, &high, 1, 1, cmp_key);
+    uint64_t counted = 0;
+    CHECK(mdb_count_range(txn, dbi, &low, &high,
+                          MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
+                          &counted),
+          "cursor del front range");
+    expect_eq(counted, naive, "cursor del front compare");
+
+    snprintf(lowbuf, sizeof(lowbuf), "c%04d", limit - 10);
+    snprintf(highbuf, sizeof(highbuf), "c%04d", limit - 1);
+    low.mv_size = strlen(lowbuf);
+    low.mv_data = lowbuf;
+    high.mv_size = strlen(highbuf);
+    high.mv_data = highbuf;
+    naive = naive_count(txn, dbi, &low, &high, 1, 1, cmp_key);
+    CHECK(mdb_count_range(txn, dbi, &low, &high,
+                          MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
+                          &counted),
+          "cursor del back range");
+    expect_eq(counted, naive, "cursor del back compare");
+
+    mdb_txn_abort(txn);
+
+    int remaining = limit;
+    while (remaining > 0) {
+        CHECK(mdb_txn_begin(env, NULL, 0, &txn), "cursor del loop begin");
+        MDB_cursor *cur;
+        CHECK(mdb_cursor_open(txn, dbi, &cur), "cursor del cursor open");
+        MDB_val ckey, cdata;
+        int inner = 0;
+        while (remaining > 0 && inner < 32) {
+            MDB_cursor_op op = inner ? MDB_PREV : MDB_LAST;
+            int rc = mdb_cursor_get(cur, &ckey, &cdata, op);
+            if (rc == MDB_NOTFOUND)
+                break;
+            CHECK(rc, "cursor del get");
+            CHECK(mdb_cursor_del(cur, 0), "cursor del cursor_del");
+            remaining--;
+            inner++;
+        }
+        mdb_cursor_close(cur);
+        CHECK(mdb_txn_commit(txn), "cursor del loop commit");
+
+        CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn),
+              "cursor del verify begin");
+        CHECK(mdb_count_all(txn, dbi, 0, &total), "cursor del verify total");
+        expect_eq(total, (uint64_t)remaining, "cursor del verify count");
+        if (remaining > 0) {
+            int start = remaining > 32 ? remaining - 32 : 0;
+            snprintf(lowbuf, sizeof(lowbuf), "c%04d", start);
+            snprintf(highbuf, sizeof(highbuf), "c%04d", remaining - 1);
+            low.mv_size = strlen(lowbuf);
+            low.mv_data = lowbuf;
+            high.mv_size = strlen(highbuf);
+            high.mv_data = highbuf;
+            naive = naive_count(txn, dbi, &low, &high, 1, 1, cmp_key);
+            CHECK(mdb_count_range(txn, dbi, &low, &high,
+                                  MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
+                                  &counted),
+                  "cursor del verify tail");
+            expect_eq(counted, naive, "cursor del tail compare");
+        }
+        mdb_txn_abort(txn);
+    }
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "cursor del drop begin");
+    CHECK(mdb_drop(txn, dbi, 0), "cursor del drop");
+    CHECK(mdb_txn_commit(txn), "cursor del drop commit");
+
+    mdb_dbi_close(env, dbi);
+}
+
 int
 main(void)
 {
@@ -489,11 +647,11 @@ main(void)
     CHECK(mdb_drop(txn, dbi, 0), "random mdb_drop");
     CHECK(mdb_txn_commit(txn), "random clear commit");
 
-    enum { max_keys = 512 };
+    enum { max_keys = 1024 };
     unsigned char present[max_keys];
     memset(present, 0, sizeof(present));
     int live = 0;
-    const int operations = 2000;
+    const int operations = 4000;
     int performed = 0;
 
     srand(7);
@@ -679,6 +837,8 @@ main(void)
     test_single_key(env);
     test_extreme_keys(env);
     test_custom_comparator(env);
+    test_overwrite_stability(env);
+    test_cursor_deletions(env);
 
     mdb_env_close(env);
     return EXIT_SUCCESS;
