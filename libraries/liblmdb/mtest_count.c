@@ -81,6 +81,20 @@ expect_eq(uint64_t got, uint64_t want, const char *msg)
     }
 }
 
+static void
+check_range_matches(MDB_txn *txn, MDB_dbi dbi,
+                    const MDB_val *low, const MDB_val *high,
+                    unsigned int flags, const char *msg)
+{
+    int lower_incl = (flags & MDB_COUNT_LOWER_INCL) != 0;
+    int upper_incl = (flags & MDB_COUNT_UPPER_INCL) != 0;
+    uint64_t naive = naive_count(txn, dbi, low, high,
+                                 lower_incl, upper_incl, cmp_key);
+    uint64_t counted = 0;
+    CHECK(mdb_count_range(txn, dbi, low, high, flags, &counted), msg);
+    expect_eq(counted, naive, msg);
+}
+
 static int
 reverse_cmp(const MDB_val *a, const MDB_val *b)
 {
@@ -523,6 +537,279 @@ test_cursor_deletions(MDB_env *env)
     mdb_dbi_close(env, dbi);
 }
 
+static void
+verify_windows(MDB_txn *txn, MDB_dbi dbi, const char *tag)
+{
+    static const struct {
+        int low;
+        int high;
+        unsigned int flags;
+    } cases[] = {
+        { -1, 64, MDB_COUNT_UPPER_INCL },
+        { 0, 127, MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL },
+        { 96, 160, MDB_COUNT_LOWER_INCL },
+        { 96, 160, MDB_COUNT_UPPER_INCL },
+        { 512, 256, MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL },
+        { 1500, -1, MDB_COUNT_LOWER_INCL },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        MDB_val low, high;
+        MDB_val *low_ptr = NULL;
+        MDB_val *high_ptr = NULL;
+        char lowbuf[16];
+        char highbuf[16];
+
+        if (cases[i].low >= 0) {
+            snprintf(lowbuf, sizeof(lowbuf), "s%05d", cases[i].low);
+            low.mv_size = strlen(lowbuf);
+            low.mv_data = lowbuf;
+            low_ptr = &low;
+        }
+        if (cases[i].high >= 0) {
+            snprintf(highbuf, sizeof(highbuf), "s%05d", cases[i].high);
+            high.mv_size = strlen(highbuf);
+            high.mv_data = highbuf;
+            high_ptr = &high;
+        }
+
+        char msg[128];
+        snprintf(msg, sizeof(msg), "%s case %zu", tag, i);
+        check_range_matches(txn, dbi, low_ptr, high_ptr,
+                            cases[i].flags, msg);
+    }
+}
+
+static void
+test_split_merge(MDB_env *env)
+{
+    const int initial = 2048;
+    MDB_txn *txn;
+    MDB_dbi dbi;
+    MDB_val key, data;
+    uint64_t total;
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "split begin");
+    CHECK(mdb_dbi_open(txn, "edge_split_merge", MDB_CREATE | MDB_COUNTED,
+                       &dbi), "split open");
+
+    char kbuf[16];
+    char vbuf[16];
+    for (int i = 0; i < initial; ++i) {
+        snprintf(kbuf, sizeof(kbuf), "s%05d", i);
+        snprintf(vbuf, sizeof(vbuf), "val%05d", i);
+        key.mv_size = strlen(kbuf);
+        key.mv_data = kbuf;
+        data.mv_size = strlen(vbuf);
+        data.mv_data = vbuf;
+        CHECK(mdb_put(txn, dbi, &key, &data, MDB_APPEND),
+              "split load append");
+    }
+    CHECK(mdb_txn_commit(txn), "split load commit");
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "split read init");
+    CHECK(mdb_count_all(txn, dbi, 0, &total), "split count_all init");
+    expect_eq(total, initial, "split initial total");
+    verify_windows(txn, dbi, "split initial");
+    mdb_txn_abort(txn);
+
+    int remaining = initial;
+    for (int base = 0; base < initial; base += 128) {
+        CHECK(mdb_txn_begin(env, NULL, 0, &txn), "split delete begin");
+        MDB_cursor *cur;
+        CHECK(mdb_cursor_open(txn, dbi, &cur), "split cursor open");
+        snprintf(kbuf, sizeof(kbuf), "s%05d", base);
+        key.mv_size = strlen(kbuf);
+        key.mv_data = kbuf;
+        MDB_val pdata;
+        int rc = mdb_cursor_get(cur, &key, &pdata, MDB_SET_RANGE);
+        if (rc == MDB_SUCCESS) {
+            int deleted = 0;
+            while (deleted < 64 && remaining > 0) {
+                CHECK(mdb_cursor_del(cur, 0), "split cursor del");
+                remaining--;
+                deleted++;
+                rc = mdb_cursor_get(cur, &key, &pdata, MDB_NEXT);
+                if (rc != MDB_SUCCESS)
+                    break;
+            }
+            if (rc != MDB_SUCCESS && rc != MDB_NOTFOUND)
+                CHECK(rc, "split cursor next");
+        } else if (rc != MDB_NOTFOUND) {
+            CHECK(rc, "split cursor seek");
+        }
+        mdb_cursor_close(cur);
+        CHECK(mdb_txn_commit(txn), "split delete commit");
+
+        CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn),
+              "split verify read");
+        CHECK(mdb_count_all(txn, dbi, 0, &total),
+              "split count_all verify");
+        expect_eq(total, (uint64_t)remaining, "split verify total");
+        verify_windows(txn, dbi, "split verify");
+        mdb_txn_abort(txn);
+
+        if (remaining <= 512)
+            break;
+    }
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "split drop begin");
+    CHECK(mdb_drop(txn, dbi, 0), "split drop");
+    CHECK(mdb_txn_commit(txn), "split drop commit");
+
+    mdb_dbi_close(env, dbi);
+}
+
+static void
+test_nested_transactions(MDB_env *env)
+{
+    MDB_txn *parent;
+    MDB_txn *child;
+    MDB_txn *txn;
+    MDB_dbi dbi;
+    MDB_val key, data;
+    uint64_t total;
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &parent), "nested parent begin");
+    CHECK(mdb_dbi_open(parent, "edge_nested", MDB_CREATE | MDB_COUNTED,
+                       &dbi), "nested open");
+
+    char keybuf[16];
+    char valbuf[16];
+    for (int i = 0; i < 10; ++i) {
+        snprintf(keybuf, sizeof(keybuf), "n%04d", i);
+        snprintf(valbuf, sizeof(valbuf), "p%04d", i);
+        key.mv_size = strlen(keybuf);
+        key.mv_data = keybuf;
+        data.mv_size = strlen(valbuf);
+        data.mv_data = valbuf;
+        CHECK(mdb_put(parent, dbi, &key, &data, MDB_APPEND),
+              "nested parent put");
+    }
+
+    CHECK(mdb_count_all(parent, dbi, 0, &total),
+          "nested parent initial count");
+    expect_eq(total, 10, "nested parent initial total");
+
+    CHECK(mdb_txn_begin(env, parent, 0, &child),
+          "nested child begin abort");
+    for (int i = 10; i < 15; ++i) {
+        snprintf(keybuf, sizeof(keybuf), "n%04d", i);
+        snprintf(valbuf, sizeof(valbuf), "c%04d", i);
+        key.mv_size = strlen(keybuf);
+        key.mv_data = keybuf;
+        data.mv_size = strlen(valbuf);
+        data.mv_data = valbuf;
+        CHECK(mdb_put(child, dbi, &key, &data, MDB_APPEND),
+              "nested child add");
+    }
+    CHECK(mdb_count_all(child, dbi, 0, &total),
+          "nested child count add");
+    expect_eq(total, 15, "nested child add total");
+
+    snprintf(keybuf, sizeof(keybuf), "n%04d", 2);
+    key.mv_size = strlen(keybuf);
+    key.mv_data = keybuf;
+    CHECK(mdb_del(child, dbi, &key, NULL), "nested child del");
+    CHECK(mdb_count_all(child, dbi, 0, &total),
+          "nested child count del");
+    expect_eq(total, 14, "nested child after del");
+
+    MDB_val low, high;
+    char lowbuf[16];
+    char highbuf[16];
+    snprintf(lowbuf, sizeof(lowbuf), "n%04d", 1);
+    low.mv_size = strlen(lowbuf);
+    low.mv_data = lowbuf;
+    snprintf(highbuf, sizeof(highbuf), "n%04d", 12);
+    high.mv_size = strlen(highbuf);
+    high.mv_data = highbuf;
+    check_range_matches(child, dbi, &low, &high,
+                        MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
+                        "nested child abort window");
+    mdb_txn_abort(child);
+
+    CHECK(mdb_count_all(parent, dbi, 0, &total),
+          "nested parent after abort");
+    expect_eq(total, 10, "nested parent retained");
+
+    CHECK(mdb_txn_begin(env, parent, 0, &child),
+          "nested child begin commit");
+    for (int i = 10; i < 20; ++i) {
+        snprintf(keybuf, sizeof(keybuf), "n%04d", i);
+        snprintf(valbuf, sizeof(valbuf), "d%04d", i);
+        key.mv_size = strlen(keybuf);
+        key.mv_data = keybuf;
+        data.mv_size = strlen(valbuf);
+        data.mv_data = valbuf;
+        CHECK(mdb_put(child, dbi, &key, &data, MDB_APPEND),
+              "nested child append");
+    }
+    for (int i = 0; i < 5; ++i) {
+        snprintf(keybuf, sizeof(keybuf), "n%04d", i);
+        key.mv_size = strlen(keybuf);
+        key.mv_data = keybuf;
+        CHECK(mdb_del(child, dbi, &key, NULL), "nested child prune");
+    }
+    CHECK(mdb_count_all(child, dbi, 0, &total),
+          "nested child post prune");
+    expect_eq(total, 15, "nested child post prune total");
+
+    snprintf(lowbuf, sizeof(lowbuf), "n%04d", 0);
+    low.mv_size = strlen(lowbuf);
+    low.mv_data = lowbuf;
+    snprintf(highbuf, sizeof(highbuf), "n%04d", 18);
+    high.mv_size = strlen(highbuf);
+    high.mv_data = highbuf;
+    check_range_matches(child, dbi, &low, &high,
+                        MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
+                        "nested child commit window");
+
+    snprintf(highbuf, sizeof(highbuf), "n%04d", 5);
+    high.mv_size = strlen(highbuf);
+    high.mv_data = highbuf;
+    check_range_matches(child, dbi, NULL, &high,
+                        MDB_COUNT_UPPER_INCL,
+                        "nested child commit head");
+
+    CHECK(mdb_txn_commit(child), "nested child commit");
+
+    CHECK(mdb_count_all(parent, dbi, 0, &total),
+          "nested parent after child");
+    expect_eq(total, 15, "nested parent after child total");
+
+    snprintf(lowbuf, sizeof(lowbuf), "n%04d", 6);
+    low.mv_size = strlen(lowbuf);
+    low.mv_data = lowbuf;
+    snprintf(highbuf, sizeof(highbuf), "n%04d", 19);
+    high.mv_size = strlen(highbuf);
+    high.mv_data = highbuf;
+    check_range_matches(parent, dbi, &low, &high,
+                        MDB_COUNT_LOWER_INCL,
+                        "nested parent post child window");
+
+    CHECK(mdb_txn_commit(parent), "nested parent commit");
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn),
+          "nested verify read");
+    CHECK(mdb_count_all(txn, dbi, 0, &total), "nested final count");
+    expect_eq(total, 15, "nested final total");
+
+    snprintf(lowbuf, sizeof(lowbuf), "n%04d", 7);
+    low.mv_size = strlen(lowbuf);
+    low.mv_data = lowbuf;
+    check_range_matches(txn, dbi, &low, NULL,
+                        MDB_COUNT_LOWER_INCL,
+                        "nested final tail");
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "nested drop begin");
+    CHECK(mdb_drop(txn, dbi, 0), "nested drop");
+    CHECK(mdb_txn_commit(txn), "nested drop commit");
+
+    mdb_dbi_close(env, dbi);
+}
+
 int
 main(void)
 {
@@ -839,6 +1126,8 @@ main(void)
     test_custom_comparator(env);
     test_overwrite_stability(env);
     test_cursor_deletions(env);
+    test_split_merge(env);
+    test_nested_transactions(env);
 
     mdb_env_close(env);
     return EXIT_SUCCESS;
