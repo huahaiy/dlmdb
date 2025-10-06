@@ -31,38 +31,39 @@ cmp_key(const MDB_val *a, const MDB_val *b)
 }
 
 static uint64_t
-naive_count(MDB_txn *txn, MDB_dbi dbi,
-            const MDB_val *low, const MDB_val *high)
+naive_count(MDB_cursor *cur, const MDB_val *low, const MDB_val *high)
 {
-    MDB_cursor *cur;
     MDB_val key, data;
+    int rc;
     uint64_t total = 0;
-    int rc = mdb_cursor_open(txn, dbi, &cur);
-    CHECK(rc, "mdb_cursor_open");
 
-    rc = mdb_cursor_get(cur, &key, &data, MDB_FIRST);
-    while (rc == MDB_SUCCESS) {
-        int include = 1;
-        if (low) {
-            int cmp = cmp_key(&key, low);
-            if (cmp < 0)
-                include = 0;
-        }
-        if (include && high) {
-            int cmp = cmp_key(&key, high);
-            if (cmp > 0) {
-                include = 0;
-                break;
-            }
-        }
-        if (include)
-            total++;
-        rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT);
+    if (low && high && cmp_key(low, high) > 0)
+        return 0;
+
+    if (low) {
+        key = *low;
+        rc = mdb_cursor_get(cur, &key, &data, MDB_SET_RANGE);
+    } else {
+        rc = mdb_cursor_get(cur, &key, &data, MDB_FIRST);
     }
-    if (rc != MDB_NOTFOUND)
-        CHECK(rc, "mdb_cursor_get");
 
-    mdb_cursor_close(cur);
+    if (rc == MDB_NOTFOUND)
+        return 0;
+    CHECK(rc, "mdb_cursor_get range");
+
+    for (;;) {
+        if (!low || cmp_key(&key, low) >= 0) {
+            if (high && cmp_key(&key, high) > 0)
+                break;
+            total++;
+        }
+
+        rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT);
+        if (rc == MDB_NOTFOUND)
+            break;
+        CHECK(rc, "mdb_cursor_get next");
+    }
+
     return total;
 }
 
@@ -176,12 +177,17 @@ main(int argc, char **argv)
     struct timespec t0, t1;
     uint64_t sink = 0;
 
+    MDB_cursor *scan_cur;
+    CHECK(mdb_cursor_open(txn, dbi, &scan_cur), "mdb_cursor_open naive");
+
     clock_gettime(CLOCK_MONOTONIC, &t0);
     for (size_t i = 0; i < queries; ++i) {
-        sink += naive_count(txn, dbi, &lows[i], &highs[i]);
+        sink += naive_count(scan_cur, &lows[i], &highs[i]);
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double naive_ms = elapsed_ms(&t0, &t1);
+
+    mdb_cursor_close(scan_cur);
 
     clock_gettime(CLOCK_MONOTONIC, &t0);
     for (size_t i = 0; i < queries; ++i) {
