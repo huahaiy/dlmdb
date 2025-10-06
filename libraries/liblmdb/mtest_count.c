@@ -197,6 +197,193 @@ main(void)
     expect_eq(total, naive, "range after deletions");
     mdb_txn_abort(txn);
 
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "random clear txn");
+    CHECK(mdb_drop(txn, dbi, 0), "random mdb_drop");
+    CHECK(mdb_txn_commit(txn), "random clear commit");
+
+    enum { max_keys = 512 };
+    unsigned char present[max_keys];
+    memset(present, 0, sizeof(present));
+    int live = 0;
+    const int operations = 2000;
+    int performed = 0;
+
+    srand(7);
+
+    while (performed < operations) {
+        int idx = rand() % max_keys;
+        int want_insert = rand() & 1;
+        int changed = 0;
+
+        CHECK(mdb_txn_begin(env, NULL, 0, &txn), "random op begin");
+        snprintf(keybuf, sizeof(keybuf), "r%04d", idx);
+        key.mv_size = strlen(keybuf);
+        key.mv_data = keybuf;
+        if (want_insert) {
+            if (!present[idx]) {
+                snprintf(databuf, sizeof(databuf), "val%04d", idx);
+                data.mv_size = strlen(databuf);
+                data.mv_data = databuf;
+                rc = mdb_put(txn, dbi, &key, &data, 0);
+                CHECK(rc, "random mdb_put");
+                present[idx] = 1;
+                live++;
+                changed = 1;
+            }
+        } else {
+            if (present[idx]) {
+                rc = mdb_del(txn, dbi, &key, NULL);
+                CHECK(rc, "random mdb_del");
+                present[idx] = 0;
+                live--;
+                changed = 1;
+            }
+        }
+        if (changed) {
+            CHECK(mdb_txn_commit(txn), "random op commit");
+            performed++;
+
+            if ((performed & 7) == 0) {
+                MDB_txn *rtxn;
+                CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &rtxn),
+                      "random read txn");
+                for (int q = 0; q < 6; ++q) {
+                    MDB_val *low_ptr = NULL;
+                    MDB_val *high_ptr = NULL;
+                    MDB_val lowv, highv;
+                    char lowtmp[16];
+                    char hightmp[16];
+                    unsigned range_flags = 0;
+
+                    if (rand() & 1) {
+                        int low_idx = rand() % max_keys;
+                        snprintf(lowtmp, sizeof(lowtmp), "r%04d", low_idx);
+                        lowv.mv_size = strlen(lowtmp);
+                        lowv.mv_data = lowtmp;
+                        low_ptr = &lowv;
+                        if (rand() & 1)
+                            range_flags |= MDB_COUNT_LOWER_INCL;
+                    }
+                    if (rand() & 1) {
+                        int high_idx = rand() % max_keys;
+                        snprintf(hightmp, sizeof(hightmp), "r%04d", high_idx);
+                        highv.mv_size = strlen(hightmp);
+                        highv.mv_data = hightmp;
+                        high_ptr = &highv;
+                        if (rand() & 1)
+                            range_flags |= MDB_COUNT_UPPER_INCL;
+                    }
+
+                    int lower_incl = (range_flags & MDB_COUNT_LOWER_INCL) != 0;
+                    int upper_incl = (range_flags & MDB_COUNT_UPPER_INCL) != 0;
+                    uint64_t naive = naive_count(rtxn, dbi, low_ptr, high_ptr,
+                                                 lower_incl, upper_incl);
+                    char low_desc[24];
+                    char high_desc[24];
+                    if (low_ptr) {
+                        size_t len = low_ptr->mv_size;
+                        if (len >= sizeof(low_desc))
+                            len = sizeof(low_desc) - 1;
+                        memcpy(low_desc, low_ptr->mv_data, len);
+                        low_desc[len] = '\0';
+                    } else {
+                        strcpy(low_desc, "<nil>");
+                    }
+                    if (high_ptr) {
+                        size_t len = high_ptr->mv_size;
+                        if (len >= sizeof(high_desc))
+                            len = sizeof(high_desc) - 1;
+                        memcpy(high_desc, high_ptr->mv_data, len);
+                        high_desc[len] = '\0';
+                    } else {
+                        strcpy(high_desc, "<nil>");
+                    }
+                    uint64_t counted = 0;
+                    CHECK(mdb_count_range(rtxn, dbi, low_ptr, high_ptr,
+                                          range_flags, &counted),
+                          "mdb_count_range random");
+                    char msg[128];
+                    snprintf(msg, sizeof(msg),
+                             "random check %d.%d low=%s high=%s flags=%u",
+                             performed, q, low_desc, high_desc, range_flags);
+                    expect_eq(counted, naive, msg);
+                }
+                CHECK(mdb_count_all(rtxn, dbi, 0, &total),
+                      "count_all random");
+                expect_eq(total, (uint64_t)live, "random total matches");
+                mdb_txn_abort(rtxn);
+            }
+        } else {
+            mdb_txn_abort(txn);
+        }
+    }
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "random final read");
+    CHECK(mdb_count_all(txn, dbi, 0, &total), "random final total");
+    expect_eq(total, (uint64_t)live, "random final count");
+    for (int q = 0; q < 8; ++q) {
+        MDB_val *low_ptr = NULL;
+        MDB_val *high_ptr = NULL;
+        MDB_val lowv, highv;
+        char lowtmp[16];
+        char hightmp[16];
+        unsigned range_flags = 0;
+
+        if (rand() & 1) {
+            int low_idx = rand() % max_keys;
+            snprintf(lowtmp, sizeof(lowtmp), "r%04d", low_idx);
+            lowv.mv_size = strlen(lowtmp);
+            lowv.mv_data = lowtmp;
+            low_ptr = &lowv;
+            if (rand() & 1)
+                range_flags |= MDB_COUNT_LOWER_INCL;
+        }
+        if (rand() & 1) {
+            int high_idx = rand() % max_keys;
+            snprintf(hightmp, sizeof(hightmp), "r%04d", high_idx);
+            highv.mv_size = strlen(hightmp);
+            highv.mv_data = hightmp;
+            high_ptr = &highv;
+            if (rand() & 1)
+                range_flags |= MDB_COUNT_UPPER_INCL;
+        }
+
+        int lower_incl = (range_flags & MDB_COUNT_LOWER_INCL) != 0;
+        int upper_incl = (range_flags & MDB_COUNT_UPPER_INCL) != 0;
+        uint64_t naive = naive_count(txn, dbi, low_ptr, high_ptr,
+                                     lower_incl, upper_incl);
+        uint64_t counted = 0;
+        CHECK(mdb_count_range(txn, dbi, low_ptr, high_ptr,
+                              range_flags, &counted),
+              "mdb_count_range random final");
+        char low_desc[24];
+        char high_desc[24];
+        if (low_ptr) {
+            size_t len = low_ptr->mv_size;
+            if (len >= sizeof(low_desc))
+                len = sizeof(low_desc) - 1;
+            memcpy(low_desc, low_ptr->mv_data, len);
+            low_desc[len] = '\0';
+        } else {
+            strcpy(low_desc, "<nil>");
+        }
+        if (high_ptr) {
+            size_t len = high_ptr->mv_size;
+            if (len >= sizeof(high_desc))
+                len = sizeof(high_desc) - 1;
+            memcpy(high_desc, high_ptr->mv_data, len);
+            high_desc[len] = '\0';
+        } else {
+            strcpy(high_desc, "<nil>");
+        }
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "random final %d low=%s high=%s flags=%u",
+                 q, low_desc, high_desc, range_flags);
+        expect_eq(counted, naive, msg);
+    }
+    mdb_txn_abort(txn);
+
     mdb_env_close(env);
     return EXIT_SUCCESS;
 }

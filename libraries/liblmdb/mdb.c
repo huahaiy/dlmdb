@@ -1796,8 +1796,10 @@ mdb_prefix_count(MDB_txn *txn, MDB_dbi dbi, const MDB_val *key,
 	int inclusive, uint64_t *out)
 {
 	MDB_cursor mc;
-	int rc, exact = 0;
+	int rc;
 	uint64_t total = 0;
+	MDB_val search;
+	MDB_cmp_func *cmp;
 
 	if (!key) {
 		*out = 0;
@@ -1805,13 +1807,16 @@ mdb_prefix_count(MDB_txn *txn, MDB_dbi dbi, const MDB_val *key,
 	}
 
 	mdb_cursor_init(&mc, txn, dbi, NULL);
-	rc = mdb_cursor_set(&mc, (MDB_val *)key, NULL, MDB_SET_RANGE, &exact);
+	search = *key;
+	rc = mdb_cursor_set(&mc, &search, NULL, MDB_SET_RANGE, NULL);
 	if (rc == MDB_NOTFOUND) {
 		*out = txn->mt_dbs[dbi].md_entries;
 		return MDB_SUCCESS;
 	}
 	if (rc != MDB_SUCCESS)
 		return rc;
+	cmp = txn->mt_dbxs[dbi].md_cmp;
+	int exact = (cmp((MDB_val *)key, &search) == 0);
 
 	for (int level = 0; level < mc.mc_top; ++level) {
 		MDB_page *branch = mc.mc_pg[level];
@@ -8711,6 +8716,8 @@ mdb_node_del(MDB_cursor *mc, int ksize)
 
 	node = NODEPTR(mp, indx);
 	sz = NODESIZE + node->mn_ksize;
+	if (IS_BRANCH(mp) && IS_COUNTED(mp))
+		sz += sizeof(uint64_t);
 	if (IS_LEAF(mp)) {
 		if (F_ISSET(node->mn_flags, F_BIGDATA))
 			sz += sizeof(pgno_t);
