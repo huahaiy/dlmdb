@@ -202,9 +202,12 @@ main(int argc, char **argv)
 
     mdb_txn_abort(txn);
 
+    double naive_us = queries ? (naive_ms * 1000.0) / queries : 0.0;
+    double counted_us = queries ? (counted_ms * 1000.0) / queries : 0.0;
+
     printf("Benchmark with %zu entries, %zu queries, span %zu\n", entries, queries, span);
-    printf("Naive cursor scan: %.2f ms\n", naive_ms);
-    printf("Counted API:      %.2f ms\n", counted_ms);
+    printf("Naive cursor scan: %.2f ms (%.2f us/op)\n", naive_ms, naive_us);
+    printf("Counted API:      %.2f ms (%.2f us/op)\n", counted_ms, counted_us);
     printf("(Ignore sink %" PRIu64 " to prevent dead-code elimination)\n", sink);
 
     for (size_t i = 0; i < queries; ++i) {
