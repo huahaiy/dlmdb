@@ -11218,6 +11218,10 @@ mdb_count_all(MDB_txn *txn, MDB_dbi dbi, unsigned flags, uint64_t *out)
 
 	mdb_cursor_init(&mc, txn, dbi, NULL);
 	rc = mdb_page_get(&mc, db->md_root, &root, NULL);
+	if (rc == MDB_PAGE_NOTFOUND && !db->md_entries) {
+		*out = 0;
+		return MDB_SUCCESS;
+	}
 	if (rc)
 		return rc;
 	if (IS_LEAF(root) || IS_LEAF2(root))
