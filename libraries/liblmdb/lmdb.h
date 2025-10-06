@@ -353,6 +353,8 @@ typedef void (MDB_rel_func)(MDB_val *item, void *oldptr, void *newptr, void *rel
 #define MDB_INTEGERDUP	0x20
 	/** with #MDB_DUPSORT, use reverse string dups */
 #define MDB_REVERSEDUP	0x40
+	/** enable counted branch nodes for fast range counts */
+#define MDB_COUNTED	0x80
 	/** create DB if not already existing */
 #define MDB_CREATE		0x40000
 /** @} */
