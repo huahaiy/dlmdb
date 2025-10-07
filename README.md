@@ -8,4 +8,4 @@ features:
 * B+ tree is augmented with order statics (subtree counts), so it supports
   efficient range counts in O(log n).
 * Getting items by rank, i.e. getting ith item, in O(log n).
-* Sample items efficient.
+* Sample items efficiently.
