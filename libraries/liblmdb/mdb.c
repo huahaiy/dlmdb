@@ -1668,6 +1668,8 @@ static int	mdb_page_merge(MDB_cursor *csrc, MDB_cursor *cdst);
 static int	mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata,
 				pgno_t newpgno, unsigned int nflags);
 
+#define MDB_COUNT_HINT_NONE	((uint64_t)~0ULL)
+
 static int  mdb_env_read_header(MDB_env *env, int prev, MDB_meta *meta);
 static MDB_meta *mdb_env_pick_meta(const MDB_env *env);
 static int  mdb_env_write_meta(MDB_txn *txn);
@@ -1678,7 +1680,8 @@ static void mdb_env_close0(MDB_env *env, int excl);
 
 static MDB_node *mdb_node_search(MDB_cursor *mc, MDB_val *key, int *exactp);
 static int  mdb_node_add(MDB_cursor *mc, indx_t indx,
-			    MDB_val *key, MDB_val *data, pgno_t pgno, unsigned int flags);
+			    MDB_val *key, MDB_val *data, pgno_t pgno, unsigned int flags,
+			    MDB_page *child_hint, uint64_t count_hint);
 static void mdb_node_del(MDB_cursor *mc, int ksize);
 static void mdb_node_shrink(MDB_page *mp, indx_t indx);
 static int	mdb_node_move(MDB_cursor *csrc, MDB_cursor *cdst, int fromleft);
@@ -8250,7 +8253,8 @@ new_sub:
 		split_performed = 1;
 	} else {
 		/* There is room already in this leaf page. */
-		rc = mdb_node_add(mc, mc->mc_ki[mc->mc_top], key, rdata, 0, nflags);
+		rc = mdb_node_add(mc, mc->mc_ki[mc->mc_top], key, rdata, 0, nflags,
+		    NULL, MDB_COUNT_HINT_NONE);
 		if (rc == 0) {
 			/* Adjust other cursors pointing to mp */
 			MDB_cursor *m2, *m3;
@@ -8643,7 +8647,8 @@ mdb_branch_size(MDB_env *env, MDB_page *mp, MDB_val *key)
  */
 static int
 mdb_node_add(MDB_cursor *mc, indx_t indx,
-    MDB_val *key, MDB_val *data, pgno_t pgno, unsigned int flags)
+    MDB_val *key, MDB_val *data, pgno_t pgno, unsigned int flags,
+    MDB_page *child_hint, uint64_t count_hint)
 {
 	unsigned int	 i;
 	size_t		 node_size = NODESIZE;
@@ -8654,6 +8659,8 @@ mdb_node_add(MDB_cursor *mc, indx_t indx,
 	MDB_page	*ofp = NULL;		/* overflow page */
 	void		*ndata;
 	size_t		 count_sz = (IS_BRANCH(mp) && IS_COUNTED(mp)) ? sizeof(uint64_t) : 0;
+	MDB_page	*counted_child = child_hint;
+	uint64_t	 child_count = count_hint;
 	DKBUF;
 
 	mdb_cassert(mc, MP_UPPER(mp) >= MP_LOWER(mp));
@@ -8756,11 +8763,13 @@ update:
 	}
 
 	if (IS_BRANCH(mp) && IS_COUNTED(mp)) {
-		uint64_t child_count = 0;
-		if (pgno != 0) {
-			MDB_page *child;
-			if (mdb_page_get(mc, pgno, &child, NULL) == MDB_SUCCESS)
-				child_count = mdb_page_subtree_count(child);
+		if (child_count == MDB_COUNT_HINT_NONE) {
+			if (!counted_child && pgno != 0)
+				mdb_page_get(mc, pgno, &counted_child, NULL);
+			if (counted_child)
+				child_count = mdb_page_subtree_count(counted_child);
+			else
+				child_count = 0;
 		}
 		mdb_node_set_count(mp, node, child_count);
 	}
@@ -9342,7 +9351,12 @@ mdb_node_move(MDB_cursor *csrc, MDB_cursor *cdst, int fromleft)
 
 	/* Add the node to the destination page.
 	 */
-	rc = mdb_node_add(cdst, cdst->mc_ki[cdst->mc_top], &key, &data, srcpg, flags);
+	MDB_page *dstpg = cdst->mc_pg[cdst->mc_top];
+	uint64_t child_hint = MDB_COUNT_HINT_NONE;
+	if (counted && IS_BRANCH(dstpg) && IS_COUNTED(dstpg))
+		child_hint = moved_total;
+	rc = mdb_node_add(cdst, cdst->mc_ki[cdst->mc_top], &key, &data, srcpg, flags,
+	    NULL, child_hint);
 	if (rc != MDB_SUCCESS)
 		return rc;
 
@@ -9552,7 +9566,8 @@ mdb_page_merge(MDB_cursor *csrc, MDB_cursor *cdst)
 		key.mv_size = csrc->mc_db->md_pad;
 		key.mv_data = METADATA(psrc);
 		for (i = 0; i < NUMKEYS(psrc); i++, j++) {
-			rc = mdb_node_add(cdst, j, &key, NULL, 0, 0);
+			rc = mdb_node_add(cdst, j, &key, NULL, 0, 0,
+		    NULL, MDB_COUNT_HINT_NONE);
 			if (rc != MDB_SUCCESS)
 				return rc;
 			key.mv_data = (char *)key.mv_data + key.mv_size;
@@ -9586,15 +9601,22 @@ mdb_page_merge(MDB_cursor *csrc, MDB_cursor *cdst)
 
 			data.mv_size = NODEDSZ(srcnode);
 			data.mv_data = NODEDATA(srcnode);
-			rc = mdb_node_add(cdst, j, &key, &data, NODEPGNO(srcnode), srcnode->mn_flags);
+			uint64_t contrib = 0;
+			if (counted) {
+				if (IS_BRANCH(psrc))
+					contrib = mdb_node_get_count(psrc, srcnode);
+				else
+					contrib = mdb_leaf_entry_contribution(psrc, srcnode);
+			}
+			uint64_t child_hint = MDB_COUNT_HINT_NONE;
+			if (counted && IS_BRANCH(pdst) && IS_COUNTED(pdst))
+				child_hint = contrib;
+			rc = mdb_node_add(cdst, j, &key, &data, NODEPGNO(srcnode),
+			    srcnode->mn_flags, NULL, child_hint);
 			if (rc != MDB_SUCCESS)
 				return rc;
-			if (counted) {
-				uint64_t contrib = IS_BRANCH(psrc) ?
-				    mdb_node_get_count(psrc, srcnode) :
-				    mdb_leaf_entry_contribution(psrc, srcnode);
+			if (counted)
 				moved_total += contrib;
-			}
 		}
 	}
 
@@ -10190,7 +10212,8 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 		new_root = mc->mc_db->md_depth++;
 
 		/* Add left (implicit) pointer. */
-		if ((rc = mdb_node_add(mc, 0, NULL, NULL, mp->mp_pgno, 0)) != MDB_SUCCESS) {
+		if ((rc = mdb_node_add(mc, 0, NULL, NULL, mp->mp_pgno, 0,
+		    mp, MDB_COUNT_HINT_NONE)) != MDB_SUCCESS) {
 			/* undo the pre-push */
 			mc->mc_pg[0] = mc->mc_pg[1];
 			mc->mc_ki[0] = mc->mc_ki[1];
@@ -10387,7 +10410,8 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 		}
 	} else {
 		mn.mc_top--;
-		rc = mdb_node_add(&mn, mn.mc_ki[ptop], &sepkey, NULL, rp->mp_pgno, 0);
+		rc = mdb_node_add(&mn, mn.mc_ki[ptop], &sepkey, NULL, rp->mp_pgno, 0,
+		    rp, MDB_COUNT_HINT_NONE);
 		mn.mc_top++;
 	}
 	if (rc != MDB_SUCCESS) {
@@ -10398,7 +10422,8 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 	if (nflags & MDB_APPEND) {
 		mc->mc_pg[mc->mc_top] = rp;
 		mc->mc_ki[mc->mc_top] = 0;
-		rc = mdb_node_add(mc, 0, newkey, newdata, newpgno, nflags);
+		rc = mdb_node_add(mc, 0, newkey, newdata, newpgno, nflags,
+		    NULL, MDB_COUNT_HINT_NONE);
 		if (rc)
 			goto done;
 		if (track_counts) {
@@ -10452,7 +10477,11 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 
 			MDB_page *dest = mc->mc_pg[mc->mc_top];
 			indx_t dest_index = j;
-			rc = mdb_node_add(mc, j, &rkey, rdata, pgno, flags);
+			uint64_t child_hint = MDB_COUNT_HINT_NONE;
+			if (!IS_LEAF(mp) && IS_BRANCH(dest) && IS_COUNTED(dest) && i != newindx)
+				child_hint = mdb_node_get_count(mp, node);
+			rc = mdb_node_add(mc, j, &rkey, rdata, pgno, flags,
+			    NULL, child_hint);
 			if (rc)
 				goto done;
 			if (track_counts) {
