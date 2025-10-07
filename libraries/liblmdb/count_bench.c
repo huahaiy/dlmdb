@@ -412,6 +412,7 @@ main(int argc, char **argv)
 
     double naive_us = queries ? (naive_ms * 1000.0) / queries : 0.0;
     double counted_us = queries ? (counted_ms * 1000.0) / queries : 0.0;
+    double range_speedup = (counted_ms > 0.0) ? naive_ms / counted_ms : 0.0;
 
     printf("Benchmark with %zu entries, %zu queries, span %zu\n", entries, queries, span);
     printf("Insert order: %s\n", shuffle ? "shuffled" : "monotonic");
@@ -422,7 +423,13 @@ main(int argc, char **argv)
         insert_overhead_pct);
     printf("Naive cursor scan: %.2f ms (%.2f us/op)\n", naive_ms, naive_us);
     printf("Counted API:      %.2f ms (%.2f us/op)\n", counted_ms, counted_us);
-    printf("(Ignore sink %" PRIu64 " to prevent dead-code elimination)\n", sink);
+    if (counted_ms > 0.0)
+        printf("Range count speedup: %.2fx\n", range_speedup);
+    else
+        printf("Range count speedup: N/A\n");
+
+    volatile uint64_t sink_guard = sink;
+    (void)sink_guard;
 
     if (!shuffle && insert_overhead_ms < 0.0) {
         printf("Sequential inserts minimize overhead; use --shuffle to randomize load.\n");
