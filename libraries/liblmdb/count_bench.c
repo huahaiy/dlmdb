@@ -68,7 +68,7 @@ naive_count(MDB_cursor *cur, const MDB_val *low, const MDB_val *high)
 }
 
 static int
-naive_count_values(MDB_txn *txn, MDB_dbi dbi,
+cursor_count_values(MDB_txn *txn, MDB_dbi dbi,
     MDB_cursor *keycur,
     const MDB_val *key_low, const MDB_val *key_high, unsigned key_flags,
     uint64_t *out)
@@ -690,9 +690,9 @@ main(int argc, char **argv)
             dup_overhead_pct);
     }
 
-    double dup_naive_ms = 0.0;
+    double dup_cursor_ms = 0.0;
     double dup_counted_ms = 0.0;
-    double dup_naive_us = 0.0;
+    double dup_cursor_us = 0.0;
     double dup_counted_us = 0.0;
     double dup_speedup = 0.0;
 
@@ -724,16 +724,16 @@ main(int argc, char **argv)
         clock_gettime(CLOCK_MONOTONIC, &t0);
         for (size_t i = 0; i < queries; ++i) {
             uint64_t counted = 0;
-            int rc = naive_count_values(dup_txn, dup_dbi, dup_keycur,
+            int rc = cursor_count_values(dup_txn, dup_dbi, dup_keycur,
                 queries ? &lows[i] : NULL,
                 queries ? &highs[i] : NULL,
                 MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
                 &counted);
-            CHECK(rc, "naive_count_values");
+            CHECK(rc, "cursor_count_values");
             sink += counted;
         }
         clock_gettime(CLOCK_MONOTONIC, &t1);
-        dup_naive_ms = elapsed_ms(&t0, &t1);
+        dup_cursor_ms = elapsed_ms(&t0, &t1);
 
         clock_gettime(CLOCK_MONOTONIC, &t0);
         for (size_t i = 0; i < queries; ++i) {
@@ -756,14 +756,14 @@ main(int argc, char **argv)
         have_dup_env = 0;
         remove_dir("./benchdb_count_dup");
 
-        dup_naive_us = (dup_naive_ms * 1000.0) / queries;
+        dup_cursor_us = (dup_cursor_ms * 1000.0) / queries;
         dup_counted_us = (dup_counted_ms * 1000.0) / queries;
         dup_speedup = (dup_counted_ms > 0.0) ?
-            (dup_naive_ms / dup_counted_ms) : 0.0;
+            (dup_cursor_ms / dup_counted_ms) : 0.0;
 
         printf("Dupsort dup/key:  %zu\n", dupcount);
-        printf("Dup cursor scan: %.2f ms (%.2f us/op)\n",
-            dup_naive_ms, dup_naive_us);
+        printf("Dup cursor count: %.2f ms (%.2f us/op)\n",
+            dup_cursor_ms, dup_cursor_us);
         printf("Dup counted API: %.2f ms (%.2f us/op)\n",
             dup_counted_ms, dup_counted_us);
         if (dup_counted_ms > 0.0)

@@ -8368,10 +8368,8 @@ prep_subDB:
 						dummy.md_pad = 0;
 						dummy.md_flags = 0;
 					}
-					if (mc->mc_db->md_flags & MDB_COUNTED)
-						dummy.md_flags |= MDB_COUNTED;
-					dummy.md_depth = 1;
-					dummy.md_branch_pages = 0;
+				dummy.md_depth = 1;
+				dummy.md_branch_pages = 0;
 					dummy.md_leaf_pages = 1;
 					dummy.md_overflow_pages = 0;
 					dummy.md_entries = NUMKEYS(fp);
@@ -9204,9 +9202,8 @@ mdb_xcursor_init1(MDB_cursor *mc, MDB_node *node)
 			if (mc->mc_db->md_flags & MDB_INTEGERDUP)
 				mx->mx_db.md_flags |= MDB_INTEGERKEY;
 		}
+		/* Keep dupsort sub-DBs uncounted to avoid extra write maintenance. */
 	}
-	if (mc->mc_db->md_flags & MDB_COUNTED)
-		mx->mx_db.md_flags |= MDB_COUNTED;
 	DPRINTF(("Sub-db -%u root page %"Yu, mx->mx_cursor.mc_dbi,
 		mx->mx_db.md_root));
 	mx->mx_dbflag = DB_VALID|DB_USRVALID|DB_DUPDATA;
