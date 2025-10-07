@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <pthread.h>
 
 #define CHECK(rc, msg) do { \
     if ((rc) != MDB_SUCCESS) { \
@@ -27,6 +28,13 @@ cmp_key(const MDB_val *a, const MDB_val *b)
     if (a->mv_size > b->mv_size)
         return 1;
     return 0;
+}
+
+static unsigned int
+next_rand(unsigned int *state)
+{
+    *state = (*state * 1103515245u) + 12345u;
+    return *state;
 }
 
 static uint64_t
@@ -99,6 +107,299 @@ static int
 reverse_cmp(const MDB_val *a, const MDB_val *b)
 {
     return cmp_key(b, a);
+}
+
+struct concurrency_ctx {
+    MDB_env *env;
+    MDB_dbi dbi;
+    int max_keys;
+    int per_txn_ops;
+    int reader_queries;
+    int iterations;
+    volatile int stop;
+    unsigned char *present;
+    int present_total;
+};
+
+static void *
+count_reader_thread(void *arg)
+{
+    struct concurrency_ctx *ctx = (struct concurrency_ctx *)arg;
+    pthread_t self = pthread_self();
+    uintptr_t ident = (uintptr_t)self;
+    unsigned int seed = (unsigned int)(ident ^ 0x13579bdu);
+
+    while (!ctx->stop) {
+        MDB_txn *txn;
+        CHECK(mdb_txn_begin(ctx->env, NULL, MDB_RDONLY, &txn),
+              "concurrent reader begin");
+
+        for (int q = 0; q < ctx->reader_queries; ++q) {
+            MDB_val low, high;
+            MDB_val *low_ptr = NULL;
+            MDB_val *high_ptr = NULL;
+            unsigned int flags = 0;
+            char lowbuf[16];
+            char highbuf[16];
+
+            if (next_rand(&seed) & 1u) {
+                int low_idx = (int)(next_rand(&seed) % ctx->max_keys);
+                snprintf(lowbuf, sizeof(lowbuf), "c%05d", low_idx);
+                low.mv_size = strlen(lowbuf);
+                low.mv_data = lowbuf;
+                low_ptr = &low;
+                if (next_rand(&seed) & 1u)
+                    flags |= MDB_COUNT_LOWER_INCL;
+            }
+
+            if (next_rand(&seed) & 1u) {
+                int high_idx = (int)(next_rand(&seed) % ctx->max_keys);
+                snprintf(highbuf, sizeof(highbuf), "c%05d", high_idx);
+                high.mv_size = strlen(highbuf);
+                high.mv_data = highbuf;
+                high_ptr = &high;
+                if (next_rand(&seed) & 1u)
+                    flags |= MDB_COUNT_UPPER_INCL;
+            }
+
+            int lower_incl = (flags & MDB_COUNT_LOWER_INCL) != 0;
+            int upper_incl = (flags & MDB_COUNT_UPPER_INCL) != 0;
+            uint64_t naive = naive_count(txn, ctx->dbi, low_ptr, high_ptr,
+                                         lower_incl, upper_incl, cmp_key);
+            uint64_t counted = 0;
+            CHECK(mdb_count_range(txn, ctx->dbi, low_ptr, high_ptr,
+                                  flags, &counted),
+                  "concurrent reader range");
+            expect_eq(counted, naive, "concurrent reader snapshot");
+        }
+
+        uint64_t total = 0;
+        CHECK(mdb_count_all(txn, ctx->dbi, 0, &total),
+              "concurrent reader count_all");
+        uint64_t naive_full = naive_count(txn, ctx->dbi, NULL, NULL, 1, 1,
+                                          cmp_key);
+        expect_eq(total, naive_full, "concurrent reader total");
+        mdb_txn_abort(txn);
+    }
+
+    return NULL;
+}
+
+static void *
+count_writer_thread(void *arg)
+{
+    struct concurrency_ctx *ctx = (struct concurrency_ctx *)arg;
+    unsigned int seed = 0x2468aceu;
+
+    for (int iter = 0; iter < ctx->iterations; ++iter) {
+        MDB_txn *txn;
+        CHECK(mdb_txn_begin(ctx->env, NULL, 0, &txn),
+              "concurrent writer begin");
+
+        for (int op = 0; op < ctx->per_txn_ops; ++op) {
+            int idx = (int)(next_rand(&seed) % ctx->max_keys);
+            char keybuf[16];
+            snprintf(keybuf, sizeof(keybuf), "c%05d", idx);
+
+            MDB_val key;
+            key.mv_size = strlen(keybuf);
+            key.mv_data = keybuf;
+
+            if (ctx->present[idx]) {
+                if (next_rand(&seed) & 1u) {
+                    int rc = mdb_del(txn, ctx->dbi, &key, NULL);
+                    if (rc == MDB_SUCCESS) {
+                        ctx->present[idx] = 0;
+                        ctx->present_total--;
+                    } else if (rc != MDB_NOTFOUND) {
+                        CHECK(rc, "concurrent writer delete");
+                    }
+                } else {
+                    MDB_val data;
+                    data.mv_size = 8;
+                    data.mv_data = NULL;
+                    CHECK(mdb_put(txn, ctx->dbi, &key, &data, MDB_RESERVE),
+                          "concurrent writer update");
+                    memset(data.mv_data, 'u', data.mv_size);
+                }
+            } else {
+                char valbuf[24];
+                snprintf(valbuf, sizeof(valbuf), "val%05d-%d",
+                         idx, iter);
+                MDB_val data;
+                data.mv_size = strlen(valbuf);
+                data.mv_data = valbuf;
+                CHECK(mdb_put(txn, ctx->dbi, &key, &data, 0),
+                      "concurrent writer insert");
+                ctx->present[idx] = 1;
+                ctx->present_total++;
+            }
+        }
+
+        CHECK(mdb_txn_commit(txn), "concurrent writer commit");
+
+        if ((iter & 0x0f) == 0) {
+            MDB_txn *rtxn;
+            CHECK(mdb_txn_begin(ctx->env, NULL, MDB_RDONLY, &rtxn),
+                  "concurrent verify begin");
+
+            uint64_t total = 0;
+            CHECK(mdb_count_all(rtxn, ctx->dbi, 0, &total),
+                  "concurrent verify total");
+            expect_eq(total, (uint64_t)ctx->present_total,
+                      "concurrent writer total check");
+
+            for (int q = 0; q < 4; ++q) {
+                MDB_val low, high;
+                MDB_val *low_ptr = NULL;
+                MDB_val *high_ptr = NULL;
+                unsigned int flags = 0;
+                char lowbuf[16];
+                char highbuf[16];
+
+                if (next_rand(&seed) & 1u) {
+                    int low_idx = (int)(next_rand(&seed) % ctx->max_keys);
+                    snprintf(lowbuf, sizeof(lowbuf), "c%05d", low_idx);
+                    low.mv_size = strlen(lowbuf);
+                    low.mv_data = lowbuf;
+                    low_ptr = &low;
+                    if (next_rand(&seed) & 1u)
+                        flags |= MDB_COUNT_LOWER_INCL;
+                }
+
+                if (next_rand(&seed) & 1u) {
+                    int high_idx = (int)(next_rand(&seed) % ctx->max_keys);
+                    snprintf(highbuf, sizeof(highbuf), "c%05d", high_idx);
+                    high.mv_size = strlen(highbuf);
+                    high.mv_data = highbuf;
+                    high_ptr = &high;
+                    if (next_rand(&seed) & 1u)
+                        flags |= MDB_COUNT_UPPER_INCL;
+                }
+
+                int lower_incl = (flags & MDB_COUNT_LOWER_INCL) != 0;
+                int upper_incl = (flags & MDB_COUNT_UPPER_INCL) != 0;
+                uint64_t naive = naive_count(rtxn, ctx->dbi, low_ptr, high_ptr,
+                                             lower_incl, upper_incl, cmp_key);
+                uint64_t counted = 0;
+                CHECK(mdb_count_range(rtxn, ctx->dbi, low_ptr, high_ptr,
+                                      flags, &counted),
+                      "concurrent writer range");
+                expect_eq(counted, naive,
+                          "concurrent writer range cross");
+            }
+
+            mdb_txn_abort(rtxn);
+        }
+    }
+
+    ctx->stop = 1;
+    return NULL;
+}
+
+static void
+test_concurrent_readers(void)
+{
+    const char *dir = "./testdb_count_concurrent";
+    if (mkdir(dir, 0775) && errno != EEXIST) {
+        perror("mkdir testdb_count_concurrent");
+        exit(EXIT_FAILURE);
+    }
+    if (chmod(dir, 0775) && errno != EPERM)
+        perror("chmod testdb_count_concurrent");
+
+    unlink("./testdb_count_concurrent/data.mdb");
+    unlink("./testdb_count_concurrent/lock.mdb");
+
+    MDB_env *env;
+    MDB_txn *txn;
+    MDB_dbi dbi;
+    struct concurrency_ctx ctx;
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.max_keys = 2048;
+    ctx.per_txn_ops = 8;
+    ctx.reader_queries = 6;
+    ctx.iterations = 256;
+    ctx.present = calloc((size_t)ctx.max_keys, sizeof(unsigned char));
+    if (!ctx.present) {
+        fprintf(stderr, "failed to allocate concurrency bitmap\n");
+        exit(EXIT_FAILURE);
+    }
+
+    CHECK(mdb_env_create(&env), "concurrent env create");
+    CHECK(mdb_env_set_maxdbs(env, 4), "concurrent env maxdbs");
+    CHECK(mdb_env_open(env, dir, MDB_NOLOCK, 0664), "concurrent env open");
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "concurrent setup begin");
+    CHECK(mdb_dbi_open(txn, "concurrent", MDB_CREATE | MDB_COUNTED, &dbi),
+          "concurrent dbi open");
+
+    for (int i = 0; i < ctx.max_keys / 4; ++i) {
+        char keybuf[16];
+        char valbuf[24];
+        snprintf(keybuf, sizeof(keybuf), "c%05d", i);
+        snprintf(valbuf, sizeof(valbuf), "init%05d", i);
+        MDB_val key;
+        MDB_val data;
+        key.mv_size = strlen(keybuf);
+        key.mv_data = keybuf;
+        data.mv_size = strlen(valbuf);
+        data.mv_data = valbuf;
+        CHECK(mdb_put(txn, dbi, &key, &data, 0), "concurrent preload");
+        ctx.present[i] = 1;
+        ctx.present_total++;
+    }
+
+    CHECK(mdb_txn_commit(txn), "concurrent setup commit");
+
+    ctx.env = env;
+    ctx.dbi = dbi;
+    ctx.stop = 0;
+
+    pthread_t readers[3];
+    for (size_t r = 0; r < sizeof(readers) / sizeof(readers[0]); ++r) {
+        if (pthread_create(&readers[r], NULL, count_reader_thread, &ctx)) {
+            fprintf(stderr, "pthread_create reader failed\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    pthread_t writer;
+    if (pthread_create(&writer, NULL, count_writer_thread, &ctx)) {
+        fprintf(stderr, "pthread_create writer failed\n");
+        exit(EXIT_FAILURE);
+    }
+
+    if (pthread_join(writer, NULL)) {
+        fprintf(stderr, "pthread_join writer failed\n");
+        exit(EXIT_FAILURE);
+    }
+
+    ctx.stop = 1;
+
+    for (size_t r = 0; r < sizeof(readers) / sizeof(readers[0]); ++r) {
+        if (pthread_join(readers[r], NULL)) {
+            fprintf(stderr, "pthread_join reader failed\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn),
+          "concurrent final begin");
+    uint64_t total = 0;
+    CHECK(mdb_count_all(txn, dbi, 0, &total), "concurrent final total");
+    expect_eq(total, (uint64_t)ctx.present_total, "concurrent final check");
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "concurrent drop begin");
+    CHECK(mdb_drop(txn, dbi, 0), "concurrent drop");
+    CHECK(mdb_txn_commit(txn), "concurrent drop commit");
+
+    mdb_dbi_close(env, dbi);
+    mdb_env_close(env);
+    free(ctx.present);
+
 }
 
 static void
@@ -377,6 +678,158 @@ test_custom_comparator(MDB_env *env)
 
     mdb_txn_abort(txn);
     mdb_dbi_close(env, dbi);
+}
+
+static void
+test_fuzz_random(MDB_env *env)
+{
+    const int max_keys = 2048;
+    const int rounds = 200;
+    const int ops_per_round = 24;
+    unsigned int seed = 0x7f4a7u;
+    unsigned char *present;
+    int live = 0;
+
+    present = calloc((size_t)max_keys, sizeof(unsigned char));
+    if (!present) {
+        fprintf(stderr, "failed to allocate fuzz bitmap\n");
+        exit(EXIT_FAILURE);
+    }
+
+    MDB_txn *txn;
+    MDB_dbi dbi;
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "fuzz begin");
+    CHECK(mdb_dbi_open(txn, "edge_fuzz_random", MDB_CREATE | MDB_COUNTED,
+                       &dbi),
+          "fuzz open");
+    CHECK(mdb_txn_commit(txn), "fuzz commit open");
+
+    for (int round = 0; round < rounds; ++round) {
+        CHECK(mdb_txn_begin(env, NULL, 0, &txn), "fuzz round begin");
+        for (int op = 0; op < ops_per_round; ++op) {
+            int idx = (int)(next_rand(&seed) % max_keys);
+            char keybuf[16];
+            snprintf(keybuf, sizeof(keybuf), "f%05d", idx);
+
+            MDB_val key;
+            key.mv_size = strlen(keybuf);
+            key.mv_data = keybuf;
+
+            unsigned int action = next_rand(&seed) % 3u;
+            if (action == 0) {
+                char valbuf[24];
+                snprintf(valbuf, sizeof(valbuf), "val%05d-%03u",
+                         idx, (unsigned)(next_rand(&seed) & 0x3ffu));
+                MDB_val data;
+                data.mv_size = strlen(valbuf);
+                data.mv_data = valbuf;
+                int rc = mdb_put(txn, dbi, &key, &data, MDB_NOOVERWRITE);
+                if (rc == MDB_KEYEXIST) {
+                    data.mv_size = 12;
+                    data.mv_data = NULL;
+                    CHECK(mdb_put(txn, dbi, &key, &data, MDB_RESERVE),
+                          "fuzz update reserve");
+                    memset(data.mv_data, 'r', data.mv_size);
+                } else {
+                    CHECK(rc, "fuzz insert");
+                    if (!present[idx]) {
+                        present[idx] = 1;
+                        live++;
+                    }
+                }
+            } else if (action == 1) {
+                if (present[idx]) {
+                    int rc = mdb_del(txn, dbi, &key, NULL);
+                    if (rc == MDB_SUCCESS) {
+                        present[idx] = 0;
+                        live--;
+                    } else if (rc != MDB_NOTFOUND) {
+                        CHECK(rc, "fuzz delete");
+                    }
+                }
+            } else {
+                if (present[idx]) {
+                    MDB_val data;
+                    data.mv_size = 16;
+                    data.mv_data = NULL;
+                    CHECK(mdb_put(txn, dbi, &key, &data, MDB_RESERVE),
+                          "fuzz overwrite reserve");
+                    memset(data.mv_data, 's', data.mv_size);
+                } else {
+                    char valbuf[24];
+                    snprintf(valbuf, sizeof(valbuf), "alt%05d", idx);
+                    MDB_val data;
+                    data.mv_size = strlen(valbuf);
+                    data.mv_data = valbuf;
+                    CHECK(mdb_put(txn, dbi, &key, &data, 0),
+                          "fuzz alt insert");
+                    present[idx] = 1;
+                    live++;
+                }
+            }
+        }
+
+        CHECK(mdb_txn_commit(txn), "fuzz round commit");
+
+        CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn),
+              "fuzz verify begin");
+        uint64_t total;
+        CHECK(mdb_count_all(txn, dbi, 0, &total), "fuzz count_all");
+        expect_eq(total, (uint64_t)live, "fuzz total matches");
+
+        for (int q = 0; q < 12; ++q) {
+            MDB_val low, high;
+            MDB_val *low_ptr = NULL;
+            MDB_val *high_ptr = NULL;
+            unsigned int flags = 0;
+            char lowbuf[16];
+            char highbuf[16];
+
+            if (next_rand(&seed) & 1u) {
+                int low_idx = (int)(next_rand(&seed) % max_keys);
+                snprintf(lowbuf, sizeof(lowbuf), "f%05d", low_idx);
+                low.mv_size = strlen(lowbuf);
+                low.mv_data = lowbuf;
+                low_ptr = &low;
+                if (next_rand(&seed) & 1u)
+                    flags |= MDB_COUNT_LOWER_INCL;
+            }
+
+            if (next_rand(&seed) & 1u) {
+                int high_idx = (int)(next_rand(&seed) % max_keys);
+                snprintf(highbuf, sizeof(highbuf), "f%05d", high_idx);
+                high.mv_size = strlen(highbuf);
+                high.mv_data = highbuf;
+                high_ptr = &high;
+                if (next_rand(&seed) & 1u)
+                    flags |= MDB_COUNT_UPPER_INCL;
+            }
+
+            int lower_incl = (flags & MDB_COUNT_LOWER_INCL) != 0;
+            int upper_incl = (flags & MDB_COUNT_UPPER_INCL) != 0;
+            uint64_t naive = naive_count(txn, dbi, low_ptr, high_ptr,
+                                         lower_incl, upper_incl, cmp_key);
+            uint64_t counted = 0;
+            CHECK(mdb_count_range(txn, dbi, low_ptr, high_ptr,
+                                  flags, &counted),
+                  "fuzz range");
+            expect_eq(counted, naive, "fuzz range matches");
+        }
+        mdb_txn_abort(txn);
+    }
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "fuzz final begin");
+    uint64_t final_total;
+    CHECK(mdb_count_all(txn, dbi, 0, &final_total), "fuzz final total");
+    expect_eq(final_total, (uint64_t)live, "fuzz final count");
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "fuzz drop begin");
+    CHECK(mdb_drop(txn, dbi, 0), "fuzz drop");
+    CHECK(mdb_txn_commit(txn), "fuzz drop commit");
+
+    mdb_dbi_close(env, dbi);
+    free(present);
 }
 
 static void
@@ -1128,6 +1581,8 @@ main(void)
     test_cursor_deletions(env);
     test_split_merge(env);
     test_nested_transactions(env);
+    test_fuzz_random(env);
+    test_concurrent_readers();
 
     mdb_env_close(env);
     return EXIT_SUCCESS;
