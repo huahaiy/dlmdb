@@ -10148,11 +10148,17 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 	MDB_page	*mp, *rp, *pp;
 	int ptop;
 	MDB_cursor	mn;
+	int		 track_counts = 0;
+	uint64_t	 left_tally = 0, right_tally = 0;
+	int		 have_left_tally = 0, have_right_tally = 0;
 	DKBUF;
 
 	mp = mc->mc_pg[mc->mc_top];
 	newindx = mc->mc_ki[mc->mc_top];
 	nkeys = NUMKEYS(mp);
+	if ((mc->mc_db->md_flags & MDB_COUNTED) &&
+	    !(mc->mc_db->md_flags & MDB_DUPSORT))
+		track_counts = 1;
 
 	DPRINTF(("-----> splitting %s page %"Yu" and adding [%s] at index %i/%i",
 	    IS_LEAF(mp) ? "leaf" : "branch", mp->mp_pgno,
@@ -10395,6 +10401,19 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 		rc = mdb_node_add(mc, 0, newkey, newdata, newpgno, nflags);
 		if (rc)
 			goto done;
+		if (track_counts) {
+			MDB_page *dest = mc->mc_pg[mc->mc_top];
+			MDB_node *added = NODEPTR(dest, 0);
+			uint64_t contrib = 0;
+			if (IS_BRANCH(dest) && IS_COUNTED(dest))
+				contrib = mdb_node_get_count(dest, added);
+			else if (IS_LEAF(dest))
+				contrib = mdb_leaf_entry_contribution(dest, added);
+			else if (IS_LEAF2(dest))
+				contrib = 1;
+			right_tally += contrib;
+			have_right_tally = 1;
+		}
 		for (i=0; i<mc->mc_top; i++)
 			mc->mc_ki[i] = mn.mc_ki[i];
 	} else if (!IS_LEAF2(mp)) {
@@ -10431,9 +10450,28 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 				rkey.mv_size = 0;
 			}
 
+			MDB_page *dest = mc->mc_pg[mc->mc_top];
+			indx_t dest_index = j;
 			rc = mdb_node_add(mc, j, &rkey, rdata, pgno, flags);
 			if (rc)
 				goto done;
+			if (track_counts) {
+				uint64_t contrib = 0;
+				MDB_node *added = NODEPTR(dest, dest_index);
+				if (IS_BRANCH(dest) && IS_COUNTED(dest))
+					contrib = mdb_node_get_count(dest, added);
+				else if (IS_LEAF(dest))
+					contrib = mdb_leaf_entry_contribution(dest, added);
+				else if (IS_LEAF2(dest))
+					contrib = 1;
+				if (dest == rp) {
+					right_tally += contrib;
+					have_right_tally = 1;
+				} else if (dest == copy || dest == mp) {
+					left_tally += contrib;
+					have_left_tally = 1;
+				}
+			}
 			if (i == nkeys) {
 				i = 0;
 				j = 0;
@@ -10490,14 +10528,17 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 	}
 
 	{
-		if ((mc->mc_db->md_flags & MDB_COUNTED) &&
-		    !(mc->mc_db->md_flags & MDB_DUPSORT) && mc->mc_top > 0) {
+		if (track_counts && mc->mc_top > 0) {
 			MDB_page *parent = mc->mc_pg[ptop];
 			if (parent) {
-				mdb_update_parent_count(parent, mp->mp_pgno,
-				    mdb_page_subtree_count(mp));
-				mdb_update_parent_count(parent, rp->mp_pgno,
-				    mdb_page_subtree_count(rp));
+				uint64_t left_total = left_tally;
+				uint64_t right_total = right_tally;
+				if (!have_left_tally)
+					left_total = mdb_page_subtree_count(mp);
+				if (!have_right_tally)
+					right_total = mdb_page_subtree_count(rp);
+				mdb_update_parent_count(parent, mp->mp_pgno, left_total);
+				mdb_update_parent_count(parent, rp->mp_pgno, right_total);
 			}
 		}
 
