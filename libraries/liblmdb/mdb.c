@@ -9244,6 +9244,7 @@ mdb_node_move(MDB_cursor *csrc, MDB_cursor *cdst, int fromleft)
 	int			 rc;
 	unsigned short flags;
 	MDB_page	*psrc, *pdst;
+	int			 counted;
 
 	DKBUF;
 
@@ -9254,6 +9255,8 @@ mdb_node_move(MDB_cursor *csrc, MDB_cursor *cdst, int fromleft)
 
 	psrc = csrc->mc_pg[csrc->mc_top];
 	pdst = cdst->mc_pg[cdst->mc_top];
+	counted = (csrc->mc_db->md_flags & MDB_COUNTED) &&
+	    !(csrc->mc_db->md_flags & MDB_DUPSORT);
 
 	if (IS_LEAF2(csrc->mc_pg[csrc->mc_top])) {
 		key.mv_size = csrc->mc_db->md_pad;
@@ -9456,13 +9459,23 @@ mdb_node_move(MDB_cursor *csrc, MDB_cursor *cdst, int fromleft)
 		}
 	}
 
-	if ((csrc->mc_db->md_flags & MDB_COUNTED) &&
-	    !(csrc->mc_db->md_flags & MDB_DUPSORT) && csrc->mc_top > 0) {
-		MDB_page *parent = csrc->mc_pg[csrc->mc_top - 1];
+	if (counted) {
 		uint64_t src_total = mdb_page_subtree_count(psrc);
 		uint64_t dst_total = mdb_page_subtree_count(pdst);
-		mdb_update_parent_count(parent, psrc->mp_pgno, src_total);
-		mdb_update_parent_count(parent, pdst->mp_pgno, dst_total);
+		if (csrc->mc_top > 0) {
+			MDB_page *src_parent = csrc->mc_pg[csrc->mc_top - 1];
+			int64_t diff_src = mdb_update_parent_count(src_parent,
+			    psrc->mp_pgno, src_total);
+			if (diff_src)
+				mdb_propagate_count_delta(csrc, csrc->mc_top - 2, diff_src);
+		}
+		if (cdst->mc_top > 0) {
+			MDB_page *dst_parent = cdst->mc_pg[cdst->mc_top - 1];
+			int64_t diff_dst = mdb_update_parent_count(dst_parent,
+			    pdst->mp_pgno, dst_total);
+			if (diff_dst)
+				mdb_propagate_count_delta(cdst, cdst->mc_top - 2, diff_dst);
+		}
 	}
 
 	return MDB_SUCCESS;
@@ -9485,9 +9498,15 @@ mdb_page_merge(MDB_cursor *csrc, MDB_cursor *cdst)
 	unsigned	 nkeys;
 	int			 rc;
 	indx_t		 i, j;
+	int			 counted;
+	uint64_t	 src_total = 0;
 
 	psrc = csrc->mc_pg[csrc->mc_top];
 	pdst = cdst->mc_pg[cdst->mc_top];
+	counted = (csrc->mc_db->md_flags & MDB_COUNTED) &&
+	    !(csrc->mc_db->md_flags & MDB_DUPSORT);
+	if (counted)
+		src_total = mdb_page_subtree_count(psrc);
 
 	DPRINTF(("merging page %"Yu" into %"Yu, psrc->mp_pgno, pdst->mp_pgno));
 
@@ -9550,16 +9569,20 @@ mdb_page_merge(MDB_cursor *csrc, MDB_cursor *cdst)
 	    pdst->mp_pgno, NUMKEYS(pdst),
 		(float)PAGEFILL(cdst->mc_txn->mt_env, pdst) / 10));
 
-	if ((cdst->mc_db->md_flags & MDB_COUNTED) &&
-	    !(cdst->mc_db->md_flags & MDB_DUPSORT) && cdst->mc_top > 0) {
+	if (counted && cdst->mc_top > 0) {
 		MDB_page *parent = cdst->mc_pg[cdst->mc_top - 1];
 		uint64_t dst_total = mdb_page_subtree_count(pdst);
-		mdb_update_parent_count(parent, pdst->mp_pgno, dst_total);
+		int64_t diff_dst = mdb_update_parent_count(parent, pdst->mp_pgno, dst_total);
+		if (diff_dst)
+			mdb_propagate_count_delta(cdst, cdst->mc_top - 2, diff_dst);
 	}
 
 	/* Unlink the src page from parent and add to free list.
 	 */
 	csrc->mc_top--;
+	if (counted && src_total && csrc->mc_top > 0)
+		mdb_propagate_count_delta(csrc, csrc->mc_top - 1,
+		    -(int64_t)src_total);
 	mdb_node_del(csrc, 0);
 	if (csrc->mc_ki[csrc->mc_top] == 0) {
 		key.mv_size = 0;
@@ -9847,12 +9870,20 @@ mdb_cursor_del0(MDB_cursor *mc)
 
 	ki = mc->mc_ki[mc->mc_top];
 	mp = mc->mc_pg[mc->mc_top];
+	uint64_t leaf_before = 0;
+	if (counted)
+		leaf_before = mdb_page_subtree_count(mp);
 	mdb_node_del(mc, mc->mc_db->md_pad);
 	mc->mc_db->md_entries--;
 	if (counted && mc->mc_top > 0) {
 		MDB_page *parent = mc->mc_pg[mc->mc_top - 1];
-		uint64_t leaf_total = mdb_leaf_contribution(mp);
-		mdb_update_parent_count(parent, mp->mp_pgno, leaf_total);
+		uint64_t leaf_after = mdb_leaf_contribution(mp);
+		int64_t diff = (int64_t)leaf_after - (int64_t)leaf_before;
+		int64_t delta = mdb_update_parent_count(parent, mp->mp_pgno, leaf_after);
+		if (!delta)
+			delta = diff;
+		if (delta)
+			mdb_propagate_count_delta(mc, mc->mc_top - 2, delta);
 	}
 	{
 		/* Adjust other cursors pointing to mp */
