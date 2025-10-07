@@ -1948,6 +1948,86 @@ mdb_prefix_count(MDB_txn *txn, MDB_dbi dbi, const MDB_val *key,
 	return MDB_SUCCESS;
 }
 
+static int
+mdb_dup_prefix_count(MDB_cursor *base, MDB_cmp_func *cmp,
+	const MDB_val *value, int inclusive, uint64_t *out)
+{
+	MDB_cursor cur = {0};
+	MDB_val search, data = {0};
+	uint64_t total = 0;
+	int rc, exact = 0;
+
+	*out = 0;
+	if (!value)
+		return MDB_SUCCESS;
+	if (!(base->mc_flags & C_INITIALIZED) || !base->mc_snum)
+		return MDB_SUCCESS;
+
+	mdb_cursor_copy(base, &cur);
+	cur.mc_xcursor = NULL;
+	cur.mc_dbflag = base->mc_dbflag;
+	search = *value;
+	rc = mdb_cursor_set(&cur, &search, &data, MDB_SET_RANGE, &exact);
+	if (rc == MDB_NOTFOUND) {
+		uint64_t entries = base->mc_db ? (uint64_t)base->mc_db->md_entries : 0;
+		MDB_cursor edge = {0};
+		MDB_val edge_key = {0}, edge_data = {0};
+		mdb_cursor_copy(base, &edge);
+		edge.mc_xcursor = NULL;
+		edge.mc_dbflag = base->mc_dbflag;
+		if (mdb_cursor_get(&edge, &edge_key, &edge_data, MDB_FIRST) == MDB_SUCCESS) {
+			int cmp_first = cmp(&edge_key, (MDB_val *)value);
+			if (cmp_first > 0 || (cmp_first == 0 && !inclusive)) {
+				*out = 0;
+				return MDB_SUCCESS;
+			}
+		}
+		mdb_cursor_copy(base, &edge);
+		edge.mc_xcursor = NULL;
+		edge.mc_dbflag = base->mc_dbflag;
+		if (mdb_cursor_get(&edge, &edge_key, &edge_data, MDB_LAST) == MDB_SUCCESS) {
+			int cmp_last = cmp(&edge_key, (MDB_val *)value);
+			if (cmp_last < 0 || (cmp_last == 0 && inclusive)) {
+				*out = entries;
+				return MDB_SUCCESS;
+			}
+		}
+		*out = entries;
+		return MDB_SUCCESS;
+	}
+	if (rc != MDB_SUCCESS)
+		return rc;
+	if (!(cur.mc_flags & C_INITIALIZED) || !cur.mc_snum)
+		return MDB_SUCCESS;
+
+	for (int level = 0; level < cur.mc_top; ++level) {
+		MDB_page *branch = cur.mc_pg[level];
+		indx_t limit = cur.mc_ki[level];
+		if (IS_BRANCH(branch) && IS_COUNTED(branch)) {
+			for (indx_t i = 0; i < limit; ++i) {
+				MDB_node *node = NODEPTR(branch, i);
+				total += mdb_node_get_count(branch, node);
+			}
+		} else {
+			for (indx_t i = 0; i < limit; ++i) {
+				MDB_node *node = NODEPTR(branch, i);
+				total += mdb_branch_child_count(&cur, branch, node);
+			}
+		}
+	}
+
+	MDB_page *leaf = cur.mc_pg[cur.mc_top];
+	indx_t leaf_idx = cur.mc_ki[cur.mc_top];
+	if (IS_LEAF(leaf) || IS_LEAF2(leaf))
+		total += leaf_idx;
+
+	if (inclusive && exact)
+		total += 1;
+
+	*out = total;
+	return MDB_SUCCESS;
+}
+
 /** @cond */
 static MDB_cmp_func	mdb_cmp_memn, mdb_cmp_memnr, mdb_cmp_int, mdb_cmp_cint, mdb_cmp_long;
 /** @endcond */
@@ -2575,6 +2655,62 @@ mdb_value_in_range(MDB_cmp_func *cmp, const MDB_val *val,
 }
 
 static int
+mdb_count_value_range_scan(MDB_cursor *base, MDB_cmp_func *cmp,
+	const MDB_val *low, const MDB_val *high,
+	int lower_incl, int upper_incl, uint64_t *out)
+{
+	MDB_cursor cur;
+	MDB_val vcur = {0}, data = {0};
+	int rc;
+
+	*out = 0;
+	if (!cmp)
+		return MDB_PROBLEM;
+	if (!(base->mc_flags & C_INITIALIZED) || !base->mc_snum)
+		return MDB_SUCCESS;
+
+	mdb_cursor_copy(base, &cur);
+
+	if (low) {
+		vcur = *low;
+		rc = mdb_cursor_get(&cur, &vcur, &data, MDB_SET_RANGE);
+		if (rc == MDB_NOTFOUND)
+			return MDB_SUCCESS;
+		if (rc != MDB_SUCCESS)
+			return rc;
+	} else {
+		rc = mdb_cursor_get(&cur, &vcur, &data, MDB_FIRST);
+		if (rc == MDB_NOTFOUND)
+			return MDB_SUCCESS;
+		if (rc != MDB_SUCCESS)
+			return rc;
+	}
+
+	while (1) {
+		int skip = 0;
+		if (low) {
+			int cmp_low = cmp(&vcur, (MDB_val *)low);
+			if (cmp_low < 0 || (cmp_low == 0 && !lower_incl))
+				skip = 1;
+		}
+		if (!skip && high) {
+			int cmp_high = cmp(&vcur, (MDB_val *)high);
+			if (cmp_high > 0 || (cmp_high == 0 && !upper_incl))
+				break;
+		}
+		if (!skip)
+			(*out)++;
+		rc = mdb_cursor_get(&cur, &vcur, &data, MDB_NEXT);
+		if (rc == MDB_NOTFOUND)
+			return MDB_SUCCESS;
+		if (rc != MDB_SUCCESS)
+			return rc;
+	}
+
+	return MDB_SUCCESS;
+}
+
+static int
 mdb_count_value_range_for_key(MDB_cursor *mc, const MDB_val *low,
 	const MDB_val *high, unsigned flags, uint64_t *out)
 {
@@ -2616,54 +2752,47 @@ mdb_count_value_range_for_key(MDB_cursor *mc, const MDB_val *low,
 			return rc;
 	}
 
-	MDB_cursor dupcur;
+	MDB_cursor dupcur = {0};
 	mdb_cursor_copy(&mc->mc_xcursor->mx_cursor, &dupcur);
+	dupcur.mc_xcursor = NULL;
+	dupcur.mc_dbflag = mc->mc_xcursor->mx_cursor.mc_dbflag;
 	if (!(dupcur.mc_flags & C_INITIALIZED) || !dupcur.mc_snum)
 		return MDB_SUCCESS;
-
 	MDB_cmp_func *dup_cmp = dupcur.mc_dbx->md_cmp ?
 	    dupcur.mc_dbx->md_cmp : dcmp;
 	if (!dup_cmp)
 		return MDB_PROBLEM;
 
-	MDB_val cur = {0}, data = {0};
-	if (low) {
-		cur = *low;
-		rc = mdb_cursor_get(&dupcur, &cur, &data, MDB_SET_RANGE);
-		if (rc == MDB_NOTFOUND)
-			return MDB_SUCCESS;
-		if (rc != MDB_SUCCESS)
-			return rc;
-	} else {
-		rc = mdb_cursor_get(&dupcur, &cur, &data, MDB_FIRST);
-		if (rc == MDB_NOTFOUND)
-			return MDB_SUCCESS;
-		if (rc != MDB_SUCCESS)
-			return rc;
+	if (!low && !high) {
+		*out = dupcur.mc_db ? dupcur.mc_db->md_entries : 0;
+		return MDB_SUCCESS;
 	}
 
-	while (1) {
-		int skip = 0;
+	if (dupcur.mc_db && (dupcur.mc_db->md_flags & MDB_COUNTED) && (low || high)) {
+		uint64_t lower = 0, upper = 0;
+
+		if (high) {
+			rc = mdb_dup_prefix_count(&dupcur, dup_cmp, high, upper_incl, &upper);
+			if (rc != MDB_SUCCESS)
+				return rc;
+		} else {
+			upper = dupcur.mc_db->md_entries;
+		}
+
 		if (low) {
-			int cmp_low = dup_cmp(&cur, (MDB_val *)low);
-			if (cmp_low < 0 || (cmp_low == 0 && !lower_incl))
-				skip = 1;
+			int include_self = !lower_incl;
+			rc = mdb_dup_prefix_count(&dupcur, dup_cmp, low, include_self, &lower);
+			if (rc != MDB_SUCCESS)
+				return rc;
 		}
-		if (!skip && high) {
-			int cmp_high = dup_cmp(&cur, (MDB_val *)high);
-			if (cmp_high > 0 || (cmp_high == 0 && !upper_incl))
-				break;
-		}
-		if (!skip)
-			(*out)++;
-		rc = mdb_cursor_get(&dupcur, &cur, &data, MDB_NEXT);
-		if (rc == MDB_NOTFOUND)
-			return MDB_SUCCESS;
-		if (rc != MDB_SUCCESS)
-			return rc;
+
+		uint64_t result = (upper >= lower) ? (upper - lower) : 0;
+		*out = result;
+		return MDB_SUCCESS;
 	}
 
-	return MDB_SUCCESS;
+	return mdb_count_value_range_scan(&dupcur, dup_cmp, low, high,
+	    lower_incl, upper_incl, out);
 }
 
 static int mdb_page_flush(MDB_txn *txn, int keep);
@@ -8283,6 +8412,8 @@ prep_subDB:
 						dummy.md_pad = 0;
 						dummy.md_flags = 0;
 					}
+					if (mc->mc_db->md_flags & MDB_COUNTED)
+						dummy.md_flags |= MDB_COUNTED;
 					dummy.md_depth = 1;
 					dummy.md_branch_pages = 0;
 					dummy.md_leaf_pages = 1;
@@ -9118,6 +9249,8 @@ mdb_xcursor_init1(MDB_cursor *mc, MDB_node *node)
 				mx->mx_db.md_flags |= MDB_INTEGERKEY;
 		}
 	}
+	if (mc->mc_db->md_flags & MDB_COUNTED)
+		mx->mx_db.md_flags |= MDB_COUNTED;
 	DPRINTF(("Sub-db -%u root page %"Yu, mx->mx_cursor.mc_dbi,
 		mx->mx_db.md_root));
 	mx->mx_dbflag = DB_VALID|DB_USRVALID|DB_DUPDATA;
