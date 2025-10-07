@@ -133,6 +133,45 @@ expect_eq(uint64_t got, uint64_t want, const char *msg)
 }
 
 static void
+expect_rc(int rc, int expect, const char *msg)
+{
+    if (rc != expect) {
+        fprintf(stderr, "%s: expected %s (%d), got %s (%d)\n",
+                msg, mdb_strerror(expect), expect, mdb_strerror(rc), rc);
+        exit(EXIT_FAILURE);
+    }
+}
+
+static void
+expect_val_eq(const MDB_val *val, const char *str, const char *msg)
+{
+    size_t len = strlen(str);
+    if (val->mv_size != len || memcmp(val->mv_data, str, len) != 0) {
+        fprintf(stderr,
+                "%s: expected \"%s\" len=%zu, got \"%.*s\" len=%zu\n",
+                msg, str, len,
+                (int)val->mv_size, (const char *)val->mv_data, val->mv_size);
+        exit(EXIT_FAILURE);
+    }
+}
+
+static void
+expect_val_match(const MDB_val *got, const MDB_val *want, const char *msg)
+{
+    if (got->mv_size != want->mv_size ||
+        memcmp(got->mv_data, want->mv_data, want->mv_size) != 0) {
+        fprintf(stderr,
+                "%s: mismatch expected len=%zu \"%.*s\" got len=%zu \"%.*s\"\n",
+                msg,
+                (size_t)want->mv_size, (int)want->mv_size,
+                (const char *)want->mv_data,
+                (size_t)got->mv_size, (int)got->mv_size,
+                (const char *)got->mv_data);
+        exit(EXIT_FAILURE);
+    }
+}
+
+static void
 check_range_matches(MDB_txn *txn, MDB_dbi dbi,
                     const MDB_val *low, const MDB_val *high,
                     unsigned int flags, const char *msg)
@@ -961,6 +1000,236 @@ test_count_all_dupsort(MDB_env *env)
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "count_all dup drop begin");
     CHECK(mdb_drop(txn, dbi, 0), "count_all dup drop");
     CHECK(mdb_txn_commit(txn), "count_all dup drop commit");
+    mdb_dbi_close(env, dbi);
+}
+
+#define RANK_DUP_MAX 64
+
+struct kv_pair {
+    MDB_val key;
+    MDB_val data;
+};
+
+static int
+pair_cmp(const void *a, const void *b)
+{
+    const struct kv_pair *pa = (const struct kv_pair *)a;
+    const struct kv_pair *pb = (const struct kv_pair *)b;
+    int rc = cmp_key(&pa->key, &pb->key);
+    if (rc)
+        return rc;
+    return cmp_key(&pa->data, &pb->data);
+}
+
+static void
+test_random_access_plain(MDB_env *env)
+{
+    const int count = 120;
+    MDB_txn *txn;
+    MDB_dbi dbi;
+    MDB_val key, data;
+    MDB_cursor *cur;
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "rank plain begin");
+    CHECK(mdb_dbi_open(txn, "rank_plain", MDB_CREATE | MDB_COUNTED, &dbi),
+          "rank plain open");
+
+    for (int i = 0; i < count; ++i) {
+        char keybuf[32];
+        char databuf[32];
+        snprintf(keybuf, sizeof(keybuf), "rp%05d", i);
+        snprintf(databuf, sizeof(databuf), "rv%05d", i);
+        key.mv_size = strlen(keybuf);
+        key.mv_data = keybuf;
+        data.mv_size = strlen(databuf);
+        data.mv_data = databuf;
+        CHECK(mdb_put(txn, dbi, &key, &data, MDB_APPEND), "rank plain put");
+    }
+
+    CHECK(mdb_txn_commit(txn), "rank plain commit");
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "rank plain rd");
+    CHECK(mdb_cursor_open(txn, dbi, &cur), "rank plain cursor");
+
+    for (uint64_t idx = 0; idx < (uint64_t)count; ++idx) {
+        MDB_val got_key, got_data;
+        CHECK(mdb_cursor_get_rank(cur, idx, &got_key, &got_data, 0),
+              "rank plain cursor get");
+
+        char expect_key[32];
+        char expect_data[32];
+        snprintf(expect_key, sizeof(expect_key), "rp%05" PRIu64, idx);
+        snprintf(expect_data, sizeof(expect_data), "rv%05" PRIu64, idx);
+
+        expect_val_eq(&got_key, expect_key, "rank plain cursor key");
+        expect_val_eq(&got_data, expect_data, "rank plain cursor data");
+
+        MDB_val api_key, api_data;
+        CHECK(mdb_get_rank(txn, dbi, idx, &api_key, &api_data),
+              "rank plain api");
+        expect_val_eq(&api_key, expect_key, "rank plain api key");
+        expect_val_eq(&api_data, expect_data, "rank plain api data");
+
+        if (idx == 7) {
+            MDB_val key_only;
+            CHECK(mdb_cursor_get_rank(cur, idx, &key_only, NULL, 0),
+                  "rank plain key only");
+            expect_val_eq(&key_only, expect_key, "rank plain key only value");
+        }
+
+        if (idx == 23) {
+            MDB_val key_only;
+            CHECK(mdb_cursor_get_rank(cur, idx, &key_only, &got_data, 0),
+                  "rank plain reuse data");
+            expect_val_eq(&key_only, expect_key, "rank plain reuse key");
+        }
+    }
+
+    int rc = mdb_cursor_get_rank(cur, count, &key, &data, 0);
+    expect_rc(rc, MDB_NOTFOUND, "rank plain eof");
+
+    rc = mdb_cursor_get_rank(cur, 0, NULL, NULL, 1);
+    expect_rc(rc, EINVAL, "rank plain bad flags");
+
+    mdb_cursor_close(cur);
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "rank plain drop begin");
+    CHECK(mdb_drop(txn, dbi, 1), "rank plain drop");
+    CHECK(mdb_txn_commit(txn), "rank plain drop commit");
+    mdb_dbi_close(env, dbi);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "rank plain uncounted begin");
+    MDB_dbi uncounted;
+    CHECK(mdb_dbi_open(txn, "rank_plain_uncounted", MDB_CREATE, &uncounted),
+          "rank plain uncounted open");
+    char uk = 'x';
+    char ud = 'y';
+    key.mv_size = 1;
+    key.mv_data = &uk;
+    data.mv_size = 1;
+    data.mv_data = &ud;
+    CHECK(mdb_put(txn, uncounted, &key, &data, 0), "rank plain uncounted put");
+    CHECK(mdb_txn_commit(txn), "rank plain uncounted commit");
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "rank plain uncounted rd");
+    rc = mdb_get_rank(txn, uncounted, 0, &key, &data);
+    expect_rc(rc, MDB_INCOMPATIBLE, "rank plain incompatible");
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "rank plain uncounted drop begin");
+    CHECK(mdb_drop(txn, uncounted, 1), "rank plain uncounted drop");
+    CHECK(mdb_txn_commit(txn), "rank plain uncounted drop commit");
+    mdb_dbi_close(env, uncounted);
+}
+
+static void
+test_random_access_dupsort(MDB_env *env)
+{
+    const int dup_counts[] = {1, 3, 5, 2, 4};
+    const int num_keys = (int)(sizeof(dup_counts) / sizeof(dup_counts[0]));
+    size_t total = 0;
+    for (int i = 0; i < num_keys; ++i)
+        total += (size_t)dup_counts[i];
+    if (total > RANK_DUP_MAX) {
+        fprintf(stderr, "rank dup configuration too large\n");
+        exit(EXIT_FAILURE);
+    }
+
+    char keybufs[RANK_DUP_MAX][16];
+    char databufs[RANK_DUP_MAX][16];
+    struct kv_pair expected[RANK_DUP_MAX];
+    struct kv_pair shuffled[RANK_DUP_MAX];
+
+    size_t index = 0;
+    for (int k = 0; k < num_keys; ++k) {
+        for (int d = 0; d < dup_counts[k]; ++d) {
+            snprintf(keybufs[index], sizeof(keybufs[index]), "dk%02d", k);
+            snprintf(databufs[index], sizeof(databufs[index]), "dv%02d_%02d", k, d);
+            expected[index].key.mv_size = strlen(keybufs[index]);
+            expected[index].key.mv_data = keybufs[index];
+            expected[index].data.mv_size = strlen(databufs[index]);
+            expected[index].data.mv_data = databufs[index];
+            ++index;
+        }
+    }
+
+    memcpy(shuffled, expected, sizeof(struct kv_pair) * total);
+    unsigned int shuffle_seed = 0x9e3779b9u;
+    for (size_t i = 0; i < total; ++i) {
+        size_t swap_idx = next_rand(&shuffle_seed) % total;
+        struct kv_pair tmp = shuffled[i];
+        shuffled[i] = shuffled[swap_idx];
+        shuffled[swap_idx] = tmp;
+    }
+
+    MDB_txn *txn;
+    MDB_dbi dbi;
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "rank dup begin");
+    CHECK(mdb_dbi_open(txn, "rank_dup", MDB_CREATE | MDB_COUNTED | MDB_DUPSORT, &dbi),
+          "rank dup open");
+
+    for (size_t i = 0; i < total; ++i) {
+        CHECK(mdb_put(txn, dbi, &shuffled[i].key, &shuffled[i].data, 0),
+              "rank dup put");
+    }
+
+    CHECK(mdb_txn_commit(txn), "rank dup commit");
+
+    qsort(expected, total, sizeof(expected[0]), pair_cmp);
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "rank dup rd");
+    MDB_cursor *cur;
+    CHECK(mdb_cursor_open(txn, dbi, &cur), "rank dup cursor");
+
+    for (uint64_t idx = 0; idx < total; ++idx) {
+        MDB_val got_key, got_data;
+        CHECK(mdb_cursor_get_rank(cur, idx, &got_key, &got_data, 0),
+              "rank dup cursor get");
+        expect_val_match(&got_key, &expected[idx].key, "rank dup key");
+        expect_val_match(&got_data, &expected[idx].data, "rank dup data");
+
+        if (idx == 3) {
+            MDB_val key_only;
+            CHECK(mdb_cursor_get_rank(cur, idx, &key_only, NULL, 0),
+                  "rank dup key only");
+            expect_val_match(&key_only, &expected[idx].key,
+                             "rank dup key only value");
+        }
+    }
+
+    unsigned int verify_seed = 0x1234abcdu;
+    for (int i = 0; i < 10; ++i) {
+        uint64_t idx = next_rand(&verify_seed) % total;
+        MDB_val gkey, gdata;
+        CHECK(mdb_get_rank(txn, dbi, idx, &gkey, &gdata),
+              "rank dup api");
+        expect_val_match(&gkey, &expected[idx].key, "rank dup api key");
+        expect_val_match(&gdata, &expected[idx].data, "rank dup api data");
+    }
+
+    MDB_val sample_data;
+    CHECK(mdb_get_rank(txn, dbi, total - 1, NULL, &sample_data),
+          "rank dup tail data");
+    expect_val_match(&sample_data, &expected[total - 1].data,
+                     "rank dup tail match");
+
+    MDB_val key, data;
+    int rc = mdb_cursor_get_rank(cur, total, &key, &data, 0);
+    expect_rc(rc, MDB_NOTFOUND, "rank dup eof");
+
+    rc = mdb_cursor_get_rank(cur, 0, &key, &data, 1);
+    expect_rc(rc, EINVAL, "rank dup bad flags");
+
+    rc = mdb_get_rank(txn, dbi, total, &key, &data);
+    expect_rc(rc, MDB_NOTFOUND, "rank dup api eof");
+
+    mdb_cursor_close(cur);
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "rank dup drop begin");
+    CHECK(mdb_drop(txn, dbi, 1), "rank dup drop");
+    CHECK(mdb_txn_commit(txn), "rank dup drop commit");
     mdb_dbi_close(env, dbi);
 }
 
@@ -2012,6 +2281,8 @@ main(void)
     test_count_all_plain(env);
     test_count_all_dupsort(env);
     test_count_all_persistence();
+    test_random_access_plain(env);
+    test_random_access_dupsort(env);
     test_overwrite_stability(env);
     test_cursor_deletions(env);
     test_split_merge(env);

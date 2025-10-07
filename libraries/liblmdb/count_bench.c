@@ -525,6 +525,15 @@ main(int argc, char **argv)
     double dup_counted_build_ms = 0.0;
     int dup_insert_samples = 0;
 
+    double cursor_rank_ms = 0.0;
+    double get_rank_ms = 0.0;
+    double naive_rank_ms = 0.0;
+    double cursor_rank_us = 0.0;
+    double get_rank_us = 0.0;
+    double naive_rank_us = 0.0;
+    double rank_speedup = 0.0;
+    size_t naive_rank_samples = 0;
+
     measure_insert_costs(entries, order, &plain_ms, &counted_build_ms,
         &insert_samples);
 
@@ -587,7 +596,8 @@ main(int argc, char **argv)
     MDB_val *highs = calloc(queries, sizeof(MDB_val));
     char **lowbufs = calloc(queries, sizeof(char *));
     char **highbufs = calloc(queries, sizeof(char *));
-    if (!lows || !highs || !lowbufs || !highbufs) {
+    size_t *ranks = calloc(queries, sizeof(size_t));
+    if (!lows || !highs || !lowbufs || !highbufs || !ranks) {
         fprintf(stderr, "allocation failure\n");
         free(order);
         free(lows);
@@ -603,6 +613,8 @@ main(int argc, char **argv)
         size_t stop = start + span;
         if (stop >= entries)
             stop = entries - 1;
+
+        ranks[i] = entries ? (size_t)(rand() % entries) : 0;
 
         lowbufs[i] = malloc(16);
         highbufs[i] = malloc(16);
@@ -649,6 +661,71 @@ main(int argc, char **argv)
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double counted_ms = elapsed_ms(&t0, &t1);
 
+    if (entries && queries) {
+        MDB_cursor *rank_cur;
+        CHECK(mdb_cursor_open(txn, dbi, &rank_cur), "mdb_cursor_open rank");
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (size_t i = 0; i < queries; ++i) {
+            MDB_val rkey = {0}, rdata = {0};
+            size_t rank = ranks[i];
+            CHECK(mdb_cursor_get_rank(rank_cur, rank, &rkey, &rdata, 0),
+                  "mdb_cursor_get_rank");
+            sink += (uint64_t)rkey.mv_size;
+            sink += (uint64_t)rdata.mv_size;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        cursor_rank_ms = elapsed_ms(&t0, &t1);
+        mdb_cursor_close(rank_cur);
+
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (size_t i = 0; i < queries; ++i) {
+            MDB_val gkey = {0}, gdata = {0};
+            size_t rank = ranks[i];
+            CHECK(mdb_get_rank(txn, dbi, rank, &gkey, &gdata),
+                  "mdb_get_rank");
+            sink += (uint64_t)gkey.mv_size;
+            sink += (uint64_t)gdata.mv_size;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        get_rank_ms = elapsed_ms(&t0, &t1);
+
+        naive_rank_samples = (queries < 128) ? queries : 128;
+        if (naive_rank_samples) {
+            MDB_cursor *naive_cur;
+            CHECK(mdb_cursor_open(txn, dbi, &naive_cur),
+                  "mdb_cursor_open rank naive");
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            for (size_t i = 0; i < naive_rank_samples; ++i) {
+                size_t rank = ranks[i];
+                MDB_val nkey = {0}, ndata = {0};
+                int rc = mdb_cursor_get(naive_cur, &nkey, &ndata, MDB_FIRST);
+                if (rc == MDB_NOTFOUND)
+                    break;
+                CHECK(rc, "mdb_cursor_get first rank");
+                for (size_t step = 0; step < rank; ++step) {
+                    rc = mdb_cursor_get(naive_cur, &nkey, &ndata, MDB_NEXT);
+                    if (rc == MDB_NOTFOUND)
+                        break;
+                    CHECK(rc, "mdb_cursor_get next rank");
+                }
+                sink += (uint64_t)nkey.mv_size;
+                sink += (uint64_t)ndata.mv_size;
+            }
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            naive_rank_ms = elapsed_ms(&t0, &t1);
+            mdb_cursor_close(naive_cur);
+        }
+
+        cursor_rank_us = queries ? (cursor_rank_ms * 1000.0) / queries : 0.0;
+        get_rank_us = queries ? (get_rank_ms * 1000.0) / queries : 0.0;
+        naive_rank_us = naive_rank_samples ?
+            (naive_rank_ms * 1000.0) / naive_rank_samples : 0.0;
+        if (cursor_rank_us > 0.0 && naive_rank_us > 0.0)
+            rank_speedup = naive_rank_us / cursor_rank_us;
+        else
+            rank_speedup = 0.0;
+    }
+
     mdb_txn_abort(txn);
     have_txn = 0;
     mdb_dbi_close(env, dbi);
@@ -662,17 +739,36 @@ main(int argc, char **argv)
 
     printf("Benchmark with %zu entries, %zu queries, span %zu\n", entries, queries, span);
     printf("Insert order: %s\n", shuffle ? "shuffled" : "monotonic");
-    printf("Insert plain DB:   %.2f ms (%.2f us/op)\n", plain_ms, plain_us);
-    printf("Insert counted DB: %.2f ms (%.2f us/op)\n", counted_build_ms,
-        counted_insert_us);
-    printf("Counted overhead:  %.2f ms (%.2f%%)\n", insert_overhead_ms,
-        insert_overhead_pct);
-    printf("Naive cursor scan: %.2f ms (%.2f us/op)\n", naive_ms, naive_us);
-    printf("Counted API:      %.2f ms (%.2f us/op)\n", counted_ms, counted_us);
+
+    printf("\n== Plain DB Inserts ==\n");
+    printf("  plain:   %.2f ms (%.2f us/op)\n", plain_ms, plain_us);
+    printf("  counted: %.2f ms (%.2f us/op)\n", counted_build_ms, counted_insert_us);
+    printf("  overhead: %.2f ms (%.2f%%)\n", insert_overhead_ms, insert_overhead_pct);
+
+    printf("\n== Range Count (keys) ==\n");
+    printf("  naive cursor: %.2f ms (%.2f us/op)\n", naive_ms, naive_us);
+    printf("  counted API:  %.2f ms (%.2f us/op)\n", counted_ms, counted_us);
     if (counted_ms > 0.0)
-        printf("Range count speedup: %.2fx\n", range_speedup);
+        printf("  speedup: %.2fx\n", range_speedup);
     else
-        printf("Range count speedup: N/A\n");
+        printf("  speedup: N/A\n");
+
+    if (entries && queries) {
+        printf("\n== Rank Lookup ==\n");
+        if (naive_rank_samples)
+            printf("  naive (sampled %zu): %.2f ms (%.2f us/op)\n",
+                naive_rank_samples, naive_rank_ms, naive_rank_us);
+        else
+            printf("  naive (sampled 0): N/A\n");
+        printf("  cursor API:        %.2f ms (%.2f us/op)\n",
+            cursor_rank_ms, cursor_rank_us);
+        printf("  mdb_get_rank:      %.2f ms (%.2f us/op)\n",
+            get_rank_ms, get_rank_us);
+        if (rank_speedup > 0.0)
+            printf("  speedup: %.2fx\n", rank_speedup);
+        else
+            printf("  speedup: N/A\n");
+    }
 
     if (entries && dupcount) {
         size_t dup_ops = entries * dupcount;
@@ -682,12 +778,11 @@ main(int argc, char **argv)
         double dup_overhead_ms = dup_counted_build_ms - dup_plain_ms;
         double dup_overhead_pct = dup_plain_ms ?
             (dup_overhead_ms / dup_plain_ms) * 100.0 : 0.0;
-        printf("Dupsort plain DB:   %.2f ms (%.2f us/op)\n", dup_plain_ms,
-            dup_plain_us);
-        printf("Dupsort counted DB: %.2f ms (%.2f us/op)\n",
-            dup_counted_build_ms, dup_counted_us);
-        printf("Dupsort overhead:   %.2f ms (%.2f%%)\n", dup_overhead_ms,
-            dup_overhead_pct);
+
+        printf("\n== Dupsort Inserts ==\n");
+        printf("  plain:   %.2f ms (%.2f us/op)\n", dup_plain_ms, dup_plain_us);
+        printf("  counted: %.2f ms (%.2f us/op)\n", dup_counted_build_ms, dup_counted_us);
+        printf("  overhead: %.2f ms (%.2f%%)\n", dup_overhead_ms, dup_overhead_pct);
     }
 
     double dup_cursor_ms = 0.0;
@@ -761,15 +856,16 @@ main(int argc, char **argv)
         dup_speedup = (dup_counted_ms > 0.0) ?
             (dup_cursor_ms / dup_counted_ms) : 0.0;
 
-        printf("Dupsort dup/key:  %zu\n", dupcount);
-        printf("Dup cursor count: %.2f ms (%.2f us/op)\n",
+        printf("\n== Dupsort Range Count ==\n");
+        printf("  dup/key: %zu\n", dupcount);
+        printf("  cursor (mdb_cursor_count): %.2f ms (%.2f us/op)\n",
             dup_cursor_ms, dup_cursor_us);
-        printf("Dup counted API: %.2f ms (%.2f us/op)\n",
+        printf("  counted API:              %.2f ms (%.2f us/op)\n",
             dup_counted_ms, dup_counted_us);
         if (dup_counted_ms > 0.0)
-            printf("Dup range speedup: %.2fx\n", dup_speedup);
+            printf("  speedup: %.2fx\n", dup_speedup);
         else
-            printf("Dup range speedup: N/A\n");
+            printf("  speedup: N/A\n");
     }
 
     volatile uint64_t sink_guard = sink;
@@ -802,6 +898,7 @@ cleanup:
     free(highbufs);
     free(lows);
     free(highs);
+    free(ranks);
 
     free(order);
 

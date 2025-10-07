@@ -1215,6 +1215,25 @@ int mdb_range_count_values(MDB_txn *txn, MDB_dbi dbi,
 	const MDB_val *key_low, const MDB_val *key_high, unsigned key_flags,
 	uint64_t *out);
 
+	/** @brief Retrieve the element at a given rank in a counted database.
+	 *
+	 * Works with plain and dupsort DBIs opened with #MDB_COUNTED. The
+	 * rank is zero-based and counts individual key/value pairs in sorted
+	 * order (duplicate values are included).
+	 *
+	 * @param[in,out] cursor Cursor to position; must reference a counted DBI.
+	 * @param[in] rank Zero-based index of the desired element.
+	 * @param[out] key Optional key output; may be NULL.
+	 * @param[out] data Optional data output; may be NULL.
+	 * @param[in] flags Reserved for future use, must be 0.
+	 */
+int mdb_cursor_get_rank(MDB_cursor *cursor, uint64_t rank,
+	MDB_val *key, MDB_val *data, unsigned flags);
+
+	/** @brief Convenience wrapper around #mdb_cursor_get_rank(). */
+int mdb_get_rank(MDB_txn *txn, MDB_dbi dbi, uint64_t rank,
+	MDB_val *key, MDB_val *data);
+
 	/** @brief Close a database handle. Normally unnecessary. Use with care:
 	 *
 	 * This call is not mutex protected. Handles should only be closed by

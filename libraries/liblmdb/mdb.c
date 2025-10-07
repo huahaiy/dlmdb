@@ -9181,6 +9181,8 @@ mdb_xcursor_init1(MDB_cursor *mc, MDB_node *node)
 		mx->mx_cursor.mc_pg[0] = 0;
 		mx->mx_cursor.mc_snum = 0;
 		mx->mx_cursor.mc_top = 0;
+		if (mc->mc_db->md_flags & MDB_COUNTED)
+			mx->mx_db.md_flags |= MDB_COUNTED;
 	} else {
 		MDB_page *fp = NODEDATA(node);
 		mx->mx_db.md_pad = 0;
@@ -9202,7 +9204,8 @@ mdb_xcursor_init1(MDB_cursor *mc, MDB_node *node)
 			if (mc->mc_db->md_flags & MDB_INTEGERDUP)
 				mx->mx_db.md_flags |= MDB_INTEGERKEY;
 		}
-		/* Keep dupsort sub-DBs uncounted to avoid extra write maintenance. */
+		if (mc->mc_db->md_flags & MDB_COUNTED)
+			mx->mx_db.md_flags |= MDB_COUNTED;
 	}
 	DPRINTF(("Sub-db -%u root page %"Yu, mx->mx_cursor.mc_dbi,
 		mx->mx_db.md_root));
@@ -11875,6 +11878,168 @@ mdb_range_count_values(MDB_txn *txn, MDB_dbi dbi,
 
 	*out = (upper >= lower) ? (upper - lower) : 0;
 	return MDB_SUCCESS;
+}
+
+static int
+mdb_cursor_rank_search(MDB_cursor *mc, uint64_t rank, uint64_t *entry_offset)
+{
+	MDB_page *mp;
+	MDB_node *node = NULL;
+	int rc;
+	uint64_t remaining = rank;
+
+	if (!mc || !mc->mc_db)
+		return EINVAL;
+	if (mc->mc_db->md_entries <= remaining)
+		return MDB_NOTFOUND;
+
+	MDB_page *root = mc->mc_pg[0];
+	/* Inline duplicate subpages already have their leaf page loaded. */
+	if (!root || !IS_SUBP(root)) {
+		rc = mdb_page_search(mc, NULL, MDB_PS_ROOTONLY);
+		if (rc != MDB_SUCCESS)
+			return rc;
+	} else {
+		mc->mc_top = 0;
+		mc->mc_snum = 1;
+	}
+
+	mc->mc_flags |= C_INITIALIZED;
+	mc->mc_flags &= ~(C_EOF|C_DEL);
+
+	mp = mc->mc_pg[mc->mc_top];
+	while (IS_BRANCH(mp)) {
+		indx_t i, nkeys = NUMKEYS(mp);
+		if (!IS_COUNTED(mp))
+			return MDB_INCOMPATIBLE;
+		for (i = 0; i < nkeys; ++i) {
+			node = NODEPTR(mp, i);
+			uint64_t child_total = mdb_node_get_count(mp, node);
+			if (remaining < child_total)
+				break;
+			remaining -= child_total;
+		}
+		if (i == nkeys)
+			return MDB_NOTFOUND;
+		mc->mc_ki[mc->mc_top] = i;
+		rc = mdb_page_get(mc, NODEPGNO(node), &mp, NULL);
+		if (rc != MDB_SUCCESS)
+			return rc;
+		rc = mdb_cursor_push(mc, mp);
+		if (rc != MDB_SUCCESS)
+			return rc;
+	}
+
+	if (IS_LEAF2(mp)) {
+		indx_t nkeys = NUMKEYS(mp);
+		if (remaining >= nkeys)
+			return MDB_NOTFOUND;
+		mc->mc_ki[mc->mc_top] = (indx_t)remaining;
+		if (entry_offset)
+			*entry_offset = 0;
+		return MDB_SUCCESS;
+	}
+
+	if (!IS_LEAF(mp))
+		return MDB_CORRUPTED;
+
+	indx_t i, nkeys = NUMKEYS(mp);
+	for (i = 0; i < nkeys; ++i) {
+		node = NODEPTR(mp, i);
+		uint64_t contrib = mdb_leaf_entry_contribution(mp, node);
+		if (remaining < contrib)
+			break;
+		remaining -= contrib;
+	}
+	if (i == nkeys)
+		return MDB_NOTFOUND;
+	mc->mc_ki[mc->mc_top] = i;
+	if (entry_offset)
+		*entry_offset = remaining;
+	return MDB_SUCCESS;
+}
+
+int ESECT
+mdb_cursor_get_rank(MDB_cursor *mc, uint64_t rank,
+	MDB_val *key, MDB_val *data, unsigned flags)
+{
+	MDB_page *mp;
+	MDB_node *leaf;
+	uint64_t dup_index = 0;
+	int rc;
+
+	if (!mc)
+		return EINVAL;
+	if (flags)
+		return EINVAL;
+	if (!(mc->mc_db->md_flags & MDB_COUNTED))
+		return MDB_INCOMPATIBLE;
+	if (mc->mc_txn->mt_flags & MDB_TXN_BLOCKED)
+		return MDB_BAD_TXN;
+	if (!mc->mc_db->md_entries)
+		return MDB_NOTFOUND;
+
+	if (mc->mc_xcursor)
+		MDB_CURSOR_UNREF(&mc->mc_xcursor->mx_cursor, 0);
+
+	rc = mdb_cursor_rank_search(mc, rank, &dup_index);
+	if (rc != MDB_SUCCESS)
+		return rc;
+
+	mp = mc->mc_pg[mc->mc_top];
+	if (IS_LEAF2(mp)) {
+		if (key) {
+			key->mv_size = mc->mc_db->md_pad;
+			key->mv_data = LEAF2KEY(mp, mc->mc_ki[mc->mc_top], key->mv_size);
+		}
+		if (data) {
+			data->mv_size = 0;
+			data->mv_data = NULL;
+		}
+		return MDB_SUCCESS;
+	}
+
+	leaf = NODEPTR(mp, mc->mc_ki[mc->mc_top]);
+	if (F_ISSET(leaf->mn_flags, F_DUPDATA)) {
+		if (!mc->mc_xcursor)
+			return MDB_INCOMPATIBLE;
+		mdb_xcursor_init1(mc, leaf);
+		if (dup_index >= mc->mc_xcursor->mx_db.md_entries)
+			return MDB_NOTFOUND;
+		rc = mdb_cursor_rank_search(&mc->mc_xcursor->mx_cursor,
+		    dup_index, NULL);
+		if (rc != MDB_SUCCESS)
+			return rc;
+	} else if (dup_index) {
+		return MDB_CORRUPTED;
+	}
+
+	if (!key && !data)
+		return MDB_SUCCESS;
+	return mdb_cursor_get(mc, key, data, MDB_GET_CURRENT);
+}
+
+int ESECT
+mdb_get_rank(MDB_txn *txn, MDB_dbi dbi, uint64_t rank,
+	MDB_val *key, MDB_val *data)
+{
+	MDB_cursor mc;
+	MDB_xcursor mx;
+	int rc;
+
+	if (!TXN_DBI_EXIST(txn, dbi, DB_USRVALID))
+		return EINVAL;
+	if (txn->mt_flags & MDB_TXN_BLOCKED)
+		return MDB_BAD_TXN;
+
+	if (txn->mt_dbs[dbi].md_flags & MDB_DUPSORT)
+		mdb_cursor_init(&mc, txn, dbi, &mx);
+	else
+		mdb_cursor_init(&mc, txn, dbi, NULL);
+
+	rc = mdb_cursor_get_rank(&mc, rank, key, data, 0);
+	MDB_CURSOR_UNREF(&mc, 1);
+	return rc;
 }
 
 int ESECT
