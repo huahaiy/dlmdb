@@ -1747,17 +1747,43 @@ mdb_page_subtree_count(MDB_page *mp)
 	return 0;
 }
 
-static void
+static int64_t
 mdb_update_parent_count(MDB_page *parent, pgno_t child_pgno, uint64_t total)
 {
 	if (!parent || !IS_BRANCH(parent) || !IS_COUNTED(parent))
-		return;
+		return 0;
 	for (indx_t i = 0; i < NUMKEYS(parent); ++i) {
 		MDB_node *node = NODEPTR(parent, i);
 		if (NODEPGNO(node) == child_pgno) {
-			mdb_node_set_count(parent, node, total);
-			break;
+			uint64_t before = mdb_node_get_count(parent, node);
+			if (before != total)
+				mdb_node_set_count(parent, node, total);
+			return (int64_t)total - (int64_t)before;
 		}
+	}
+	return 0;
+}
+
+static void
+mdb_propagate_count_delta(MDB_cursor *mc, int level, int64_t delta)
+{
+	if (!delta)
+		return;
+	for (int i = level; i >= 0; --i) {
+		MDB_page *parent = mc->mc_pg[i];
+		if (!parent)
+			break;
+		if (!IS_BRANCH(parent) || !IS_COUNTED(parent))
+			continue;
+		indx_t idx = mc->mc_ki[i];
+		if (idx >= NUMKEYS(parent))
+			continue;
+		MDB_node *node = NODEPTR(parent, idx);
+		uint64_t before = mdb_node_get_count(parent, node);
+		int64_t acc = (int64_t)before + delta;
+		if (acc < 0)
+			acc = 0;
+		mdb_node_set_count(parent, node, (uint64_t)acc);
 	}
 }
 
@@ -7826,6 +7852,7 @@ _mdb_cursor_put(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 	MDB_val		xdata, *rdata, dkey, olddata;
 	MDB_db dummy;
 	int do_sub = 0, insert_key, insert_data;
+	int split_performed = 0;
 	unsigned int mcount = 0, dcount = 0, nospill;
 	size_t nsize;
 	int rc, rc2;
@@ -8228,6 +8255,8 @@ new_sub:
 		if (!insert_key)
 			nflags |= MDB_SPLIT_REPLACE;
 		rc = mdb_page_split(mc, key, rdata, P_INVALID, nflags);
+	if (rc == MDB_SUCCESS)
+		split_performed = 1;
 	} else {
 		/* There is room already in this leaf page. */
 		rc = mdb_node_add(mc, mc->mc_ki[mc->mc_top], key, rdata, 0, nflags);
@@ -8341,7 +8370,36 @@ bad_sub:
 			rc = MDB_PROBLEM;
 	}
 	if (rc == MDB_SUCCESS) {
-		mdb_cursor_refresh_counts(mc);
+		if ((mc->mc_db->md_flags & MDB_COUNTED) &&
+		    !(mc->mc_db->md_flags & MDB_DUPSORT)) {
+			int64_t delta = insert_data;
+			if (delta && mc->mc_top > 0) {
+				int level = mc->mc_top - 1;
+				MDB_page *leaf = mc->mc_pg[mc->mc_top];
+				MDB_page *parent = mc->mc_pg[level];
+				uint64_t leaf_total = mdb_page_subtree_count(leaf);
+				int64_t diff = 0;
+				if (parent && IS_BRANCH(parent) && IS_COUNTED(parent)) {
+					indx_t idx = mc->mc_ki[level];
+					if (idx < NUMKEYS(parent)) {
+						MDB_node *node = NODEPTR(parent, idx);
+						if (NODEPGNO(node) == leaf->mp_pgno) {
+							uint64_t before = mdb_node_get_count(parent, node);
+							uint64_t after = leaf_total;
+							diff = (int64_t)after - (int64_t)before;
+							if (diff != 0)
+								mdb_node_set_count(parent, node, after);
+						}
+					}
+				}
+				if (diff == 0)
+					diff = mdb_update_parent_count(parent, leaf->mp_pgno, leaf_total);
+				if (diff == 0 && split_performed)
+					diff = delta;
+				if (diff != 0)
+					mdb_propagate_count_delta(mc, level - 1, diff);
+			}
+		}
 		return rc;
 	}
 	mc->mc_txn->mt_flags |= MDB_TXN_ERROR;
