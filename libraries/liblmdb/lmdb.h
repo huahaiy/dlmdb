@@ -386,7 +386,6 @@ typedef void (MDB_rel_func)(MDB_val *item, void *oldptr, void *newptr, void *rel
 /**	@defgroup mdb_count	Range Count Flags
  *	@{
  */
-#define MDB_COUNT_DISTINCT_KEYS	0x01
 #define MDB_COUNT_LOWER_INCL	0x02
 #define MDB_COUNT_UPPER_INCL	0x04
 /*	@} */
@@ -1204,6 +1203,11 @@ int  mdb_stat(MDB_txn *txn, MDB_dbi dbi, MDB_stat *stat);
 	 * @return A non-zero error value on failure and 0 on success.
 	 */
 int mdb_dbi_flags(MDB_txn *txn, MDB_dbi dbi, unsigned int *flags);
+/** @brief Return the total number of elements in a counted database.
+ *
+ * Works with plain and dupsort DBIs opened with #MDB_COUNTED. For dupsort
+ * databases the total counts all key/value pairs (including duplicates).
+ */
 int mdb_count_all(MDB_txn *txn, MDB_dbi dbi, unsigned flags, uint64_t *out);
 int mdb_count_range(MDB_txn *txn, MDB_dbi dbi,
 	const MDB_val *low, const MDB_val *high, unsigned flags, uint64_t *out);

@@ -756,6 +756,7 @@ test_range_count_values(MDB_env *env)
     MDB_val key_low, key_high;
     uint64_t counted = 0;
     uint64_t naive = 0;
+    uint64_t total_all = 0;
 
     key_low.mv_data = "k01";
     key_low.mv_size = 3;
@@ -787,6 +788,8 @@ test_range_count_values(MDB_env *env)
     CHECK(mdb_range_count_values(txn, dbi, NULL, NULL, 0, &counted),
           "dup range full db");
     expect_eq(counted, naive, "dup range full db match");
+    CHECK(mdb_count_all(txn, dbi, 0, &total_all), "dup range count_all total");
+    expect_eq(total_all, naive, "dup range count_all match");
 
     MDB_val reverse_low = key_high;
     MDB_val reverse_high = key_low;
@@ -830,6 +833,9 @@ test_range_count_values(MDB_env *env)
                                  &counted),
           "dup range post mutate full");
     expect_eq(counted, naive, "dup range post mutate full match");
+    CHECK(mdb_count_all(txn, dbi, 0, &total_all), "dup range count_all post mutate");
+    uint64_t naive_total = naive_count_values(txn, dbi, NULL, NULL, 0, 0, cmp_key);
+    expect_eq(total_all, naive_total, "dup range count_all post mutate total");
 
     mdb_txn_abort(txn);
 
@@ -837,6 +843,272 @@ test_range_count_values(MDB_env *env)
     CHECK(mdb_drop(txn, dbi, 0), "dup range drop");
     CHECK(mdb_txn_commit(txn), "dup range drop commit");
     mdb_dbi_close(env, dbi);
+}
+
+static void
+test_count_all_plain(MDB_env *env)
+{
+    MDB_txn *txn;
+    MDB_dbi dbi;
+    MDB_val key, data;
+    char keybuf[16];
+    char valbuf[16];
+    uint64_t total = 0;
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "count_all plain begin");
+    CHECK(mdb_dbi_open(txn, "plain_all", MDB_CREATE | MDB_COUNTED, &dbi),
+          "count_all plain open");
+
+    CHECK(mdb_txn_commit(txn), "count_all plain commit empty");
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "count_all plain rd empty");
+    CHECK(mdb_count_all(txn, dbi, 0, &total), "count_all plain empty");
+    expect_eq(total, 0, "count_all plain empty total");
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "count_all plain load");
+    for (int i = 0; i < 25; ++i) {
+        snprintf(keybuf, sizeof(keybuf), "k%03d", i);
+        snprintf(valbuf, sizeof(valbuf), "v%03d", i);
+        key.mv_size = strlen(keybuf);
+        key.mv_data = keybuf;
+        data.mv_size = strlen(valbuf);
+        data.mv_data = valbuf;
+        CHECK(mdb_put(txn, dbi, &key, &data, 0), "count_all plain put");
+    }
+    CHECK(mdb_txn_commit(txn), "count_all plain load commit");
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "count_all plain rd full");
+    CHECK(mdb_count_all(txn, dbi, 0, &total), "count_all plain full");
+    expect_eq(total, 25, "count_all plain total");
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "count_all plain delete");
+    for (int i = 0; i < 10; ++i) {
+        snprintf(keybuf, sizeof(keybuf), "k%03d", i);
+        key.mv_size = strlen(keybuf);
+        key.mv_data = keybuf;
+        CHECK(mdb_del(txn, dbi, &key, NULL), "count_all plain del");
+    }
+    CHECK(mdb_txn_commit(txn), "count_all plain delete commit");
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "count_all plain rd trim");
+    CHECK(mdb_count_all(txn, dbi, 0, &total), "count_all plain trimmed");
+    expect_eq(total, 15, "count_all plain trimmed total");
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "count_all plain drop begin");
+    CHECK(mdb_drop(txn, dbi, 0), "count_all plain drop");
+    CHECK(mdb_txn_commit(txn), "count_all plain drop commit");
+    mdb_dbi_close(env, dbi);
+}
+
+static void
+test_count_all_dupsort(MDB_env *env)
+{
+    MDB_txn *txn;
+    MDB_dbi dbi;
+    MDB_val key, data;
+    char keybuf[8];
+    char valbuf[8];
+    uint64_t total = 0;
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "count_all dup begin");
+    CHECK(mdb_dbi_open(txn, "dup_all", MDB_CREATE | MDB_DUPSORT | MDB_COUNTED, &dbi),
+          "count_all dup open");
+
+    CHECK(mdb_txn_commit(txn), "count_all dup commit empty");
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "count_all dup rd empty");
+    CHECK(mdb_count_all(txn, dbi, 0, &total), "count_all dup empty");
+    expect_eq(total, 0, "count_all dup empty total");
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "count_all dup load");
+    for (int k = 0; k < 4; ++k) {
+        snprintf(keybuf, sizeof(keybuf), "k%d", k);
+        key.mv_size = strlen(keybuf);
+        key.mv_data = keybuf;
+        for (int v = 0; v < 6; ++v) {
+            snprintf(valbuf, sizeof(valbuf), "v%d", v);
+            data.mv_size = strlen(valbuf);
+            data.mv_data = valbuf;
+            CHECK(mdb_put(txn, dbi, &key, &data, 0), "count_all dup put");
+        }
+    }
+    CHECK(mdb_txn_commit(txn), "count_all dup load commit");
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "count_all dup rd full");
+    CHECK(mdb_count_all(txn, dbi, 0, &total), "count_all dup full");
+    expect_eq(total, 24, "count_all dup total");
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "count_all dup delete");
+    key.mv_size = 2;
+    key.mv_data = "k1";
+    data.mv_size = 2;
+    data.mv_data = "v0";
+    CHECK(mdb_del(txn, dbi, &key, &data), "count_all dup del");
+    data.mv_data = "v1";
+    CHECK(mdb_del(txn, dbi, &key, &data), "count_all dup del2");
+    CHECK(mdb_txn_commit(txn), "count_all dup delete commit");
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "count_all dup rd trim");
+    CHECK(mdb_count_all(txn, dbi, 0, &total), "count_all dup trimmed");
+    expect_eq(total, 22, "count_all dup trimmed total");
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "count_all dup drop begin");
+    CHECK(mdb_drop(txn, dbi, 0), "count_all dup drop");
+    CHECK(mdb_txn_commit(txn), "count_all dup drop commit");
+    mdb_dbi_close(env, dbi);
+}
+
+static void
+test_count_all_persistence(void)
+{
+    const char *path = "./count_all_persist";
+    const char *data_path = "./count_all_persist/data.mdb";
+    const char *lock_path = "./count_all_persist/lock.mdb";
+    MDB_env *env;
+    MDB_txn *txn;
+    MDB_dbi db_plain, db_dup;
+    MDB_val key, data;
+    char keybuf[16];
+    char valbuf[16];
+    uint64_t total = 0;
+
+    if (mkdir(path, 0777) && errno != EEXIST) {
+        fprintf(stderr, "mkdir %s failed: %s\n", path, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    unlink(data_path);
+    unlink(lock_path);
+
+    CHECK(mdb_env_create(&env), "persistence env create");
+    CHECK(mdb_env_set_maxdbs(env, 8), "persistence maxdbs");
+    CHECK(mdb_env_open(env, path, MDB_NOLOCK, 0664), "persistence env open");
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "persistence load begin");
+    CHECK(mdb_dbi_open(txn, "persist_plain", MDB_CREATE | MDB_COUNTED, &db_plain),
+          "persistence open plain");
+    CHECK(mdb_dbi_open(txn, "persist_dup", MDB_CREATE | MDB_COUNTED | MDB_DUPSORT,
+                       &db_dup),
+          "persistence open dup");
+
+    for (int i = 0; i < 16; ++i) {
+        snprintf(keybuf, sizeof(keybuf), "p%03d", i);
+        snprintf(valbuf, sizeof(valbuf), "v%03d", i);
+        key.mv_size = strlen(keybuf);
+        key.mv_data = keybuf;
+        data.mv_size = strlen(valbuf);
+        data.mv_data = valbuf;
+        CHECK(mdb_put(txn, db_plain, &key, &data, 0), "persistence put plain");
+    }
+
+    for (int k = 0; k < 3; ++k) {
+        snprintf(keybuf, sizeof(keybuf), "dk%02d", k);
+        key.mv_size = strlen(keybuf);
+        key.mv_data = keybuf;
+        for (int v = 0; v < 5; ++v) {
+            snprintf(valbuf, sizeof(valbuf), "dv%02d", v);
+            data.mv_size = strlen(valbuf);
+            data.mv_data = valbuf;
+            CHECK(mdb_put(txn, db_dup, &key, &data, 0), "persistence put dup");
+        }
+    }
+
+    CHECK(mdb_txn_commit(txn), "persistence load commit");
+    mdb_dbi_close(env, db_plain);
+    mdb_dbi_close(env, db_dup);
+    mdb_env_close(env);
+
+    CHECK(mdb_env_create(&env), "persistence env create rd");
+    CHECK(mdb_env_set_maxdbs(env, 8), "persistence maxdbs rd");
+    CHECK(mdb_env_open(env, path, MDB_NOLOCK, 0664), "persistence env open rd");
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "persistence read begin");
+    CHECK(mdb_dbi_open(txn, "persist_plain", MDB_COUNTED, &db_plain),
+          "persistence reopen plain");
+    CHECK(mdb_dbi_open(txn, "persist_dup", MDB_COUNTED | MDB_DUPSORT, &db_dup),
+          "persistence reopen dup");
+
+    CHECK(mdb_count_all(txn, db_plain, 0, &total), "persistence plain initial");
+    expect_eq(total, 16, "persistence plain initial total");
+    CHECK(mdb_count_all(txn, db_dup, 0, &total), "persistence dup initial");
+    expect_eq(total, 15, "persistence dup initial total");
+
+    mdb_txn_abort(txn);
+    mdb_dbi_close(env, db_plain);
+    mdb_dbi_close(env, db_dup);
+    mdb_env_close(env);
+
+    CHECK(mdb_env_create(&env), "persistence env create mutate");
+    CHECK(mdb_env_set_maxdbs(env, 8), "persistence maxdbs mutate");
+    CHECK(mdb_env_open(env, path, MDB_NOLOCK, 0664), "persistence env open mutate");
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "persistence mutate begin");
+    CHECK(mdb_dbi_open(txn, "persist_plain", MDB_COUNTED, &db_plain),
+          "persistence mutate plain");
+    CHECK(mdb_dbi_open(txn, "persist_dup", MDB_COUNTED | MDB_DUPSORT, &db_dup),
+          "persistence mutate dup");
+
+    for (int i = 0; i < 6; ++i) {
+        snprintf(keybuf, sizeof(keybuf), "p%03d", i);
+        key.mv_size = strlen(keybuf);
+        key.mv_data = keybuf;
+        CHECK(mdb_del(txn, db_plain, &key, NULL), "persistence delete plain");
+    }
+
+    key.mv_size = 4;
+    key.mv_data = "dk01";
+    for (int v = 0; v < 2; ++v) {
+        snprintf(valbuf, sizeof(valbuf), "dv%02d", v);
+        data.mv_size = strlen(valbuf);
+        data.mv_data = valbuf;
+        CHECK(mdb_del(txn, db_dup, &key, &data), "persistence delete dup");
+    }
+
+    CHECK(mdb_txn_commit(txn), "persistence mutate commit");
+    mdb_dbi_close(env, db_plain);
+    mdb_dbi_close(env, db_dup);
+    mdb_env_close(env);
+
+    CHECK(mdb_env_create(&env), "persistence env create verify");
+    CHECK(mdb_env_set_maxdbs(env, 8), "persistence maxdbs verify");
+    CHECK(mdb_env_open(env, path, MDB_NOLOCK, 0664), "persistence env open verify");
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "persistence verify begin");
+    CHECK(mdb_dbi_open(txn, "persist_plain", MDB_COUNTED, &db_plain),
+          "persistence verify plain");
+    CHECK(mdb_dbi_open(txn, "persist_dup", MDB_COUNTED | MDB_DUPSORT, &db_dup),
+          "persistence verify dup");
+
+    CHECK(mdb_count_all(txn, db_plain, 0, &total), "persistence plain final");
+    expect_eq(total, 10, "persistence plain final total");
+    CHECK(mdb_count_all(txn, db_dup, 0, &total), "persistence dup final");
+    expect_eq(total, 13, "persistence dup final total");
+
+    mdb_txn_abort(txn);
+    mdb_dbi_close(env, db_plain);
+    mdb_dbi_close(env, db_dup);
+    mdb_env_close(env);
+
+    CHECK(mdb_env_create(&env), "persistence env create cleanup");
+    CHECK(mdb_env_set_maxdbs(env, 8), "persistence maxdbs cleanup");
+    CHECK(mdb_env_open(env, path, MDB_NOLOCK, 0664), "persistence env open cleanup");
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "persistence cleanup begin");
+    CHECK(mdb_dbi_open(txn, "persist_plain", MDB_COUNTED, &db_plain),
+          "persistence cleanup plain");
+    CHECK(mdb_drop(txn, db_plain, 0), "persistence drop plain");
+    CHECK(mdb_dbi_open(txn, "persist_dup", MDB_COUNTED | MDB_DUPSORT, &db_dup),
+          "persistence cleanup dup");
+    CHECK(mdb_drop(txn, db_dup, 0), "persistence drop dup");
+    CHECK(mdb_txn_commit(txn), "persistence cleanup commit");
+    mdb_dbi_close(env, db_plain);
+    mdb_dbi_close(env, db_dup);
+    mdb_env_close(env);
+
+    unlink(data_path);
+    unlink(lock_path);
+    rmdir(path);
 }
 
 static void
@@ -1737,6 +2009,9 @@ main(void)
     test_extreme_keys(env);
     test_custom_comparator(env);
     test_range_count_values(env);
+    test_count_all_plain(env);
+    test_count_all_dupsort(env);
+    test_count_all_persistence();
     test_overwrite_stability(env);
     test_cursor_deletions(env);
     test_split_merge(env);

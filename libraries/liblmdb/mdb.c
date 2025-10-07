@@ -1016,7 +1016,7 @@ typedef struct MDB_page {
 #define	P_LOOSE		 0x4000		/**< page was dirtied then freed, can be reused */
 #define	P_KEEP		 0x8000		/**< leave this page alone during spill */
 #define MDB_COUNT_ALLOWED_FLAGS \
-	(MDB_COUNT_DISTINCT_KEYS|MDB_COUNT_LOWER_INCL|MDB_COUNT_UPPER_INCL)
+	(MDB_COUNT_LOWER_INCL|MDB_COUNT_UPPER_INCL)
 /** @} */
 	uint16_t	mp_flags;		/**< @ref mdb_page */
 #define mp_lower	mp_pb.pb.pb_lower
@@ -11724,41 +11724,29 @@ int mdb_dbi_open(MDB_txn *txn, const char *name, unsigned int flags, MDB_dbi *db
 int ESECT
 mdb_count_all(MDB_txn *txn, MDB_dbi dbi, unsigned flags, uint64_t *out)
 {
-	MDB_db *db;
-	MDB_cursor mc;
-	MDB_page *root;
-	uint64_t total;
-	int rc;
-
 	if (!out || !TXN_DBI_EXIST(txn, dbi, DB_VALID))
 		return EINVAL;
 	if (flags & ~MDB_COUNT_ALLOWED_FLAGS)
 		return EINVAL;
-	db = &txn->mt_dbs[dbi];
+
+	MDB_db *db = &txn->mt_dbs[dbi];
+	unsigned char *dbflag = &txn->mt_dbflags[dbi];
+	MDB_xcursor mx, *mxp = NULL;
+
 	if (!(db->md_flags & MDB_COUNTED))
 		return MDB_INCOMPATIBLE;
-	if (db->md_flags & MDB_DUPSORT)
-		return MDB_INCOMPATIBLE;
-	if (db->md_root == P_INVALID) {
-		*out = 0;
-		return MDB_SUCCESS;
+	if (db->md_flags & MDB_DUPSORT) {
+		memset(&mx, 0, sizeof(mx));
+		mxp = &mx;
+	}
+	if (*dbflag & DB_STALE) {
+		MDB_cursor mc;
+		mdb_cursor_init(&mc, txn, dbi, mxp);
+		/* Refresh pointer after cursor init updates metadata. */
+		db = &txn->mt_dbs[dbi];
 	}
 
-	mdb_cursor_init(&mc, txn, dbi, NULL);
-	rc = mdb_page_get(&mc, db->md_root, &root, NULL);
-	if (rc == MDB_PAGE_NOTFOUND && !db->md_entries) {
-		*out = 0;
-		return MDB_SUCCESS;
-	}
-	if (rc)
-		return rc;
-	if (IS_LEAF(root) || IS_LEAF2(root))
-		total = mdb_leaf_count(root);
-	else if (IS_COUNTED(root))
-		total = mdb_branch_sum(root);
-	else
-		total = mdb_page_count(&mc, root);
-	*out = total;
+	*out = db->md_entries;
 	return MDB_SUCCESS;
 }
 
