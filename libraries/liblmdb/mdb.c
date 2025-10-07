@@ -9908,6 +9908,11 @@ mdb_cursor_del0(MDB_cursor *mc)
 	MDB_cursor *m2, *m3;
 	MDB_dbi dbi = mc->mc_dbi;
 	int counted = (mc->mc_db->md_flags & MDB_COUNTED) && !(mc->mc_db->md_flags & MDB_DUPSORT);
+	MDB_page *parent = NULL;
+	MDB_node *parent_ref = NULL;
+	indx_t parent_idx = 0;
+	uint64_t parent_before = 0;
+	int have_direct_parent = 0;
 
 	ki = mc->mc_ki[mc->mc_top];
 	mp = mc->mc_pg[mc->mc_top];
@@ -9922,18 +9927,39 @@ mdb_cursor_del0(MDB_cursor *mc)
 			prior_total = mdb_leaf_count(mp);
 			removal_contrib = mdb_leaf_entry_contribution(mp, leaf);
 		}
+		if (mc->mc_top > 0) {
+			parent_idx = mc->mc_ki[mc->mc_top - 1];
+			parent = mc->mc_pg[mc->mc_top - 1];
+			if (parent && IS_BRANCH(parent) && IS_COUNTED(parent) && parent_idx < NUMKEYS(parent)) {
+				MDB_node *ref = NODEPTR(parent, parent_idx);
+				if (NODEPGNO(ref) == mp->mp_pgno) {
+					parent_ref = ref;
+					parent_before = mdb_node_get_count(parent, ref);
+					have_direct_parent = 1;
+				}
+			}
+		}
 	}
 	mdb_node_del(mc, mc->mc_db->md_pad);
 	mc->mc_db->md_entries--;
 	if (counted && mc->mc_top > 0) {
-		MDB_page *parent = mc->mc_pg[mc->mc_top - 1];
-		uint64_t leaf_after = mdb_leaf_count(mp);
-		int64_t diff = - (int64_t)removal_contrib;
-		int64_t delta = mdb_update_parent_count(parent, mp->mp_pgno, leaf_after);
-		if (!delta && diff)
-			delta = diff;
-		if (!delta)
-			delta = (int64_t)leaf_after - (int64_t)prior_total;
+		uint64_t leaf_after = prior_total;
+		if (removal_contrib >= leaf_after)
+			leaf_after = 0;
+		else
+			leaf_after -= removal_contrib;
+		int64_t delta;
+		if (have_direct_parent) {
+			if (leaf_after != parent_before)
+				mdb_node_set_count(parent, parent_ref, leaf_after);
+			delta = (int64_t)leaf_after - (int64_t)parent_before;
+		} else {
+			delta = mdb_update_parent_count(parent, mp->mp_pgno, leaf_after);
+			if (!delta && removal_contrib)
+				delta = - (int64_t)removal_contrib;
+			if (!delta)
+				delta = (int64_t)leaf_after - (int64_t)prior_total;
+		}
 		if (delta)
 			mdb_propagate_count_delta(mc, mc->mc_top - 2, delta);
 	}
