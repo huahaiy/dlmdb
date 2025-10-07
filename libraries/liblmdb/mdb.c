@@ -8363,30 +8363,44 @@ bad_sub:
 	if (rc == MDB_SUCCESS) {
 		if ((mc->mc_db->md_flags & MDB_COUNTED) &&
 		    !(mc->mc_db->md_flags & MDB_DUPSORT)) {
-			int64_t delta = insert_data;
+			int64_t delta = insert_key ? 1 : 0;
 			if (delta && mc->mc_top > 0) {
 				int level = mc->mc_top - 1;
 				MDB_page *leaf = mc->mc_pg[mc->mc_top];
 				MDB_page *parent = mc->mc_pg[level];
-				uint64_t leaf_total = mdb_page_subtree_count(leaf);
+				uint64_t leaf_total = 0;
+				uint64_t before = 0;
+				uint64_t after = 0;
 				int64_t diff = 0;
+				int slot_matched = 0;
 				if (parent && IS_BRANCH(parent) && IS_COUNTED(parent)) {
 					indx_t idx = mc->mc_ki[level];
 					if (idx < NUMKEYS(parent)) {
 						MDB_node *node = NODEPTR(parent, idx);
 						if (NODEPGNO(node) == leaf->mp_pgno) {
-							uint64_t before = mdb_node_get_count(parent, node);
-							uint64_t after = leaf_total;
-							diff = (int64_t)after - (int64_t)before;
-							if (diff != 0)
+							before = mdb_node_get_count(parent, node);
+							if (split_performed) {
+								if (!leaf_total)
+									leaf_total = mdb_page_subtree_count(leaf);
+								after = leaf_total;
+							} else {
+								after = before + (uint64_t)delta;
+							}
+							if (after != before)
 								mdb_node_set_count(parent, node, after);
+							diff = (int64_t)(after - before);
+							slot_matched = 1;
 						}
 					}
 				}
-				if (diff == 0)
+				if (!slot_matched) {
+					leaf_total = mdb_page_subtree_count(leaf);
 					diff = mdb_update_parent_count(parent, leaf->mp_pgno, leaf_total);
-				if (diff == 0 && split_performed)
-					diff = delta;
+					if (diff == 0 && split_performed)
+						diff = delta;
+					after = leaf_total;
+					before = after - (uint64_t)diff;
+				}
 				if (diff != 0)
 					mdb_propagate_count_delta(mc, level - 1, diff);
 			}
