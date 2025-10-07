@@ -79,6 +79,73 @@ naive_count(MDB_txn *txn, MDB_dbi dbi,
     return total;
 }
 
+static uint64_t
+naive_count_values(MDB_txn *txn, MDB_dbi dbi,
+                   const MDB_val *key_low, const MDB_val *key_high,
+                   int key_lower_incl, int key_upper_incl,
+                   const MDB_val *val_low, const MDB_val *val_high,
+                   int val_lower_incl, int val_upper_incl,
+                   MDB_cmp_func *kcmp, MDB_cmp_func *vcmp)
+{
+    MDB_cursor *cur;
+    MDB_val key, data;
+    uint64_t total = 0;
+    int rc = mdb_cursor_open(txn, dbi, &cur);
+    CHECK(rc, "naive_count_values cursor_open");
+
+    if (!kcmp)
+        kcmp = cmp_key;
+    if (!vcmp)
+        vcmp = cmp_key;
+
+    rc = mdb_cursor_get(cur, &key, &data, MDB_FIRST);
+    while (rc == MDB_SUCCESS) {
+        int skip = 0;
+        if (key_low) {
+            int cmp = kcmp(&key, key_low);
+            if (cmp < 0 || (cmp == 0 && !key_lower_incl))
+                skip = 1;
+        }
+        if (!skip && key_high) {
+            int cmp = kcmp(&key, key_high);
+            if (cmp > 0 || (cmp == 0 && !key_upper_incl)) {
+                break;
+            }
+        }
+        if (!skip) {
+            MDB_val dup_key = key;
+            MDB_val dup_data = data;
+            int drc = mdb_cursor_get(cur, &dup_key, &dup_data, MDB_GET_CURRENT);
+            CHECK(drc, "naive_count_values get_current");
+            while (1) {
+                int include = 1;
+                if (val_low) {
+                    int cmp = vcmp(&dup_data, val_low);
+                    if (cmp < 0 || (cmp == 0 && !val_lower_incl))
+                        include = 0;
+                }
+                if (include && val_high) {
+                    int cmp = vcmp(&dup_data, val_high);
+                    if (cmp > 0 || (cmp == 0 && !val_upper_incl))
+                        break;
+                }
+                if (include)
+                    total++;
+                drc = mdb_cursor_get(cur, &dup_key, &dup_data, MDB_NEXT_DUP);
+                if (drc == MDB_NOTFOUND)
+                    break;
+                CHECK(drc, "naive_count_values next_dup");
+            }
+        }
+        rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT_NODUP);
+    }
+    if (rc != MDB_NOTFOUND)
+        CHECK(rc, "naive_count_values next_nodup");
+
+    mdb_cursor_close(cur);
+    return total;
+}
+
 static void
 expect_eq(uint64_t got, uint64_t want, const char *msg)
 {
@@ -677,6 +744,156 @@ test_custom_comparator(MDB_env *env)
     expect_eq(total, naive, "custom head excl one");
 
     mdb_txn_abort(txn);
+    mdb_dbi_close(env, dbi);
+}
+
+static void
+test_range_count_values(MDB_env *env)
+{
+    MDB_txn *txn;
+    MDB_dbi dbi;
+    MDB_val key, data;
+    char keybuf[16];
+    char valbuf[2];
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "dup range begin");
+    CHECK(mdb_dbi_open(txn, "dup_values", MDB_CREATE | MDB_DUPSORT | MDB_COUNTED, &dbi),
+          "dup range open");
+
+    for (int i = 0; i < 6; ++i) {
+        snprintf(keybuf, sizeof(keybuf), "k%02d", i);
+        key.mv_size = strlen(keybuf);
+        key.mv_data = keybuf;
+        for (int j = 0; j < 5; ++j) {
+            valbuf[0] = 'a' + j;
+            valbuf[1] = '\0';
+            data.mv_size = 1;
+            data.mv_data = valbuf;
+            CHECK(mdb_put(txn, dbi, &key, &data, 0), "dup range put");
+        }
+    }
+
+    CHECK(mdb_txn_commit(txn), "dup range commit");
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "dup range read");
+
+    MDB_val key_low, key_high, val_low, val_high;
+    uint64_t counted = 0;
+    uint64_t naive = 0;
+
+    key_low.mv_data = "k01";
+    key_low.mv_size = 3;
+    key_high.mv_data = "k03";
+    key_high.mv_size = 3;
+
+    naive = naive_count_values(txn, dbi, &key_low, &key_high, 1, 1,
+                               NULL, NULL, 0, 0, cmp_key, cmp_key);
+    CHECK(mdb_range_count_values(txn, dbi, &key_low, &key_high,
+                                 MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
+                                 NULL, NULL, 0, &counted),
+          "dup range full values");
+    expect_eq(counted, naive, "dup range full values match");
+
+    val_low.mv_data = "b";
+    val_low.mv_size = 1;
+    val_high.mv_data = "d";
+    val_high.mv_size = 1;
+
+    naive = naive_count_values(txn, dbi, &key_low, &key_high, 1, 1,
+                               &val_low, &val_high, 1, 0,
+                               cmp_key, cmp_key);
+    CHECK(mdb_range_count_values(txn, dbi, &key_low, &key_high,
+                                 MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
+                                 &val_low, &val_high, MDB_COUNT_LOWER_INCL,
+                                 &counted),
+          "dup range mid window");
+    expect_eq(counted, naive, "dup range mid window match");
+
+    val_low.mv_data = "c";
+    val_low.mv_size = 1;
+    val_high.mv_data = "c";
+    val_high.mv_size = 1;
+
+    naive = naive_count_values(txn, dbi, &key_low, &key_high, 1, 1,
+                               &val_low, &val_high, 1, 1,
+                               cmp_key, cmp_key);
+    CHECK(mdb_range_count_values(txn, dbi, &key_low, &key_high,
+                                 MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
+                                 &val_low, &val_high,
+                                 MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
+                                 &counted),
+          "dup range point value");
+    expect_eq(counted, naive, "dup range point value match");
+
+    val_low.mv_data = "y";
+    val_low.mv_size = 1;
+    val_high.mv_data = "z";
+    val_high.mv_size = 1;
+
+    naive = naive_count_values(txn, dbi, &key_low, &key_high, 1, 1,
+                               &val_low, &val_high, 1, 1,
+                               cmp_key, cmp_key);
+    CHECK(mdb_range_count_values(txn, dbi, &key_low, &key_high,
+                                 MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
+                                 &val_low, &val_high,
+                                 MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
+                                 &counted),
+          "dup range empty window");
+    expect_eq(counted, naive, "dup range empty window zero");
+
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "dup range add begin");
+    key.mv_data = "k02";
+    key.mv_size = 3;
+    for (int j = 0; j < 3; ++j) {
+        valbuf[0] = (char)('f' + j);
+        valbuf[1] = '\0';
+        data.mv_size = 1;
+        data.mv_data = valbuf;
+        CHECK(mdb_put(txn, dbi, &key, &data, 0), "dup range add dup");
+    }
+    CHECK(mdb_txn_commit(txn), "dup range add commit");
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "dup range delete begin");
+    key.mv_data = "k01";
+    key.mv_size = 3;
+    data.mv_size = 1;
+    data.mv_data = "a";
+    CHECK(mdb_del(txn, dbi, &key, &data), "dup range delete a");
+    data.mv_data = "b";
+    CHECK(mdb_del(txn, dbi, &key, &data), "dup range delete b");
+    CHECK(mdb_txn_commit(txn), "dup range delete commit");
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "dup range reread");
+
+    naive = naive_count_values(txn, dbi, &key_low, &key_high, 1, 1,
+                               NULL, NULL, 0, 0, cmp_key, cmp_key);
+    CHECK(mdb_range_count_values(txn, dbi, &key_low, &key_high,
+                                 MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
+                                 NULL, NULL, 0, &counted),
+          "dup range post mutate full");
+    expect_eq(counted, naive, "dup range post mutate full match");
+
+    val_low.mv_data = "b";
+    val_low.mv_size = 1;
+    val_high.mv_data = "d";
+    val_high.mv_size = 1;
+    naive = naive_count_values(txn, dbi, &key_low, &key_high, 1, 1,
+                               &val_low, &val_high, 1, 0,
+                               cmp_key, cmp_key);
+    CHECK(mdb_range_count_values(txn, dbi, &key_low, &key_high,
+                                 MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
+                                 &val_low, &val_high, MDB_COUNT_LOWER_INCL,
+                                 &counted),
+          "dup range post mutate mid");
+    expect_eq(counted, naive, "dup range post mutate mid match");
+
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "dup range drop begin");
+    CHECK(mdb_drop(txn, dbi, 0), "dup range drop");
+    CHECK(mdb_txn_commit(txn), "dup range drop commit");
     mdb_dbi_close(env, dbi);
 }
 
@@ -1577,6 +1794,7 @@ main(void)
     test_single_key(env);
     test_extreme_keys(env);
     test_custom_comparator(env);
+    test_range_count_values(env);
     test_overwrite_stability(env);
     test_cursor_deletions(env);
     test_split_merge(env);
