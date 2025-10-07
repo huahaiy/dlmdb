@@ -1731,6 +1731,36 @@ mdb_branch_sum(const MDB_page *mp)
 	return total;
 }
 
+static uint64_t
+mdb_leaf_contribution(const MDB_page *mp)
+{
+	return mdb_leaf_count(mp);
+}
+
+static uint64_t
+mdb_page_subtree_count(MDB_page *mp)
+{
+	if (IS_LEAF(mp) || IS_LEAF2(mp))
+		return mdb_leaf_contribution(mp);
+	if (IS_BRANCH(mp) && IS_COUNTED(mp))
+		return mdb_branch_sum(mp);
+	return 0;
+}
+
+static void
+mdb_update_parent_count(MDB_page *parent, pgno_t child_pgno, uint64_t total)
+{
+	if (!parent || !IS_BRANCH(parent) || !IS_COUNTED(parent))
+		return;
+	for (indx_t i = 0; i < NUMKEYS(parent); ++i) {
+		MDB_node *node = NODEPTR(parent, i);
+		if (NODEPGNO(node) == child_pgno) {
+			mdb_node_set_count(parent, node, total);
+			break;
+		}
+	}
+}
+
 static uint64_t mdb_branch_child_count(MDB_cursor *mc, MDB_page *mp, MDB_node *node);
 
 static uint64_t
@@ -1766,28 +1796,28 @@ mdb_branch_child_count(MDB_cursor *mc, MDB_page *mp, MDB_node *node)
 }
 
 static void
-mdb_refresh_branch_counts(MDB_cursor *mc, MDB_page *mp)
-{
-	if (!IS_BRANCH(mp) || !IS_COUNTED(mp))
-		return;
-	for (indx_t i = 0; i < NUMKEYS(mp); ++i) {
-		MDB_node *node = NODEPTR(mp, i);
-		uint64_t count = mdb_branch_child_count(mc, mp, node);
-		mdb_node_set_count(mp, node, count);
-	}
-}
-
-static void
 mdb_cursor_refresh_counts(MDB_cursor *mc)
 {
 	if (!(mc->mc_db->md_flags & MDB_COUNTED))
 		return;
 	if (mc->mc_db->md_flags & MDB_DUPSORT)
 		return;
-	for (int level = mc->mc_top; level >= 0; --level) {
-		MDB_page *mp = mc->mc_pg[level];
-		if (mp && IS_BRANCH(mp) && IS_COUNTED(mp))
-			mdb_refresh_branch_counts(mc, mp);
+	if (!mc->mc_snum)
+		return;
+	MDB_page *child = mc->mc_pg[mc->mc_top];
+	for (int level = mc->mc_top - 1; level >= 0; --level) {
+		MDB_page *parent = mc->mc_pg[level];
+		if (!parent)
+			break;
+		if (!IS_BRANCH(parent) || !IS_COUNTED(parent)) {
+			child = parent;
+			continue;
+		}
+		indx_t idx = mc->mc_ki[level];
+		MDB_node *node = NODEPTR(parent, idx);
+		uint64_t total = mdb_page_subtree_count(child);
+		mdb_node_set_count(parent, node, total);
+		child = parent;
 	}
 }
 
@@ -8667,7 +8697,7 @@ update:
 		if (pgno != 0) {
 			MDB_page *child;
 			if (mdb_page_get(mc, pgno, &child, NULL) == MDB_SUCCESS)
-				child_count = mdb_page_count(mc, child);
+				child_count = mdb_page_subtree_count(child);
 		}
 		mdb_node_set_count(mp, node, child_count);
 	}
@@ -9155,6 +9185,7 @@ mdb_node_move(MDB_cursor *csrc, MDB_cursor *cdst, int fromleft)
 	MDB_cursor mn;
 	int			 rc;
 	unsigned short flags;
+	MDB_page	*psrc, *pdst;
 
 	DKBUF;
 
@@ -9162,6 +9193,9 @@ mdb_node_move(MDB_cursor *csrc, MDB_cursor *cdst, int fromleft)
 	if ((rc = mdb_page_touch(csrc)) ||
 	    (rc = mdb_page_touch(cdst)))
 		return rc;
+
+	psrc = csrc->mc_pg[csrc->mc_top];
+	pdst = cdst->mc_pg[cdst->mc_top];
 
 	if (IS_LEAF2(csrc->mc_pg[csrc->mc_top])) {
 		key.mv_size = csrc->mc_db->md_pad;
@@ -9364,6 +9398,15 @@ mdb_node_move(MDB_cursor *csrc, MDB_cursor *cdst, int fromleft)
 		}
 	}
 
+	if ((csrc->mc_db->md_flags & MDB_COUNTED) &&
+	    !(csrc->mc_db->md_flags & MDB_DUPSORT) && csrc->mc_top > 0) {
+		MDB_page *parent = csrc->mc_pg[csrc->mc_top - 1];
+		uint64_t src_total = mdb_page_subtree_count(psrc);
+		uint64_t dst_total = mdb_page_subtree_count(pdst);
+		mdb_update_parent_count(parent, psrc->mp_pgno, src_total);
+		mdb_update_parent_count(parent, pdst->mp_pgno, dst_total);
+	}
+
 	return MDB_SUCCESS;
 }
 
@@ -9448,6 +9491,13 @@ mdb_page_merge(MDB_cursor *csrc, MDB_cursor *cdst)
 	DPRINTF(("dst page %"Yu" now has %u keys (%.1f%% filled)",
 	    pdst->mp_pgno, NUMKEYS(pdst),
 		(float)PAGEFILL(cdst->mc_txn->mt_env, pdst) / 10));
+
+	if ((cdst->mc_db->md_flags & MDB_COUNTED) &&
+	    !(cdst->mc_db->md_flags & MDB_DUPSORT) && cdst->mc_top > 0) {
+		MDB_page *parent = cdst->mc_pg[cdst->mc_top - 1];
+		uint64_t dst_total = mdb_page_subtree_count(pdst);
+		mdb_update_parent_count(parent, pdst->mp_pgno, dst_total);
+	}
 
 	/* Unlink the src page from parent and add to free list.
 	 */
@@ -9741,6 +9791,11 @@ mdb_cursor_del0(MDB_cursor *mc)
 	mp = mc->mc_pg[mc->mc_top];
 	mdb_node_del(mc, mc->mc_db->md_pad);
 	mc->mc_db->md_entries--;
+	if (counted && mc->mc_top > 0) {
+		MDB_page *parent = mc->mc_pg[mc->mc_top - 1];
+		uint64_t leaf_total = mdb_leaf_contribution(mp);
+		mdb_update_parent_count(parent, mp->mp_pgno, leaf_total);
+	}
 	{
 		/* Adjust other cursors pointing to mp */
 		for (m2 = mc->mc_txn->mt_cursors[dbi]; m2; m2=m2->mc_next) {
@@ -10270,6 +10325,17 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 	}
 
 	{
+		if ((mc->mc_db->md_flags & MDB_COUNTED) &&
+		    !(mc->mc_db->md_flags & MDB_DUPSORT) && mc->mc_top > 0) {
+			MDB_page *parent = mc->mc_pg[ptop];
+			if (parent) {
+				mdb_update_parent_count(parent, mp->mp_pgno,
+				    mdb_page_subtree_count(mp));
+				mdb_update_parent_count(parent, rp->mp_pgno,
+				    mdb_page_subtree_count(rp));
+			}
+		}
+
 		/* Adjust other cursors pointing to mp */
 		MDB_cursor *m2, *m3;
 		MDB_dbi dbi = mc->mc_dbi;
