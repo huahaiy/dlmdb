@@ -11824,174 +11824,22 @@ mdb_count_range(MDB_txn *txn, MDB_dbi dbi,
 	return MDB_SUCCESS;
 }
 
-static int
-mdb_count_value_range_scan(MDB_cursor *base, MDB_cmp_func *cmp,
-	const MDB_val *low, const MDB_val *high,
-	int lower_incl, int upper_incl, uint64_t *out)
-{
-	MDB_cursor cur;
-	MDB_val vcur = {0}, data = {0};
-	int rc;
-
-	*out = 0;
-	if (!cmp)
-		return MDB_PROBLEM;
-	if (!(base->mc_flags & C_INITIALIZED) || !base->mc_snum)
-		return MDB_SUCCESS;
-
-	mdb_cursor_copy(base, &cur);
-
-	if (low) {
-		vcur = *low;
-		rc = mdb_cursor_get(&cur, &vcur, &data, MDB_SET_RANGE);
-		if (rc == MDB_NOTFOUND)
-			return MDB_SUCCESS;
-		if (rc != MDB_SUCCESS)
-			return rc;
-	} else {
-		rc = mdb_cursor_get(&cur, &vcur, &data, MDB_FIRST);
-		if (rc == MDB_NOTFOUND)
-			return MDB_SUCCESS;
-		if (rc != MDB_SUCCESS)
-			return rc;
-	}
-
-	while (1) {
-		int skip = 0;
-		if (low) {
-			int cmp_low = cmp(&vcur, (MDB_val *)low);
-			if (cmp_low < 0 || (cmp_low == 0 && !lower_incl))
-				skip = 1;
-		}
-		if (!skip && high) {
-			int cmp_high = cmp(&vcur, (MDB_val *)high);
-			if (cmp_high > 0 || (cmp_high == 0 && !upper_incl))
-				break;
-		}
-		if (!skip)
-			(*out)++;
-		rc = mdb_cursor_get(&cur, &vcur, &data, MDB_NEXT);
-		if (rc == MDB_NOTFOUND)
-			return MDB_SUCCESS;
-		if (rc != MDB_SUCCESS)
-			return rc;
-	}
-
-	return MDB_SUCCESS;
-}
-
-static int
-mdb_count_value_range_for_key(MDB_cursor *mc, const MDB_val *low,
-	const MDB_val *high, unsigned flags, uint64_t *out)
-{
-	MDB_node *leaf;
-	MDB_cmp_func *dcmp = mc->mc_dbx->md_dcmp ?
-	    mc->mc_dbx->md_dcmp : mc->mc_dbx->md_cmp;
-	int lower_incl = (flags & MDB_COUNT_LOWER_INCL) != 0;
-	int upper_incl = (flags & MDB_COUNT_UPPER_INCL) != 0;
-	int rc;
-
-	*out = 0;
-
-	leaf = NODEPTR(mc->mc_pg[mc->mc_top], mc->mc_ki[mc->mc_top]);
-	if (!(leaf->mn_flags & F_DUPDATA)) {
-		MDB_val datum;
-		if (!dcmp)
-			dcmp = mc->mc_dbx->md_cmp;
-		if (!dcmp)
-			return MDB_PROBLEM;
-		rc = mdb_node_read(mc, leaf, &datum);
-		if (rc)
-			return rc;
-		int include = 1;
-		if (low) {
-			int c = dcmp(&datum, (MDB_val *)low);
-			if (c < 0 || (c == 0 && !lower_incl))
-				include = 0;
-		}
-		if (include && high) {
-			int c = dcmp(&datum, (MDB_val *)high);
-			if (c > 0 || (c == 0 && !upper_incl))
-				include = 0;
-		}
-		*out = include ? 1 : 0;
-		return MDB_SUCCESS;
-	}
-
-	if (!mc->mc_xcursor)
-		return MDB_INCOMPATIBLE;
-	if (!(mc->mc_xcursor->mx_cursor.mc_flags & C_INITIALIZED)) {
-		MDB_val tmpk = {0}, tmpd = {0};
-		rc = mdb_cursor_get(mc, &tmpk, &tmpd, MDB_GET_CURRENT);
-		if (rc)
-			return rc;
-	}
-
-	MDB_cursor *base = &mc->mc_xcursor->mx_cursor;
-	MDB_cmp_func *dup_cmp = (base->mc_dbx && base->mc_dbx->md_cmp) ?
-	    base->mc_dbx->md_cmp : dcmp;
-	if (!dup_cmp)
-		return MDB_PROBLEM;
-
-	if (!low && !high) {
-		*out = base->mc_db ? base->mc_db->md_entries : 0;
-		return MDB_SUCCESS;
-	}
-
-	if (!(base->mc_db && (base->mc_db->md_flags & MDB_COUNTED)))
-		return mdb_count_value_range_scan(base, dup_cmp, low, high,
-		    lower_incl, upper_incl, out);
-
-	uint64_t upper = 0, lower = 0;
-
-	if (high) {
-		MDB_cursor hi_cur = {0};
-		mdb_cursor_copy(base, &hi_cur);
-		hi_cur.mc_xcursor = NULL;
-		hi_cur.mc_dbflag = base->mc_dbflag;
-		rc = mdb_dup_prefix_count_internal(base, &hi_cur,
-		    dup_cmp, high, upper_incl, &upper);
-		if (rc != MDB_SUCCESS)
-			return rc;
-	} else {
-		upper = base->mc_db->md_entries;
-	}
-
-	if (low) {
-		MDB_cursor lo_cur = {0};
-		mdb_cursor_copy(base, &lo_cur);
-		lo_cur.mc_xcursor = NULL;
-		lo_cur.mc_dbflag = base->mc_dbflag;
-		int include_self = !lower_incl;
-		rc = mdb_dup_prefix_count_internal(base, &lo_cur,
-		    dup_cmp, low, include_self, &lower);
-		if (rc != MDB_SUCCESS)
-			return rc;
-	}
-
-	*out = (upper >= lower) ? (upper - lower) : 0;
-	return MDB_SUCCESS;
-}
-
 int ESECT
 mdb_range_count_values(MDB_txn *txn, MDB_dbi dbi,
 	const MDB_val *key_low, const MDB_val *key_high, unsigned key_flags,
-	const MDB_val *val_low, const MDB_val *val_high, unsigned val_flags,
 	uint64_t *out)
 {
 	MDB_db *db;
-	MDB_cmp_func *kcmp;
-	MDB_cmp_func *dcmp;
+	MDB_cmp_func *key_cmp;
 	int rc;
 	int key_lower_incl = (key_flags & MDB_COUNT_LOWER_INCL) != 0;
 	int key_upper_incl = (key_flags & MDB_COUNT_UPPER_INCL) != 0;
-	int val_upper_incl = (val_flags & MDB_COUNT_UPPER_INCL) != 0;
 
 	if (!out || !TXN_DBI_EXIST(txn, dbi, DB_VALID))
 		return EINVAL;
+	if (txn->mt_flags & MDB_TXN_BLOCKED)
+		return MDB_BAD_TXN;
 	if (key_flags & ~MDB_COUNT_ALLOWED_FLAGS)
-		return EINVAL;
-	if (val_flags & ~MDB_COUNT_ALLOWED_FLAGS)
 		return EINVAL;
 
 	db = &txn->mt_dbs[dbi];
@@ -12005,120 +11853,42 @@ mdb_range_count_values(MDB_txn *txn, MDB_dbi dbi,
 		return MDB_SUCCESS;
 	}
 
-	kcmp = txn->mt_dbxs[dbi].md_cmp;
-	dcmp = txn->mt_dbxs[dbi].md_dcmp ? txn->mt_dbxs[dbi].md_dcmp : kcmp;
-	if (!kcmp || !dcmp)
+	key_cmp = txn->mt_dbxs[dbi].md_cmp;
+	if (!key_cmp)
 		return MDB_PROBLEM;
 
 	if (key_low && key_high) {
-		int c = kcmp((MDB_val *)key_low, (MDB_val *)key_high);
-		if (c > 0)
-			return (*out = 0, MDB_SUCCESS);
-		if (c == 0 && !(key_lower_incl && key_upper_incl))
-			return (*out = 0, MDB_SUCCESS);
+		int c = key_cmp((MDB_val *)key_low, (MDB_val *)key_high);
+		if (c > 0 || (c == 0 && !(key_lower_incl && key_upper_incl))) {
+			*out = 0;
+			return MDB_SUCCESS;
+		}
 	}
 
-	if (val_low && val_high) {
-		int c = dcmp((MDB_val *)val_low, (MDB_val *)val_high);
-		if (c > 0)
-			return (*out = 0, MDB_SUCCESS);
-		if (c == 0 && !((val_flags & MDB_COUNT_LOWER_INCL) &&
-		    (val_flags & MDB_COUNT_UPPER_INCL)))
-			return (*out = 0, MDB_SUCCESS);
+	uint64_t upper = 0, lower = 0;
+
+	if (key_high) {
+		rc = mdb_prefix_pair_leq(txn, dbi, key_high,
+		    key_upper_incl, NULL, key_upper_incl ? 1 : 0, &upper);
+		if (rc != MDB_SUCCESS)
+			return rc;
+	} else {
+		upper = db->md_entries;
 	}
 
-	uint64_t total = 0;
-
-	if (!val_low && !val_high) {
-		uint64_t upper = 0, lower = 0;
-		if (key_high) {
-			const MDB_val *upper_val = NULL;
-			int upper_val_incl = 0;
-			if (key_upper_incl) {
-				upper_val = val_high;
-				upper_val_incl = val_high ? (val_upper_incl ? 1 : 0) : 1;
-			}
-			rc = mdb_prefix_pair_leq(txn, dbi, key_high,
-			    key_upper_incl, upper_val, upper_val_incl, &upper);
+	if (key_low) {
+		if (!key_lower_incl) {
+			rc = mdb_prefix_pair_leq(txn, dbi, key_low, 1, NULL, 1, &lower);
 			if (rc != MDB_SUCCESS)
 				return rc;
 		} else {
-			upper = db->md_entries;
-		}
-
-		if (key_low) {
-			if (!key_lower_incl) {
-				rc = mdb_prefix_pair_leq(txn, dbi, key_low, 1, NULL, 1, &lower);
-				if (rc != MDB_SUCCESS)
-					return rc;
-			} else {
-				rc = mdb_prefix_pair_leq(txn, dbi, key_low, 0, NULL, 0, &lower);
-				if (rc != MDB_SUCCESS)
-					return rc;
-			}
-		}
-
-		*out = (upper >= lower) ? (upper - lower) : 0;
-		return MDB_SUCCESS;
-	}
-
-	MDB_cursor mc;
-	MDB_xcursor mx;
-	MDB_val key = {0}, data = {0};
-
-	mdb_cursor_init(&mc, txn, dbi, &mx);
-
-	if (key_low) {
-		int exact = 0;
-		key = *key_low;
-		rc = mdb_cursor_set(&mc, &key, &data, MDB_SET_RANGE, &exact);
-		if (rc == MDB_NOTFOUND) {
-			*out = 0;
-			return MDB_SUCCESS;
-		}
-		if (rc != MDB_SUCCESS)
-			return rc;
-		if (!key_lower_incl && exact) {
-	rc = mdb_cursor_get(&mc, &key, &data, MDB_NEXT_NODUP);
-			if (rc == MDB_NOTFOUND) {
-				*out = 0;
-				return MDB_SUCCESS;
-			}
+			rc = mdb_prefix_pair_leq(txn, dbi, key_low, 0, NULL, 0, &lower);
 			if (rc != MDB_SUCCESS)
 				return rc;
 		}
-	} else {
-	rc = mdb_cursor_get(&mc, &key, &data, MDB_FIRST);
-		if (rc == MDB_NOTFOUND) {
-			*out = 0;
-			return MDB_SUCCESS;
-		}
-		if (rc != MDB_SUCCESS)
-			return rc;
 	}
 
-	while (1) {
-		if (key_high) {
-			int c = kcmp(&key, (MDB_val *)key_high);
-			if (c > 0 || (c == 0 && !key_upper_incl))
-				break;
-		}
-
-		uint64_t key_total = 0;
-		rc = mdb_count_value_range_for_key(&mc, val_low, val_high,
-		    val_flags, &key_total);
-		if (rc != MDB_SUCCESS)
-			return rc;
-		total += key_total;
-
-		rc = mdb_cursor_get(&mc, &key, &data, MDB_NEXT_NODUP);
-		if (rc == MDB_NOTFOUND)
-			break;
-		if (rc != MDB_SUCCESS)
-			return rc;
-	}
-
-	*out = total;
+	*out = (upper >= lower) ? (upper - lower) : 0;
 	return MDB_SUCCESS;
 }
 

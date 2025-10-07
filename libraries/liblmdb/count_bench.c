@@ -69,17 +69,14 @@ naive_count(MDB_cursor *cur, const MDB_val *low, const MDB_val *high)
 
 static int
 naive_count_values(MDB_txn *txn, MDB_dbi dbi,
-    MDB_cursor *keycur, MDB_cursor *dupcur,
+    MDB_cursor *keycur,
     const MDB_val *key_low, const MDB_val *key_high, unsigned key_flags,
-    const MDB_val *val_low, const MDB_val *val_high, unsigned val_flags,
     uint64_t *out)
 {
     MDB_val key = {0}, data = {0};
     uint64_t total = 0;
     int key_lower_incl = (key_flags & MDB_COUNT_LOWER_INCL) != 0;
     int key_upper_incl = (key_flags & MDB_COUNT_UPPER_INCL) != 0;
-    int val_lower_incl = (val_flags & MDB_COUNT_LOWER_INCL) != 0;
-    int val_upper_incl = (val_flags & MDB_COUNT_UPPER_INCL) != 0;
     int rc;
 
     if (!out)
@@ -93,12 +90,6 @@ naive_count_values(MDB_txn *txn, MDB_dbi dbi,
             return MDB_SUCCESS;
     }
 
-    if (val_low && val_high) {
-        int c = mdb_dcmp(txn, dbi, val_low, val_high);
-        if (c > 0 || (c == 0 && !(val_lower_incl && val_upper_incl)))
-            return MDB_SUCCESS;
-    }
-
     if (key_low) {
         key = *key_low;
         rc = mdb_cursor_get(keycur, &key, &data, MDB_SET_RANGE);
@@ -106,14 +97,12 @@ naive_count_values(MDB_txn *txn, MDB_dbi dbi,
             return MDB_SUCCESS;
         if (rc != MDB_SUCCESS)
             return rc;
-        if (!key_lower_incl) {
-            if (mdb_cmp(txn, dbi, &key, key_low) == 0) {
-                rc = mdb_cursor_get(keycur, &key, &data, MDB_NEXT_NODUP);
-                if (rc == MDB_NOTFOUND)
-                    return MDB_SUCCESS;
-                if (rc != MDB_SUCCESS)
-                    return rc;
-            }
+        if (!key_lower_incl && mdb_cmp(txn, dbi, &key, key_low) == 0) {
+            rc = mdb_cursor_get(keycur, &key, &data, MDB_NEXT_NODUP);
+            if (rc == MDB_NOTFOUND)
+                return MDB_SUCCESS;
+            if (rc != MDB_SUCCESS)
+                return rc;
         }
     } else {
         rc = mdb_cursor_get(keycur, &key, &data, MDB_FIRST);
@@ -130,53 +119,12 @@ naive_count_values(MDB_txn *txn, MDB_dbi dbi,
                 break;
         }
 
-        if (!val_low && !val_high) {
-            mdb_size_t dupcount = 0;
-            rc = mdb_cursor_count(keycur, &dupcount);
-            if (rc != MDB_SUCCESS)
-                return rc;
-            total += (uint64_t)dupcount;
-        } else {
-            MDB_val dkey = key;
-            MDB_val dval = data;
+        mdb_size_t dupcount = 0;
+        rc = mdb_cursor_count(keycur, &dupcount);
+        if (rc != MDB_SUCCESS)
+            return rc;
+        total += (uint64_t)dupcount;
 
-            rc = mdb_cursor_get(dupcur, &dkey, &dval, MDB_SET_KEY);
-            if (rc != MDB_SUCCESS)
-                return rc;
-
-            rc = mdb_cursor_get(dupcur, &dkey, &dval, MDB_FIRST_DUP);
-            if (rc == MDB_NOTFOUND)
-                goto next_key;
-            if (rc != MDB_SUCCESS)
-                return rc;
-
-            while (1) {
-                if (val_high) {
-                    int cmp_high = mdb_dcmp(txn, dbi, &dval, val_high);
-                    if (cmp_high > 0 ||
-                        (cmp_high == 0 && !val_upper_incl))
-                        break;
-                }
-
-                if (val_low) {
-                    int cmp_low = mdb_dcmp(txn, dbi, &dval, val_low);
-                    if (cmp_low < 0 ||
-                        (cmp_low == 0 && !val_lower_incl))
-                        goto advance_dup;
-                }
-
-                total++;
-
-advance_dup:
-                rc = mdb_cursor_get(dupcur, &dkey, &dval, MDB_NEXT_DUP);
-                if (rc == MDB_NOTFOUND)
-                    break;
-                if (rc != MDB_SUCCESS)
-                    return rc;
-            }
-        }
-
-next_key:
         rc = mdb_cursor_get(keycur, &key, &data, MDB_NEXT_NODUP);
         if (rc == MDB_NOTFOUND)
             break;
@@ -639,26 +587,13 @@ main(int argc, char **argv)
     MDB_val *highs = calloc(queries, sizeof(MDB_val));
     char **lowbufs = calloc(queries, sizeof(char *));
     char **highbufs = calloc(queries, sizeof(char *));
-    MDB_val *val_lows = calloc(queries, sizeof(MDB_val));
-    MDB_val *val_highs = calloc(queries, sizeof(MDB_val));
-    MDB_val **val_low_refs = calloc(queries, sizeof(MDB_val *));
-    MDB_val **val_high_refs = calloc(queries, sizeof(MDB_val *));
-    char **val_lowbufs = calloc(queries, sizeof(char *));
-    char **val_highbufs = calloc(queries, sizeof(char *));
-    if (!lows || !highs || !lowbufs || !highbufs || !val_lows || !val_highs ||
-        !val_low_refs || !val_high_refs || !val_lowbufs || !val_highbufs) {
+    if (!lows || !highs || !lowbufs || !highbufs) {
         fprintf(stderr, "allocation failure\n");
         free(order);
         free(lows);
         free(highs);
         free(lowbufs);
         free(highbufs);
-        free(val_lows);
-        free(val_highs);
-        free(val_low_refs);
-        free(val_high_refs);
-        free(val_lowbufs);
-        free(val_highbufs);
         return EXIT_FAILURE;
     }
 
@@ -683,27 +618,6 @@ main(int argc, char **argv)
         highs[i].mv_size = strlen(highbufs[i]);
         highs[i].mv_data = highbufs[i];
 
-        val_low_refs[i] = NULL;
-        val_high_refs[i] = NULL;
-        if (dupcount && (rand() & 1)) {
-            size_t vstart = rand() % dupcount;
-            size_t vend = vstart + (rand() % (dupcount - vstart));
-            val_lowbufs[i] = malloc(16);
-            val_highbufs[i] = malloc(16);
-            if (!val_lowbufs[i] || !val_highbufs[i]) {
-                fprintf(stderr, "allocation failure\n");
-                status = EXIT_FAILURE;
-                goto cleanup;
-            }
-            snprintf(val_lowbufs[i], 16, "val%08zu", vstart);
-            snprintf(val_highbufs[i], 16, "val%08zu", vend);
-            val_lows[i].mv_size = strlen(val_lowbufs[i]);
-            val_lows[i].mv_data = val_lowbufs[i];
-            val_highs[i].mv_size = strlen(val_highbufs[i]);
-            val_highs[i].mv_data = val_highbufs[i];
-            val_low_refs[i] = &val_lows[i];
-            val_high_refs[i] = &val_highs[i];
-        }
     }
 
     CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "mdb_txn_begin read");
@@ -776,11 +690,11 @@ main(int argc, char **argv)
             dup_overhead_pct);
     }
 
-    double naive_val_ms = 0.0;
-    double counted_val_ms = 0.0;
-    double naive_val_us = 0.0;
-    double counted_val_us = 0.0;
-    double value_speedup = 0.0;
+    double dup_naive_ms = 0.0;
+    double dup_counted_ms = 0.0;
+    double dup_naive_us = 0.0;
+    double dup_counted_us = 0.0;
+    double dup_speedup = 0.0;
 
     if (entries && dupcount) {
         prepare_dir("./benchdb_count_dup");
@@ -800,32 +714,26 @@ main(int argc, char **argv)
 
     if (entries && queries && dupcount && have_dup_env) {
         MDB_cursor *dup_keycur;
-        MDB_cursor *dup_dupcur;
 
         CHECK(mdb_txn_begin(dup_env, NULL, MDB_RDONLY, &dup_txn),
             "mdb_txn_begin dup read");
         have_dup_txn = 1;
         CHECK(mdb_cursor_open(dup_txn, dup_dbi, &dup_keycur),
             "mdb_cursor_open dup key");
-        CHECK(mdb_cursor_open(dup_txn, dup_dbi, &dup_dupcur),
-            "mdb_cursor_open dup dup");
 
         clock_gettime(CLOCK_MONOTONIC, &t0);
         for (size_t i = 0; i < queries; ++i) {
             uint64_t counted = 0;
             int rc = naive_count_values(dup_txn, dup_dbi, dup_keycur,
-                dup_dupcur,
                 queries ? &lows[i] : NULL,
                 queries ? &highs[i] : NULL,
-                MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
-                val_low_refs[i], val_high_refs[i],
                 MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
                 &counted);
             CHECK(rc, "naive_count_values");
             sink += counted;
         }
         clock_gettime(CLOCK_MONOTONIC, &t1);
-        naive_val_ms = elapsed_ms(&t0, &t1);
+        dup_naive_ms = elapsed_ms(&t0, &t1);
 
         clock_gettime(CLOCK_MONOTONIC, &t0);
         for (size_t i = 0; i < queries; ++i) {
@@ -834,15 +742,12 @@ main(int argc, char **argv)
                 queries ? &lows[i] : NULL,
                 queries ? &highs[i] : NULL,
                 MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
-                val_low_refs[i], val_high_refs[i],
-                MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
                 &counted), "mdb_range_count_values");
             sink += counted;
         }
         clock_gettime(CLOCK_MONOTONIC, &t1);
-        counted_val_ms = elapsed_ms(&t0, &t1);
+        dup_counted_ms = elapsed_ms(&t0, &t1);
 
-        mdb_cursor_close(dup_dupcur);
         mdb_cursor_close(dup_keycur);
         mdb_txn_abort(dup_txn);
         have_dup_txn = 0;
@@ -851,20 +756,20 @@ main(int argc, char **argv)
         have_dup_env = 0;
         remove_dir("./benchdb_count_dup");
 
-        naive_val_us = (naive_val_ms * 1000.0) / queries;
-        counted_val_us = (counted_val_ms * 1000.0) / queries;
-        value_speedup = (counted_val_ms > 0.0) ?
-            (naive_val_ms / counted_val_ms) : 0.0;
+        dup_naive_us = (dup_naive_ms * 1000.0) / queries;
+        dup_counted_us = (dup_counted_ms * 1000.0) / queries;
+        dup_speedup = (dup_counted_ms > 0.0) ?
+            (dup_naive_ms / dup_counted_ms) : 0.0;
 
         printf("Dupsort dup/key:  %zu\n", dupcount);
-        printf("Value cursor scan: %.2f ms (%.2f us/op)\n",
-            naive_val_ms, naive_val_us);
-        printf("Value counted API: %.2f ms (%.2f us/op)\n",
-            counted_val_ms, counted_val_us);
-        if (counted_val_ms > 0.0)
-            printf("Value range speedup: %.2fx\n", value_speedup);
+        printf("Dup cursor scan: %.2f ms (%.2f us/op)\n",
+            dup_naive_ms, dup_naive_us);
+        printf("Dup counted API: %.2f ms (%.2f us/op)\n",
+            dup_counted_ms, dup_counted_us);
+        if (dup_counted_ms > 0.0)
+            printf("Dup range speedup: %.2fx\n", dup_speedup);
         else
-            printf("Value range speedup: N/A\n");
+            printf("Dup range speedup: N/A\n");
     }
 
     volatile uint64_t sink_guard = sink;
@@ -892,19 +797,11 @@ cleanup:
     for (size_t i = 0; i < queries; ++i) {
         free(lowbufs[i]);
         free(highbufs[i]);
-        free(val_lowbufs[i]);
-        free(val_highbufs[i]);
     }
     free(lowbufs);
     free(highbufs);
-    free(val_lowbufs);
-    free(val_highbufs);
     free(lows);
     free(highs);
-    free(val_lows);
-    free(val_highs);
-    free(val_low_refs);
-    free(val_high_refs);
 
     free(order);
 

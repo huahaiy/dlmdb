@@ -1209,7 +1209,6 @@ int mdb_count_range(MDB_txn *txn, MDB_dbi dbi,
 	const MDB_val *low, const MDB_val *high, unsigned flags, uint64_t *out);
 int mdb_range_count_values(MDB_txn *txn, MDB_dbi dbi,
 	const MDB_val *key_low, const MDB_val *key_high, unsigned key_flags,
-	const MDB_val *val_low, const MDB_val *val_high, unsigned val_flags,
 	uint64_t *out);
 
 	/** @brief Close a database handle. Normally unnecessary. Use with care:

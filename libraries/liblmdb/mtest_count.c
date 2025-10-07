@@ -83,9 +83,7 @@ static uint64_t
 naive_count_values(MDB_txn *txn, MDB_dbi dbi,
                    const MDB_val *key_low, const MDB_val *key_high,
                    int key_lower_incl, int key_upper_incl,
-                   const MDB_val *val_low, const MDB_val *val_high,
-                   int val_lower_incl, int val_upper_incl,
-                   MDB_cmp_func *kcmp, MDB_cmp_func *vcmp)
+                   MDB_cmp_func *kcmp)
 {
     MDB_cursor *cur;
     MDB_val key, data;
@@ -95,47 +93,25 @@ naive_count_values(MDB_txn *txn, MDB_dbi dbi,
 
     if (!kcmp)
         kcmp = cmp_key;
-    if (!vcmp)
-        vcmp = cmp_key;
 
     rc = mdb_cursor_get(cur, &key, &data, MDB_FIRST);
     while (rc == MDB_SUCCESS) {
-        int skip = 0;
+        int include = 1;
         if (key_low) {
             int cmp = kcmp(&key, key_low);
             if (cmp < 0 || (cmp == 0 && !key_lower_incl))
-                skip = 1;
+                include = 0;
         }
-        if (!skip && key_high) {
+        if (include && key_high) {
             int cmp = kcmp(&key, key_high);
-            if (cmp > 0 || (cmp == 0 && !key_upper_incl)) {
+            if (cmp > 0 || (cmp == 0 && !key_upper_incl))
                 break;
-            }
         }
-        if (!skip) {
-            MDB_val dup_key = key;
-            MDB_val dup_data = data;
-            int drc = mdb_cursor_get(cur, &dup_key, &dup_data, MDB_GET_CURRENT);
-            CHECK(drc, "naive_count_values get_current");
-            while (1) {
-                int include = 1;
-                if (val_low) {
-                    int cmp = vcmp(&dup_data, val_low);
-                    if (cmp < 0 || (cmp == 0 && !val_lower_incl))
-                        include = 0;
-                }
-                if (include && val_high) {
-                    int cmp = vcmp(&dup_data, val_high);
-                    if (cmp > 0 || (cmp == 0 && !val_upper_incl))
-                        break;
-                }
-                if (include)
-                    total++;
-                drc = mdb_cursor_get(cur, &dup_key, &dup_data, MDB_NEXT_DUP);
-                if (drc == MDB_NOTFOUND)
-                    break;
-                CHECK(drc, "naive_count_values next_dup");
-            }
+        if (include) {
+            mdb_size_t dupcount = 0;
+            int drc = mdb_cursor_count(cur, &dupcount);
+            CHECK(drc, "naive_count_values count");
+            total += (uint64_t)dupcount;
         }
         rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT_NODUP);
     }
@@ -777,7 +753,7 @@ test_range_count_values(MDB_env *env)
 
     CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "dup range read");
 
-    MDB_val key_low, key_high, val_low, val_high;
+    MDB_val key_low, key_high;
     uint64_t counted = 0;
     uint64_t naive = 0;
 
@@ -786,60 +762,41 @@ test_range_count_values(MDB_env *env)
     key_high.mv_data = "k03";
     key_high.mv_size = 3;
 
-    naive = naive_count_values(txn, dbi, &key_low, &key_high, 1, 1,
-                               NULL, NULL, 0, 0, cmp_key, cmp_key);
+    naive = naive_count_values(txn, dbi, &key_low, &key_high, 1, 1, cmp_key);
     CHECK(mdb_range_count_values(txn, dbi, &key_low, &key_high,
-                                 MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
-                                 NULL, NULL, 0, &counted),
-          "dup range full values");
-    expect_eq(counted, naive, "dup range full values match");
-
-    val_low.mv_data = "b";
-    val_low.mv_size = 1;
-    val_high.mv_data = "d";
-    val_high.mv_size = 1;
-
-    naive = naive_count_values(txn, dbi, &key_low, &key_high, 1, 1,
-                               &val_low, &val_high, 1, 0,
-                               cmp_key, cmp_key);
-    CHECK(mdb_range_count_values(txn, dbi, &key_low, &key_high,
-                                 MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
-                                 &val_low, &val_high, MDB_COUNT_LOWER_INCL,
-                                 &counted),
-          "dup range mid window");
-    expect_eq(counted, naive, "dup range mid window match");
-
-    val_low.mv_data = "c";
-    val_low.mv_size = 1;
-    val_high.mv_data = "c";
-    val_high.mv_size = 1;
-
-    naive = naive_count_values(txn, dbi, &key_low, &key_high, 1, 1,
-                               &val_low, &val_high, 1, 1,
-                               cmp_key, cmp_key);
-    CHECK(mdb_range_count_values(txn, dbi, &key_low, &key_high,
-                                 MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
-                                 &val_low, &val_high,
                                  MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
                                  &counted),
-          "dup range point value");
-    expect_eq(counted, naive, "dup range point value match");
+          "dup range inclusive");
+    expect_eq(counted, naive, "dup range inclusive match");
 
-    val_low.mv_data = "y";
-    val_low.mv_size = 1;
-    val_high.mv_data = "z";
-    val_high.mv_size = 1;
-
-    naive = naive_count_values(txn, dbi, &key_low, &key_high, 1, 1,
-                               &val_low, &val_high, 1, 1,
-                               cmp_key, cmp_key);
+    naive = naive_count_values(txn, dbi, &key_low, &key_high, 0, 1, cmp_key);
     CHECK(mdb_range_count_values(txn, dbi, &key_low, &key_high,
-                                 MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
-                                 &val_low, &val_high,
+                                 MDB_COUNT_UPPER_INCL,
+                                 &counted),
+          "dup range lower exclusive");
+    expect_eq(counted, naive, "dup range lower exclusive match");
+
+    naive = naive_count_values(txn, dbi, &key_low, &key_high, 1, 0, cmp_key);
+    CHECK(mdb_range_count_values(txn, dbi, &key_low, &key_high,
+                                 MDB_COUNT_LOWER_INCL,
+                                 &counted),
+          "dup range upper exclusive");
+    expect_eq(counted, naive, "dup range upper exclusive match");
+
+    naive = naive_count_values(txn, dbi, NULL, NULL, 0, 0, cmp_key);
+    CHECK(mdb_range_count_values(txn, dbi, NULL, NULL, 0, &counted),
+          "dup range full db");
+    expect_eq(counted, naive, "dup range full db match");
+
+    MDB_val reverse_low = key_high;
+    MDB_val reverse_high = key_low;
+    naive = naive_count_values(txn, dbi, &reverse_low, &reverse_high, 1, 1,
+                               cmp_key);
+    CHECK(mdb_range_count_values(txn, dbi, &reverse_low, &reverse_high,
                                  MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
                                  &counted),
-          "dup range empty window");
-    expect_eq(counted, naive, "dup range empty window zero");
+          "dup range inverted");
+    expect_eq(counted, naive, "dup range inverted zero");
 
     mdb_txn_abort(txn);
 
@@ -867,27 +824,12 @@ test_range_count_values(MDB_env *env)
 
     CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "dup range reread");
 
-    naive = naive_count_values(txn, dbi, &key_low, &key_high, 1, 1,
-                               NULL, NULL, 0, 0, cmp_key, cmp_key);
+    naive = naive_count_values(txn, dbi, &key_low, &key_high, 1, 1, cmp_key);
     CHECK(mdb_range_count_values(txn, dbi, &key_low, &key_high,
                                  MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
-                                 NULL, NULL, 0, &counted),
+                                 &counted),
           "dup range post mutate full");
     expect_eq(counted, naive, "dup range post mutate full match");
-
-    val_low.mv_data = "b";
-    val_low.mv_size = 1;
-    val_high.mv_data = "d";
-    val_high.mv_size = 1;
-    naive = naive_count_values(txn, dbi, &key_low, &key_high, 1, 1,
-                               &val_low, &val_high, 1, 0,
-                               cmp_key, cmp_key);
-    CHECK(mdb_range_count_values(txn, dbi, &key_low, &key_high,
-                                 MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
-                                 &val_low, &val_high, MDB_COUNT_LOWER_INCL,
-                                 &counted),
-          "dup range post mutate mid");
-    expect_eq(counted, naive, "dup range post mutate mid match");
 
     mdb_txn_abort(txn);
 
