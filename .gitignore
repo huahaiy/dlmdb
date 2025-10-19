@@ -1,1 +1,5 @@
 AGENTS.md
+.claude/
+CLAUDE.md
+QWEN.md
+claude_code_zai_env.sh

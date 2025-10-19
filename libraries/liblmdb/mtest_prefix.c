@@ -1,0 +1,1184 @@
+#include "lmdb.h"
+
+#include <errno.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#define CHECK(rc, msg)                                                          \
+	do {                                                                    \
+		if ((rc) != MDB_SUCCESS) {                                      \
+			fprintf(stderr, "%s:%d: %s: %s\n", __FILE__, __LINE__,  \
+			    (msg), mdb_strerror(rc));                             \
+			exit(EXIT_FAILURE);                                       \
+		}                                                               \
+	} while (0)
+
+#define CHECK_CALL(expr)                                                        \
+	do {                                                                        \
+		int __rc = (expr);                                                  \
+		CHECK(__rc, #expr);                                                 \
+	} while (0)
+
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+
+#define PF_KEY_MAX_LEN   256
+#define PF_VALUE_MAX_LEN 512
+#define PF_MAX_ENTRIES   2048
+
+typedef struct {
+	size_t key_len;
+	char key[PF_KEY_MAX_LEN];
+	size_t val_len;
+	unsigned char value[PF_VALUE_MAX_LEN];
+} PFEntry;
+
+static PFEntry pf_entries[PF_MAX_ENTRIES];
+static size_t pf_entry_count;
+static uint64_t pf_rng_state = UINT64_C(0x9e3779b97f4a7c15);
+static uint64_t pf_key_nonce;
+static size_t pf_op_index;
+
+static void test_prefix_leaf_splits(void);
+static void test_prefix_alternating_prefixes(void);
+static void test_prefix_update_reinsert(void);
+static void test_prefix_dupsort_smoke(void);
+
+static void
+reset_dir(const char *dir)
+{
+	if (mkdir(dir, 0755) && errno != EEXIST) {
+		fprintf(stderr, "mkdir %s failed: %s\n", dir, strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/data.mdb", dir);
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/lock.mdb", dir);
+	unlink(path);
+}
+
+static MDB_env *
+create_env(const char *dir)
+{
+	MDB_env *env = NULL;
+	reset_dir(dir);
+	CHECK_CALL(mdb_env_create(&env));
+	CHECK_CALL(mdb_env_set_maxdbs(env, 4));
+	CHECK_CALL(mdb_env_set_mapsize(env, 64UL * 1024 * 1024));
+	CHECK_CALL(mdb_env_open(env, dir, MDB_NOLOCK, 0664));
+	return env;
+}
+
+
+static void
+test_config_validation(void)
+{
+	MDB_env *env = NULL;
+	CHECK_CALL(mdb_env_create(&env));
+	CHECK_CALL(mdb_env_set_maxdbs(env, 4));
+	CHECK_CALL(mdb_env_set_mapsize(env, 64UL * 1024 * 1024));
+	int maxkey = mdb_env_get_maxkeysize(env);
+	if (maxkey <= 0) {
+		fprintf(stderr, "config validation: unexpected max key size %d\n",
+		    maxkey);
+		exit(EXIT_FAILURE);
+	}
+	mdb_env_close(env);
+}
+
+static void
+test_edge_cases(void)
+{
+	static const char *dir = "testdb_prefix_edges";
+	MDB_env *env = create_env(dir);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+	MDB_cursor *cur = NULL;
+	MDB_val key = {0, NULL};
+	MDB_val data = {0, NULL};
+	int rc;
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	const char *single_key = "solo-entry";
+	MDB_val single = {strlen(single_key), (void *)single_key};
+	CHECK_CALL(mdb_put(txn, dbi, &single, &single, 0));
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	key.mv_data = NULL;
+	key.mv_size = 0;
+	data.mv_data = NULL;
+	data.mv_size = 0;
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+	rc = mdb_cursor_get(cur, &key, &data, MDB_FIRST);
+	if (rc != MDB_SUCCESS || key.mv_size != single.mv_size ||
+	    memcmp(key.mv_data, single.mv_data, key.mv_size) != 0) {
+		fprintf(stderr, "edge cases: failed to fetch single key entry\n");
+		exit(EXIT_FAILURE);
+	}
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+
+	mdb_env_close(env);
+	env = create_env(dir);
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	const char *short_key = "ab";
+	MDB_val short_val = {strlen(short_key), (void *)short_key};
+	CHECK_CALL(mdb_put(txn, dbi, &short_val, &short_val, 0));
+
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+	MDB_val short_lookup = {short_val.mv_size, short_val.mv_data};
+	rc = mdb_cursor_get(cur, &short_lookup, &data, MDB_SET_KEY);
+	if (rc != MDB_SUCCESS || short_lookup.mv_size != short_val.mv_size ||
+	    memcmp(short_lookup.mv_data, short_val.mv_data, short_lookup.mv_size) != 0) {
+		fprintf(stderr, "edge cases: short key lookup failed\n");
+		exit(EXIT_FAILURE);
+	}
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+
+	mdb_env_close(env);
+}
+
+static void
+test_range_scans(void)
+{
+	static const char *dir = "testdb_prefix_ranges";
+	MDB_env *env = create_env(dir);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+	MDB_cursor *cur = NULL;
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	for (unsigned int i = 0; i < 16; ++i) {
+		char keybuf[32];
+		snprintf(keybuf, sizeof(keybuf), "acct-%04u-range", i);
+		MDB_val key = {strlen(keybuf), keybuf};
+		MDB_val val = {strlen(keybuf), keybuf};
+		CHECK_CALL(mdb_put(txn, dbi, &key, &val, 0));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, 0, &dbi));
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+
+	MDB_val key = {0, NULL};
+	MDB_val data = {0, NULL};
+
+	char target_key[] = "acct-0005-range";
+	key.mv_size = strlen(target_key);
+	key.mv_data = target_key;
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_SET_RANGE));
+	if (key.mv_size != strlen(target_key) ||
+	    memcmp(key.mv_data, target_key, key.mv_size) != 0) {
+		fprintf(stderr, "range scans: MDB_SET_RANGE exact failed\n");
+		exit(EXIT_FAILURE);
+	}
+	if (data.mv_size != key.mv_size ||
+	    memcmp(data.mv_data, key.mv_data, key.mv_size) != 0) {
+		fprintf(stderr, "range scans: MDB_SET_RANGE exact value mismatch\n");
+		exit(EXIT_FAILURE);
+	}
+
+	char between_key[] = "acct-0005-rangezzz";
+	key.mv_size = strlen(between_key);
+	key.mv_data = between_key;
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_SET_RANGE));
+	const char *expect_next = "acct-0006-range";
+	if (key.mv_size != strlen(expect_next) ||
+	    memcmp(key.mv_data, expect_next, key.mv_size) != 0) {
+		fprintf(stderr, "range scans: MDB_SET_RANGE upper bound failed\n");
+		exit(EXIT_FAILURE);
+	}
+
+	char low_key[] = "acct-0000-range";
+	key.mv_size = strlen(low_key);
+	key.mv_data = low_key;
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_SET_KEY));
+	if (key.mv_size != strlen(low_key) ||
+	    memcmp(key.mv_data, low_key, key.mv_size) != 0) {
+		fprintf(stderr, "range scans: MDB_SET_KEY first entry failed\n");
+		exit(EXIT_FAILURE);
+	}
+
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_LAST));
+	const char *last_key = "acct-0015-range";
+	if (key.mv_size != strlen(last_key) ||
+	    memcmp(key.mv_data, last_key, key.mv_size) != 0) {
+		fprintf(stderr, "range scans: MDB_LAST failed\n");
+		exit(EXIT_FAILURE);
+	}
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_PREV));
+	const char *prev_key = "acct-0014-range";
+	if (key.mv_size != strlen(prev_key) ||
+	    memcmp(key.mv_data, prev_key, key.mv_size) != 0) {
+		fprintf(stderr, "range scans: MDB_PREV failed\n");
+		exit(EXIT_FAILURE);
+	}
+
+	char beyond_key[] = "acct-9999-range";
+	key.mv_size = strlen(beyond_key);
+	key.mv_data = beyond_key;
+	int rc = mdb_cursor_get(cur, &key, &data, MDB_SET_RANGE);
+	if (rc != MDB_NOTFOUND) {
+		fprintf(stderr,
+		    "range scans: expected MDB_NOTFOUND for upper bound, saw %s\n",
+		    mdb_strerror(rc));
+		exit(EXIT_FAILURE);
+	}
+
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+	mdb_env_close(env);
+}
+
+
+
+
+static void
+test_threshold_behavior(void)
+{
+	static const char *dir = "testdb_prefix_threshold";
+	MDB_env *env = create_env(dir);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+	const char *keys[] = {
+		"aaaa-0000",
+		"aaaa-0001",
+		"aaab-0002"
+	};
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	for (size_t i = 0; i < ARRAY_SIZE(keys); ++i) {
+		const char *k = keys[i];
+		MDB_val key = {strlen(k), (void *)k};
+		MDB_val val = {strlen(k), (void *)k};
+		CHECK_CALL(mdb_put(txn, dbi, &key, &val, 0));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, 0, &dbi));
+
+	MDB_stat st;
+	CHECK_CALL(mdb_stat(txn, dbi, &st));
+	if ((size_t)st.ms_entries != ARRAY_SIZE(keys)) {
+		fprintf(stderr, "threshold test: expected %zu entries, saw %" MDB_PRIy(u) "\n",
+		    ARRAY_SIZE(keys), st.ms_entries);
+		exit(EXIT_FAILURE);
+	}
+	if (st.ms_leaf_pages != 1) {
+		fprintf(stderr, "threshold test: expected single leaf page, saw %" MDB_PRIy(u) "\n",
+		    st.ms_leaf_pages);
+		exit(EXIT_FAILURE);
+	}
+
+	mdb_txn_abort(txn);
+	mdb_env_close(env);
+}
+
+
+
+static void
+test_mixed_pattern_and_unicode(void)
+{
+	static const char *dir = "testdb_prefix_mixed_patterns";
+	MDB_env *env = create_env(dir);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	const char *keys[] = {
+		"sh",
+		"shared-alpha-000000000000",
+		"shared-alpha-000000000001",
+		"shared-alpha-zzzzzzzzzzzz",
+		"shared-beta-000000000004",
+		"\xE2\x82\xAC-shared-euro-0002",
+		"\xE6\xBC\xA2\xE5\xAD\x97-long-prefix-0005",
+		"\xF0\x9F\x97\x9D-shared-box-0003",
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(keys); ++i) {
+		const char *k = keys[i];
+		char valbuf[PF_KEY_MAX_LEN];
+		int vlen = snprintf(valbuf, sizeof(valbuf), "VAL-%s", k);
+		if (vlen < 0) {
+			fprintf(stderr, "mixed patterns: value formatting failed\n");
+			exit(EXIT_FAILURE);
+		}
+		MDB_val key = {strlen(k), (void *)k};
+		MDB_val data = {(size_t)vlen, valbuf};
+		int put_rc = mdb_put(txn, dbi, &key, &data, 0);
+		if (put_rc != MDB_SUCCESS) {
+			fprintf(stderr, "mixed patterns: insert failed for key '%s' rc=%s\n",
+			    k, mdb_strerror(put_rc));
+			exit(EXIT_FAILURE);
+		}
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, 0, &dbi));
+	MDB_cursor *cur = NULL;
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+
+	MDB_val key = {0, NULL};
+	MDB_val data = {0, NULL};
+	int rc = mdb_cursor_get(cur, &key, &data, MDB_FIRST);
+	size_t seen = 0;
+	while (rc == MDB_SUCCESS) {
+		char valbuf[PF_KEY_MAX_LEN];
+		int vlen = snprintf(valbuf, sizeof(valbuf), "VAL-%.*s",
+		    (int)key.mv_size, (char *)key.mv_data);
+		if (vlen < 0) {
+			fprintf(stderr, "mixed patterns: snprintf failed during validation\n");
+			exit(EXIT_FAILURE);
+		}
+		if ((size_t)vlen != data.mv_size ||
+		    memcmp(data.mv_data, valbuf, data.mv_size) != 0) {
+			fprintf(stderr,
+			    "mixed patterns: value mismatch for key %.*s\n",
+			    (int)key.mv_size, (char *)key.mv_data);
+			exit(EXIT_FAILURE);
+		}
+		seen++;
+		rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT);
+	}
+	if (rc != MDB_NOTFOUND)
+		CHECK(rc, "mdb_cursor_get");
+	if (seen != ARRAY_SIZE(keys)) {
+		fprintf(stderr,
+		    "mixed patterns: expected %zu keys during scan, saw %zu\n",
+		    ARRAY_SIZE(keys), seen);
+		exit(EXIT_FAILURE);
+	}
+
+	for (size_t i = 0; i < ARRAY_SIZE(keys); ++i) {
+		const char *k = keys[i];
+		char valbuf[PF_KEY_MAX_LEN];
+		int vlen = snprintf(valbuf, sizeof(valbuf), "VAL-%s", k);
+		if (vlen < 0) {
+			fprintf(stderr, "mixed patterns: lookup format failed\n");
+			exit(EXIT_FAILURE);
+		}
+		MDB_val lookup = {strlen(k), (void *)k};
+		MDB_val value = {0, NULL};
+		CHECK_CALL(mdb_get(txn, dbi, &lookup, &value));
+		if ((size_t)vlen != value.mv_size ||
+		    memcmp(value.mv_data, valbuf, value.mv_size) != 0) {
+			fprintf(stderr, "mixed patterns: lookup mismatch for %s\n", k);
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+	mdb_env_close(env);
+}
+
+
+
+
+
+static void
+test_cursor_buffer_sharing(void)
+{
+	static const char *dir = "testdb_prefix_cursor_sharing";
+	MDB_env *env = create_env(dir);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	for (unsigned int i = 0; i < 12; ++i) {
+		char keybuf[64];
+		snprintf(keybuf, sizeof(keybuf), "cursor-shared-%03u", i);
+		MDB_val key = {strlen(keybuf), keybuf};
+		MDB_val val = {strlen(keybuf), keybuf};
+		CHECK_CALL(mdb_put(txn, dbi, &key, &val, MDB_APPEND));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	MDB_txn *rtxn = NULL;
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &rtxn));
+	MDB_cursor *primary = NULL;
+	CHECK_CALL(mdb_cursor_open(rtxn, dbi, &primary));
+	MDB_val key = {0, NULL};
+	MDB_val data = {0, NULL};
+	CHECK_CALL(mdb_cursor_get(primary, &key, &data, MDB_FIRST));
+
+	MDB_cursor *shadow = NULL;
+	CHECK_CALL(mdb_cursor_open(rtxn, dbi, &shadow));
+	MDB_val shadow_key = {0, NULL};
+	MDB_val shadow_data = {0, NULL};
+	CHECK_CALL(mdb_cursor_get(shadow, &shadow_key, &shadow_data, MDB_FIRST));
+
+	CHECK_CALL(mdb_cursor_get(shadow, &shadow_key, &shadow_data, MDB_NEXT));
+	MDB_val verify = {0, NULL};
+	MDB_val verify_data = {0, NULL};
+	CHECK_CALL(mdb_cursor_get(primary, &verify, &verify_data, MDB_GET_CURRENT));
+	if (verify.mv_size != verify_data.mv_size ||
+	    memcmp(verify.mv_data, verify_data.mv_data, verify.mv_size) != 0) {
+		fprintf(stderr, "cursor sharing: primary cursor lost its buffer after peer advance\n");
+		exit(EXIT_FAILURE);
+	}
+
+	MDB_txn *wtxn = NULL;
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &wtxn));
+	const char *new_key = "cursor-shared-999-new";
+	MDB_val nkey = {strlen(new_key), (void *)new_key};
+	MDB_val nval = {strlen(new_key), (void *)new_key};
+	CHECK_CALL(mdb_put(wtxn, dbi, &nkey, &nval, 0));
+	CHECK_CALL(mdb_txn_commit(wtxn));
+
+	mdb_cursor_close(shadow);
+	mdb_txn_abort(rtxn);
+
+	MDB_txn *rtxn2 = NULL;
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &rtxn2));
+	CHECK_CALL(mdb_cursor_renew(rtxn2, primary));
+
+	CHECK_CALL(mdb_cursor_get(primary, &key, &data, MDB_LAST));
+	if (key.mv_size != nkey.mv_size ||
+	    memcmp(key.mv_data, nkey.mv_data, key.mv_size) != 0) {
+		fprintf(stderr, "cursor sharing: renewed cursor failed to see new key\n");
+		exit(EXIT_FAILURE);
+	}
+
+	mdb_cursor_close(primary);
+	mdb_txn_abort(rtxn2);
+	mdb_env_close(env);
+}
+
+static void
+test_prefix_dupsort_transitions(void)
+{
+	static const char *dir = "testdb_prefix_dupsort_transitions";
+	MDB_env *env = create_env(dir);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	unsigned int open_flags = MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_DUPSORT;
+	CHECK_CALL(mdb_dbi_open(txn, "prefixed", open_flags, &dbi));
+	const char *dup_key_str = "prefixed-dup-target";
+	MDB_val dup_key = {strlen(dup_key_str), (void *)dup_key_str};
+	MDB_val dup_val1 = {5, "dup-a"};
+	MDB_val dup_val2 = {5, "dup-b"};
+	CHECK_CALL(mdb_put(txn, dbi, &dup_key, &dup_val1, 0));
+	CHECK_CALL(mdb_put(txn, dbi, &dup_key, &dup_val2, 0));
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, "prefixed", 0, &dbi));
+	MDB_cursor *cur = NULL;
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+	MDB_val seek_key = {strlen(dup_key_str), (void *)dup_key_str};
+	MDB_val data = {0, NULL};
+	CHECK_CALL(mdb_cursor_get(cur, &seek_key, &data, MDB_SET_KEY));
+	int seen_first = 0;
+	int seen_second = 0;
+	for (;;) {
+		if (data.mv_size == dup_val1.mv_size &&
+		    memcmp(data.mv_data, dup_val1.mv_data, data.mv_size) == 0) {
+			seen_first = 1;
+		} else if (data.mv_size == dup_val2.mv_size &&
+		    memcmp(data.mv_data, dup_val2.mv_data, data.mv_size) == 0) {
+			seen_second = 1;
+		} else {
+			fprintf(stderr, "dupsort transitions: unexpected duplicate payload\n");
+			exit(EXIT_FAILURE);
+		}
+		int dup_rc = mdb_cursor_get(cur, &seek_key, &data, MDB_NEXT_DUP);
+		if (dup_rc == MDB_NOTFOUND)
+			break;
+		if (dup_rc != MDB_SUCCESS)
+			CHECK(dup_rc, "mdb_cursor_get");
+	}
+	if (!seen_first || !seen_second) {
+		fprintf(stderr, "dupsort transitions: missing duplicate entries\n");
+		exit(EXIT_FAILURE);
+	}
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	int rc = mdb_dbi_open(txn, "prefixed",
+	    MDB_PREFIX_COMPRESSION | MDB_DUPFIXED, &dbi);
+	if (rc == MDB_SUCCESS)
+		mdb_txn_commit(txn);
+	else
+		mdb_txn_abort(txn);
+
+	mdb_env_close(env);
+}
+
+static void
+test_prefix_leaf_splits(void)
+{
+	static const char *dir = "testdb_prefix_split";
+	MDB_env *env = create_env(dir);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+	const size_t total = 4096;
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	for (size_t i = 0; i < total; ++i) {
+		char keybuf[64];
+		snprintf(keybuf, sizeof(keybuf), "shared-split-%08zu", i);
+		MDB_val key = {strlen(keybuf), keybuf};
+		MDB_val data = {strlen(keybuf), keybuf};
+		CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, 0, &dbi));
+
+	for (size_t i = 0; i < total; i += 1023) {
+		char keybuf[64];
+		snprintf(keybuf, sizeof(keybuf), "shared-split-%08zu", i);
+		MDB_val key = {strlen(keybuf), keybuf};
+		MDB_val data = {0, NULL};
+		CHECK_CALL(mdb_get(txn, dbi, &key, &data));
+		if (data.mv_size != key.mv_size ||
+		    memcmp(data.mv_data, key.mv_data, key.mv_size) != 0) {
+			fprintf(stderr, "leaf splits: mismatch for %s\n", keybuf);
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	MDB_cursor *cur = NULL;
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+	MDB_val key = {0, NULL};
+	MDB_val data = {0, NULL};
+	int rc = mdb_cursor_get(cur, &key, &data, MDB_FIRST);
+	size_t seen = 0;
+	while (rc == MDB_SUCCESS) {
+		char expect[64];
+		snprintf(expect, sizeof(expect), "shared-split-%08zu", seen);
+		if (key.mv_size != strlen(expect) ||
+		    memcmp(key.mv_data, expect, key.mv_size) != 0) {
+			fprintf(stderr, "leaf splits: iteration mismatch at %zu\n", seen);
+			exit(EXIT_FAILURE);
+		}
+		rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT);
+		seen++;
+	}
+	if (rc != MDB_NOTFOUND)
+		CHECK(rc, "mdb_cursor_get");
+	if (seen != total) {
+		fprintf(stderr, "leaf splits: expected %zu entries, saw %zu\n", total, seen);
+		exit(EXIT_FAILURE);
+	}
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+	mdb_env_close(env);
+}
+
+static void
+test_prefix_alternating_prefixes(void)
+{
+	static const char *dir = "testdb_prefix_alternating";
+	MDB_env *env = create_env(dir);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+	const size_t total = 512;
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	for (size_t i = 0; i < total; ++i) {
+		char keybuf[64];
+		const char *prefix = (i & 1) ? "omega-" : "alpha-";
+		snprintf(keybuf, sizeof(keybuf), "%s%08zu", prefix, i);
+		MDB_val key = {strlen(keybuf), keybuf};
+		MDB_val data = {strlen(prefix), (void *)prefix};
+		CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, 0, &dbi));
+	MDB_cursor *cur = NULL;
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+	MDB_val key = {0, NULL};
+	MDB_val data = {0, NULL};
+	int rc = mdb_cursor_get(cur, &key, &data, MDB_FIRST);
+	char prev[64] = {0};
+	size_t seen = 0;
+	while (rc == MDB_SUCCESS) {
+		if (seen > 0 &&
+		    (strlen(prev) != key.mv_size ||
+		        memcmp(prev, key.mv_data, key.mv_size) > 0)) {
+			fprintf(stderr, "alternating prefixes: order violation\n");
+			exit(EXIT_FAILURE);
+		}
+		memcpy(prev, key.mv_data, key.mv_size);
+		prev[key.mv_size] = '\0';
+		rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT);
+		seen++;
+	}
+	if (rc != MDB_NOTFOUND)
+		CHECK(rc, "mdb_cursor_get");
+	if (seen != total) {
+		fprintf(stderr, "alternating prefixes: expected %zu entries, saw %zu\n",
+		    total, seen);
+		exit(EXIT_FAILURE);
+	}
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+	mdb_env_close(env);
+}
+
+static void
+test_prefix_update_reinsert(void)
+{
+	static const char *dir = "testdb_prefix_update";
+	MDB_env *env = create_env(dir);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+	const char *key_str = "update-key-constant";
+	MDB_val key = {strlen(key_str), (void *)key_str};
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	for (int i = 0; i < 5; ++i) {
+		char valbuf[32];
+		int vlen = snprintf(valbuf, sizeof(valbuf), "value-%d", i);
+		MDB_val val = {(size_t)vlen, valbuf};
+		CHECK_CALL(mdb_put(txn, dbi, &key, &val, 0));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, 0, &dbi));
+	MDB_val data = {0, NULL};
+	CHECK_CALL(mdb_get(txn, dbi, &key, &data));
+	if (data.mv_size != strlen("value-4") ||
+	    memcmp(data.mv_data, "value-4", data.mv_size) != 0) {
+		fprintf(stderr, "update reinsert: unexpected value after updates\n");
+		exit(EXIT_FAILURE);
+	}
+	mdb_txn_abort(txn);
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	CHECK_CALL(mdb_del(txn, dbi, &key, NULL));
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, 0, &dbi));
+	int rc = mdb_get(txn, dbi, &key, &data);
+	if (rc != MDB_NOTFOUND) {
+		fprintf(stderr, "update reinsert: key still present (%s)\n", mdb_strerror(rc));
+		exit(EXIT_FAILURE);
+	}
+	mdb_txn_abort(txn);
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	MDB_val rein_val = {strlen("value-reinsert"), "value-reinsert"};
+	CHECK_CALL(mdb_put(txn, dbi, &key, &rein_val, 0));
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, 0, &dbi));
+	CHECK_CALL(mdb_get(txn, dbi, &key, &data));
+	if (data.mv_size != rein_val.mv_size ||
+	    memcmp(data.mv_data, rein_val.mv_data, data.mv_size) != 0) {
+		fprintf(stderr, "update reinsert: reinsertion mismatch\n");
+		exit(EXIT_FAILURE);
+	}
+	mdb_txn_abort(txn);
+	mdb_env_close(env);
+}
+
+static void
+test_prefix_dupsort_smoke(void)
+{
+	static const char *dir = "testdb_prefix_dupsort_smoke";
+	MDB_env *env = create_env(dir);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	unsigned int flags = MDB_PREFIX_COMPRESSION | MDB_DUPSORT;
+	CHECK_CALL(mdb_dbi_open(txn, "dupdb", MDB_CREATE | flags, &dbi));
+
+	const char *key_str = "dup-key-alpha";
+	MDB_val key = {strlen(key_str), (void *)key_str};
+	const char *dups[] = {"dup-01", "dup-02", "dup-03", "dup-04"};
+	for (size_t i = 0; i < ARRAY_SIZE(dups); ++i) {
+		MDB_val data = {strlen(dups[i]), (void *)dups[i]};
+		CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, "dupdb", flags, &dbi));
+	MDB_cursor *cur = NULL;
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+	MDB_val data = {0, NULL};
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_SET_KEY));
+	size_t seen = 0;
+	int rc = mdb_cursor_get(cur, &key, &data, MDB_GET_CURRENT);
+	while (rc == MDB_SUCCESS) {
+		const char *expect = dups[seen];
+		if (data.mv_size != strlen(expect) ||
+		    memcmp(data.mv_data, expect, data.mv_size) != 0) {
+			fprintf(stderr, "dupsort smoke: mismatch at %zu\n", seen);
+			exit(EXIT_FAILURE);
+		}
+		rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT_DUP);
+		seen++;
+	}
+	if (rc != MDB_NOTFOUND)
+		CHECK(rc, "mdb_cursor_get");
+	if (seen != ARRAY_SIZE(dups)) {
+		fprintf(stderr, "dupsort smoke: expected %zu duplicates, saw %zu\n",
+		    ARRAY_SIZE(dups), seen);
+		exit(EXIT_FAILURE);
+	}
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, "dupdb", flags, &dbi));
+	MDB_val deldup = {strlen(dups[1]), (void *)dups[1]};
+	CHECK_CALL(mdb_del(txn, dbi, &key, &deldup));
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, "dupdb", flags, &dbi));
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_SET_KEY));
+	rc = mdb_cursor_get(cur, &key, &data, MDB_GET_CURRENT);
+	seen = 0;
+	while (rc == MDB_SUCCESS) {
+		const char *expect = (seen == 0) ? dups[0] : dups[seen + 1];
+		if (data.mv_size != strlen(expect) ||
+		    memcmp(data.mv_data, expect, data.mv_size) != 0) {
+			fprintf(stderr, "dupsort smoke: mismatch after delete\n");
+			exit(EXIT_FAILURE);
+		}
+		rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT_DUP);
+		seen++;
+	}
+	if (rc != MDB_NOTFOUND)
+		CHECK(rc, "mdb_cursor_get");
+	if (seen != ARRAY_SIZE(dups) - 1) {
+		fprintf(stderr, "dupsort smoke: expected %zu duplicates after delete, saw %zu\n",
+		    ARRAY_SIZE(dups) - 1, seen);
+		exit(EXIT_FAILURE);
+	}
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+	mdb_env_close(env);
+}
+
+
+static uint64_t
+pf_rng_next(void)
+{
+	uint64_t x = pf_rng_state;
+	x ^= x >> 12;
+	x ^= x << 25;
+	x ^= x >> 27;
+	pf_rng_state = x;
+	return x * UINT64_C(2685821657736338717);
+}
+
+static size_t
+pf_rng_range(size_t min, size_t max)
+{
+	if (max <= min)
+		return min;
+	uint64_t span = (uint64_t)(max - min + 1);
+	return min + (size_t)(pf_rng_next() % span);
+}
+
+static int
+pf_key_compare(const char *a, size_t alen, const char *b, size_t blen)
+{
+	size_t n = alen < blen ? alen : blen;
+	int cmp = memcmp(a, b, n);
+	if (cmp)
+		return cmp;
+	if (alen < blen)
+		return -1;
+	if (alen > blen)
+		return 1;
+	return 0;
+}
+
+static int
+pf_entry_search(const char *key, size_t key_len, int *found)
+{
+	size_t lo = 0;
+	size_t hi = pf_entry_count;
+	while (lo < hi) {
+		size_t mid = lo + ((hi - lo) >> 1);
+		int cmp = pf_key_compare(key, key_len,
+		    pf_entries[mid].key, pf_entries[mid].key_len);
+		if (cmp == 0) {
+			*found = 1;
+			return (int)mid;
+		}
+		if (cmp < 0)
+			hi = mid;
+		else
+			lo = mid + 1;
+	}
+	*found = 0;
+	return (int)lo;
+}
+
+static void
+pf_entry_insert(const char *key, size_t key_len,
+    const unsigned char *value, size_t val_len)
+{
+	int found = 0;
+	int idx = pf_entry_search(key, key_len, &found);
+	if (found) {
+		PFEntry *e = &pf_entries[idx];
+		e->val_len = val_len;
+		memcpy(e->value, value, val_len);
+		return;
+	}
+	if (pf_entry_count >= PF_MAX_ENTRIES) {
+		fprintf(stderr, "prefix fuzz: model capacity exceeded\n");
+		exit(EXIT_FAILURE);
+	}
+	for (size_t i = pf_entry_count; i > (size_t)idx; --i)
+		pf_entries[i] = pf_entries[i - 1];
+	PFEntry *dst = &pf_entries[idx];
+	dst->key_len = key_len;
+	memcpy(dst->key, key, key_len);
+	dst->key[key_len] = '\0';
+	dst->val_len = val_len;
+	memcpy(dst->value, value, val_len);
+	pf_entry_count++;
+}
+
+static void
+pf_entry_delete_at(size_t idx)
+{
+	if (idx >= pf_entry_count) {
+		fprintf(stderr, "prefix fuzz: delete index out of range\n");
+		exit(EXIT_FAILURE);
+	}
+	for (size_t i = idx; i + 1 < pf_entry_count; ++i)
+		pf_entries[i] = pf_entries[i + 1];
+	pf_entry_count--;
+}
+
+static size_t
+pf_make_key(char *out, size_t max_len)
+{
+	static const char *prefixes[] = {
+		"shared-alpha",
+		"shared-beta",
+		"shared-gamma",
+		"prefix-longer-alpha",
+		"prefix-longer-beta",
+		"prefix-longer-gamma"
+	};
+	size_t which = (size_t)(pf_rng_next() % (sizeof(prefixes) / sizeof(prefixes[0])));
+	const char *prefix = prefixes[which];
+	size_t prefix_len = strlen(prefix);
+	if (prefix_len + 1 >= max_len)
+		prefix_len = max_len > 1 ? max_len - 1 : 0;
+	memcpy(out, prefix, prefix_len);
+	out[prefix_len++] = '-';
+
+	uint64_t nonce = pf_key_nonce++;
+	int written = snprintf(out + prefix_len, max_len - prefix_len, "%016" PRIx64, nonce);
+	if (written < 0) {
+		fprintf(stderr, "prefix fuzz: snprintf failed while formatting key\n");
+		exit(EXIT_FAILURE);
+	}
+	size_t len = prefix_len + (size_t)written;
+	if (len >= max_len)
+		len = max_len - 1;
+
+	size_t extra = pf_rng_range(0, 8);
+	for (size_t i = 0; i < extra && len + 1 < max_len; ++i)
+		out[len++] = (char)('a' + (pf_rng_next() % 26));
+
+	out[len] = '\0';
+	return len;
+}
+
+static size_t
+pf_make_value(unsigned char *buf, size_t max_len)
+{
+    size_t len = pf_rng_range(4, max_len > 96 ? 96 : max_len);
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char ch = (unsigned char)('A' + (pf_rng_next() % 26));
+        buf[i] = ch;
+    }
+    return len;
+}
+
+static void
+pf_verify_model(MDB_env *env, MDB_dbi dbi)
+{
+	MDB_txn *txn = NULL;
+	MDB_cursor *cur = NULL;
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	MDB_dbi verify_dbi = dbi;
+	if (dbi == 0) {
+		CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &verify_dbi));
+	}
+	CHECK_CALL(mdb_cursor_open(txn, verify_dbi, &cur));
+
+	MDB_val key = {0, NULL};
+	MDB_val data = {0, NULL};
+	size_t idx = 0;
+	int rc = mdb_cursor_get(cur, &key, &data, MDB_FIRST);
+	while (rc == MDB_SUCCESS) {
+		if (idx >= pf_entry_count) {
+			fprintf(stderr, "prefix fuzz: database has unexpected extra key\n");
+			exit(EXIT_FAILURE);
+		}
+		PFEntry *e = &pf_entries[idx];
+		if (key.mv_size != e->key_len ||
+		    memcmp(key.mv_data, e->key, key.mv_size) != 0) {
+			fprintf(stderr, "prefix fuzz: key mismatch at index %zu\n", idx);
+			exit(EXIT_FAILURE);
+		}
+		if (data.mv_size != e->val_len ||
+		    memcmp(data.mv_data, e->value, data.mv_size) != 0) {
+		fprintf(stderr,
+		    "prefix fuzz: op=%zu value mismatch at index %zu (entries=%zu)\n",
+		    pf_op_index, idx, pf_entry_count);
+			fprintf(stderr, "  key: %.*s\n", (int)key.mv_size, (char *)key.mv_data);
+			fprintf(stderr, "  expected (%zu bytes):", e->val_len);
+			for (size_t i = 0; i < e->val_len; ++i)
+				fprintf(stderr, " %02x", e->value[i]);
+			fprintf(stderr, "\n  actual (%zu bytes):", data.mv_size);
+			for (size_t i = 0; i < data.mv_size; ++i)
+				fprintf(stderr, " %02x", ((unsigned char *)data.mv_data)[i]);
+			if (data.mv_size && ((unsigned char *)data.mv_data) != NULL) {
+				unsigned char *raw = (unsigned char *)data.mv_data;
+				fprintf(stderr, "\n  preceding byte: %02x", raw[-1]);
+			}
+			fprintf(stderr, "\n");
+			exit(EXIT_FAILURE);
+		}
+		idx++;
+		rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT);
+	}
+	if (rc != MDB_NOTFOUND)
+		CHECK(rc, "mdb_cursor_get");
+	if (idx != pf_entry_count) {
+		fprintf(stderr, "prefix fuzz: database returned %zu keys, expected %zu\n",
+		    idx, pf_entry_count);
+		exit(EXIT_FAILURE);
+	}
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+}
+
+static void
+pf_do_insert(MDB_env *env, MDB_dbi dbi)
+{
+	char keybuf[PF_KEY_MAX_LEN];
+	unsigned char valbuf[PF_VALUE_MAX_LEN];
+	size_t key_len = pf_make_key(keybuf, sizeof(keybuf));
+	size_t val_len = pf_make_value(valbuf, sizeof(valbuf));
+	fprintf(stderr, "op%zu: insert %.*s len=%zu\n",
+	    pf_op_index, (int)key_len, keybuf, val_len);
+
+	MDB_val key = { key_len, keybuf };
+	MDB_val val = { val_len, valbuf };
+
+	MDB_txn *txn = NULL;
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	int rc = mdb_put(txn, dbi, &key, &val, 0);
+	if (rc != MDB_SUCCESS) {
+		fprintf(stderr, "prefix fuzz: insert failed (%s)\n", mdb_strerror(rc));
+		mdb_txn_abort(txn);
+		exit(EXIT_FAILURE);
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	pf_entry_insert(keybuf, key_len, valbuf, val_len);
+}
+
+static void
+pf_do_delete(MDB_env *env, MDB_dbi dbi)
+{
+	if (pf_entry_count == 0)
+		return;
+	size_t idx = (size_t)(pf_rng_next() % pf_entry_count);
+	PFEntry *entry = &pf_entries[idx];
+	MDB_val key = { entry->key_len, entry->key };
+	fprintf(stderr, "op%zu: delete %.*s\n",
+	    pf_op_index, (int)entry->key_len, entry->key);
+
+	MDB_txn *txn = NULL;
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	int rc = mdb_del(txn, dbi, &key, NULL);
+	if (rc != MDB_SUCCESS) {
+		fprintf(stderr, "prefix fuzz: delete failed (%s)\n", mdb_strerror(rc));
+		mdb_txn_abort(txn);
+		exit(EXIT_FAILURE);
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	pf_entry_delete_at(idx);
+}
+
+static void
+test_prefix_fuzz(void)
+{
+	static const char *dir = "testdb_prefix_fuzz";
+	MDB_env *env = create_env(dir);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+
+	const char *seed_env = getenv("PF_SEED");
+	uint64_t seed = UINT64_C(0x9e3779b97f4a7c15);
+	if (seed_env && *seed_env) {
+		char *end = NULL;
+		uint64_t parsed = strtoull(seed_env, &end, 0);
+		if (end && *end == '\0')
+			seed = parsed;
+	}
+	pf_entry_count = 0;
+	pf_key_nonce = 0;
+	pf_rng_state = seed;
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	const size_t operations = 400;
+	for (size_t op = 0; op < operations; ++op) {
+		pf_op_index = op;
+		int do_insert = (pf_entry_count < PF_MAX_ENTRIES) &&
+		    (pf_entry_count == 0 || (pf_rng_next() & 1));
+		if (do_insert)
+			pf_do_insert(env, dbi);
+		else
+			pf_do_delete(env, dbi);
+		pf_verify_model(env, dbi);
+	}
+
+	/* Final cleanup verification. */
+	while (pf_entry_count > 0) {
+		pf_do_delete(env, dbi);
+		pf_verify_model(env, dbi);
+	}
+
+	mdb_env_close(env);
+}
+
+static void
+test_nested_txn_rollback(void)
+{
+	static const char *dir = "testdb_prefix_nested";
+	MDB_env *env = create_env(dir);
+	MDB_txn *parent = NULL;
+	MDB_dbi dbi;
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &parent));
+	CHECK_CALL(mdb_dbi_open(parent, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	const char *base_key = "nested-base";
+	MDB_val key = {strlen(base_key), (void *)base_key};
+	MDB_val val = {strlen(base_key), (void *)base_key};
+	CHECK_CALL(mdb_put(parent, dbi, &key, &val, 0));
+
+	MDB_txn *child = NULL;
+	CHECK_CALL(mdb_txn_begin(env, parent, 0, &child));
+	const char *child_key = "nested-child";
+	MDB_val ckey = {strlen(child_key), (void *)child_key};
+	MDB_val cval = {strlen(child_key), (void *)child_key};
+	CHECK_CALL(mdb_put(child, dbi, &ckey, &cval, 0));
+	mdb_txn_abort(child);
+
+	MDB_val lookup = {strlen(child_key), (void *)child_key};
+	MDB_val data = {0, NULL};
+	int rc = mdb_get(parent, dbi, &lookup, &data);
+	if (rc != MDB_NOTFOUND) {
+		fprintf(stderr,
+		    "nested txn: aborted child write still visible (%s)\n",
+		    mdb_strerror(rc));
+		exit(EXIT_FAILURE);
+	}
+
+	const char *parent_key = "nested-parent";
+	MDB_val pkey = {strlen(parent_key), (void *)parent_key};
+	MDB_val pval = {strlen(parent_key), (void *)parent_key};
+	CHECK_CALL(mdb_put(parent, dbi, &pkey, &pval, 0));
+	CHECK_CALL(mdb_txn_commit(parent));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &parent));
+	CHECK_CALL(mdb_dbi_open(parent, NULL, 0, &dbi));
+	rc = mdb_get(parent, dbi, &lookup, &data);
+	if (rc != MDB_NOTFOUND) {
+		fprintf(stderr,
+		    "nested txn: child insert survived abort (%s)\n",
+		    mdb_strerror(rc));
+		exit(EXIT_FAILURE);
+	}
+	CHECK_CALL(mdb_get(parent, dbi, &pkey, &data));
+	if (data.mv_size != pkey.mv_size ||
+	    memcmp(data.mv_data, pkey.mv_data, data.mv_size) != 0) {
+		fprintf(stderr, "nested txn: parent insert mismatch\n");
+		exit(EXIT_FAILURE);
+	}
+	CHECK_CALL(mdb_get(parent, dbi, &key, &data));
+	if (data.mv_size != key.mv_size ||
+	    memcmp(data.mv_data, key.mv_data, data.mv_size) != 0) {
+		fprintf(stderr, "nested txn: base insert mismatch\n");
+		exit(EXIT_FAILURE);
+	}
+	mdb_txn_abort(parent);
+	mdb_env_close(env);
+}
+
+
+
+
+
+int
+main(void)
+{
+    test_config_validation();
+    test_edge_cases();
+    test_range_scans();
+    test_threshold_behavior();
+    test_mixed_pattern_and_unicode();
+    test_cursor_buffer_sharing();
+    test_prefix_dupsort_transitions();
+    test_prefix_leaf_splits();
+    test_prefix_alternating_prefixes();
+    test_prefix_update_reinsert();
+    test_prefix_dupsort_smoke();
+    test_nested_txn_rollback();
+    test_prefix_fuzz();
+    printf("mtest_prefix: all tests passed\n");
+    return 0;
+}
