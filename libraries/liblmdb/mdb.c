@@ -1466,6 +1466,16 @@ typedef struct MDB_prefix_scratch {
 	unsigned int	entries_cap;	/**< number of cached entry slots */
 	unsigned char	*keybuf;	/**< contiguous decoded key storage */
 	size_t		keybuf_size;	/**< allocated bytes for decoded keys */
+	MDB_val		*decoded_vals;	/**< cached decoded keys for readonly scans */
+	unsigned int	decoded_vals_cap; /**< capacity for decoded_vals */
+	unsigned int	decoded_count;	/**< total keys in cached page */
+	unsigned char	*decoded_buf;	/**< backing storage for decoded keys */
+	size_t		decoded_buf_size; /**< allocated bytes for decoded_buf */
+	size_t		decoded_stride;	/**< bytes reserved per decoded key */
+	unsigned char	*decoded_ready;	/**< bitmap of decoded key slots */
+	unsigned int	decoded_ready_cap; /**< capacity for decoded_ready */
+	pgno_t		decoded_pgno;	/**< leaf page number currently cached */
+	txnid_t		decoded_gen;	/**< txnid that generated decoded cache */
 } MDB_prefix_scratch;
 
 	/** A database transaction.
@@ -1657,6 +1667,8 @@ typedef struct MDB_xcursor {
 	unsigned char mx_dbflag;
 } MDB_xcursor;
 
+static int mdb_prefix_cache_page(MDB_cursor *mc, MDB_page *mp);
+
 	/** Check if there is an inited xcursor */
 #define XCURSOR_INITED(mc) \
 	((mc)->mc_xcursor && ((mc)->mc_xcursor->mx_cursor.mc_flags & C_INITIALIZED))
@@ -1691,10 +1703,38 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 			out->mv_data = NODEKEY(mp, node);
 			return MDB_SUCCESS;
 		}
+		if (!IS_SUBP(mp) && (mc->mc_txn->mt_flags & MDB_TXN_RDONLY)) {
+			MDB_prefix_scratch *scratch = &mc->mc_txn->mt_prefix;
+			if (scratch->decoded_pgno != mp->mp_pgno ||
+			    scratch->decoded_gen != mc->mc_txn->mt_txnid ||
+			    scratch->decoded_count != NUMKEYS(mp)) {
+				int prc = mdb_prefix_cache_page(mc, mp);
+				if (prc != MDB_SUCCESS)
+					return prc;
+			}
+			if (idx < scratch->decoded_count &&
+			    scratch->decoded_pgno == mp->mp_pgno) {
+				if (!scratch->decoded_ready[idx]) {
+					if (idx == 0) {
+						scratch->decoded_ready[0] = 1;
+					} else {
+						MDB_val *slot = &scratch->decoded_vals[idx];
+						int drc = mdb_leaf_decode_key(&scratch->decoded_vals[0],
+						    NODEKEY(mp, node), node->mn_ksize,
+						    slot, slot->mv_data, scratch->decoded_stride, 0);
+						if (drc != MDB_SUCCESS)
+							return drc;
+						scratch->decoded_ready[idx] = 1;
+					}
+				}
+				*out = scratch->decoded_vals[idx];
+				return MDB_SUCCESS;
+			}
+		}
 		MDB_node *trunk_node = NODEPTR(mp, 0);
 		MDB_val trunk = { trunk_node->mn_ksize, NODEKEY(mp, trunk_node) };
-	int rc = mdb_leaf_decode_key(&trunk, NODEKEY(mp, node), node->mn_ksize,
-	    &mc->mc_key, mc->mc_keybuf, MDB_KEYBUF_MAX, 0);
+		int rc = mdb_leaf_decode_key(&trunk, NODEKEY(mp, node), node->mn_ksize,
+		    &mc->mc_key, mc->mc_keybuf, MDB_KEYBUF_MAX, 0);
 		if (rc != MDB_SUCCESS)
 			return rc;
 		*out = mc->mc_key;
@@ -1875,6 +1915,12 @@ static int  mdb_node_read(MDB_cursor *mc, MDB_node *leaf, MDB_val *data);
 static size_t	mdb_leaf_size(MDB_env *env, MDB_page *mp, indx_t indx, MDB_val *key, MDB_val *data, int prefix_enabled);
 static size_t	mdb_branch_size(MDB_env *env, MDB_page *mp, MDB_val *key);
 static int mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out);
+static void mdb_prefix_cache_reset(MDB_prefix_scratch *scratch);
+static int mdb_prefix_ensure_decoded_vals(MDB_txn *txn, unsigned int count, MDB_val **out);
+static int mdb_prefix_ensure_ready(MDB_txn *txn, unsigned int count, unsigned char **out);
+static size_t mdb_prefix_maxkey(const MDB_env *env);
+static int mdb_prefix_reserve_decoded_buf(MDB_txn *txn, size_t need, unsigned char **out);
+static int mdb_prefix_cache_page(MDB_cursor *mc, MDB_page *mp);
 
 typedef struct MDB_prefix_rebuild_entry {
 	MDB_val key;
@@ -1944,6 +1990,159 @@ mdb_prefix_ensure_keybuf(MDB_txn *txn, size_t size, unsigned char **out)
 }
 
 static void
+mdb_prefix_cache_reset(MDB_prefix_scratch *scratch)
+{
+	if (!scratch)
+		return;
+	scratch->decoded_count = 0;
+	scratch->decoded_stride = 0;
+	scratch->decoded_pgno = P_INVALID;
+	scratch->decoded_gen = 0;
+}
+
+static int
+mdb_prefix_ensure_decoded_vals(MDB_txn *txn, unsigned int count, MDB_val **out)
+{
+	MDB_prefix_scratch *scratch = &txn->mt_prefix;
+
+	if (count == 0) {
+		if (out)
+			*out = NULL;
+		return MDB_SUCCESS;
+	}
+	if (scratch->decoded_vals_cap < count) {
+		unsigned int newcap = scratch->decoded_vals_cap ? scratch->decoded_vals_cap : 16;
+		while (newcap < count)
+			newcap *= 2;
+		MDB_val *vals = realloc(scratch->decoded_vals, sizeof(MDB_val) * newcap);
+		if (!vals)
+			return ENOMEM;
+		scratch->decoded_vals = vals;
+		scratch->decoded_vals_cap = newcap;
+	}
+	if (out)
+		*out = scratch->decoded_vals;
+	return MDB_SUCCESS;
+}
+
+static int
+mdb_prefix_ensure_ready(MDB_txn *txn, unsigned int count, unsigned char **out)
+{
+	MDB_prefix_scratch *scratch = &txn->mt_prefix;
+
+	if (count == 0) {
+		if (out)
+			*out = NULL;
+		return MDB_SUCCESS;
+	}
+	if (scratch->decoded_ready_cap < count) {
+		unsigned int newcap = scratch->decoded_ready_cap ? scratch->decoded_ready_cap : 16;
+		while (newcap < count)
+			newcap *= 2;
+		unsigned char *bits = realloc(scratch->decoded_ready, newcap);
+		if (!bits)
+			return ENOMEM;
+		scratch->decoded_ready = bits;
+		scratch->decoded_ready_cap = newcap;
+	}
+	if (out)
+		*out = scratch->decoded_ready;
+	return MDB_SUCCESS;
+}
+
+static size_t
+mdb_prefix_maxkey(const MDB_env *env)
+{
+#if MDB_MAXKEYSIZE
+	(void)env;
+	return MDB_MAXKEYSIZE;
+#else
+	return env->me_maxkey;
+#endif
+}
+
+static int
+mdb_prefix_reserve_decoded_buf(MDB_txn *txn, size_t need, unsigned char **out)
+{
+	MDB_prefix_scratch *scratch = &txn->mt_prefix;
+	size_t size = scratch->decoded_buf_size;
+
+	if (size < need) {
+		size_t newsize = size ? size : txn->mt_env->me_psize;
+		if (newsize < 256)
+			newsize = 256;
+		while (newsize < need) {
+			if (newsize > (SIZE_MAX >> 1)) {
+				newsize = need;
+				break;
+			}
+			newsize *= 2;
+		}
+		unsigned char *buf = realloc(scratch->decoded_buf, newsize);
+		if (!buf)
+			return ENOMEM;
+		scratch->decoded_buf = buf;
+		scratch->decoded_buf_size = newsize;
+	}
+	if (out)
+		*out = scratch->decoded_buf;
+	return MDB_SUCCESS;
+}
+
+static int
+mdb_prefix_cache_page(MDB_cursor *mc, MDB_page *mp)
+{
+	MDB_txn *txn = mc->mc_txn;
+	MDB_env *env = txn->mt_env;
+	MDB_prefix_scratch *scratch = &txn->mt_prefix;
+	unsigned int total = NUMKEYS(mp);
+	int rc;
+
+	mdb_prefix_cache_reset(scratch);
+
+	rc = mdb_prefix_ensure_decoded_vals(txn, total, NULL);
+	if (rc != MDB_SUCCESS)
+		goto fail;
+	rc = mdb_prefix_ensure_ready(txn, total, NULL);
+	if (rc != MDB_SUCCESS)
+		goto fail;
+
+	size_t stride = total ? mdb_prefix_maxkey(env) : 0;
+	if (stride == 0 && total)
+		stride = env->me_psize; /* fallback */
+	if (stride == 0)
+		stride = 1;
+	size_t need = (size_t)total * stride;
+	rc = mdb_prefix_reserve_decoded_buf(txn, need, NULL);
+	if (rc != MDB_SUCCESS)
+		goto fail;
+
+	for (unsigned int i = 0; i < total; ++i) {
+		scratch->decoded_vals[i].mv_data = scratch->decoded_buf + (size_t)i * stride;
+		scratch->decoded_vals[i].mv_size = 0;
+	}
+	if (total > 0)
+		memset(scratch->decoded_ready, 0, total);
+
+	if (total > 0) {
+		MDB_node *trunk = NODEPTR(mp, 0);
+		scratch->decoded_vals[0].mv_size = trunk->mn_ksize;
+		memcpy(scratch->decoded_vals[0].mv_data, NODEKEY(mp, trunk), trunk->mn_ksize);
+		scratch->decoded_ready[0] = 1;
+	}
+
+	scratch->decoded_pgno = mp->mp_pgno;
+	scratch->decoded_gen = txn->mt_txnid;
+	scratch->decoded_count = total;
+	scratch->decoded_stride = stride;
+	return MDB_SUCCESS;
+
+fail:
+	mdb_prefix_cache_reset(scratch);
+	return rc;
+}
+
+static void
 mdb_prefix_scratch_clear(MDB_prefix_scratch *scratch)
 {
 	if (!scratch)
@@ -1960,9 +2159,28 @@ mdb_prefix_scratch_clear(MDB_prefix_scratch *scratch)
 		free(scratch->keybuf);
 		scratch->keybuf = NULL;
 	}
+	if (scratch->decoded_vals) {
+		free(scratch->decoded_vals);
+		scratch->decoded_vals = NULL;
+	}
+	if (scratch->decoded_buf) {
+		free(scratch->decoded_buf);
+		scratch->decoded_buf = NULL;
+	}
+	if (scratch->decoded_ready) {
+		free(scratch->decoded_ready);
+		scratch->decoded_ready = NULL;
+	}
 	scratch->snapshot_size = 0;
 	scratch->entries_cap = 0;
 	scratch->keybuf_size = 0;
+	scratch->decoded_vals_cap = 0;
+	scratch->decoded_count = 0;
+	scratch->decoded_buf_size = 0;
+	scratch->decoded_stride = 0;
+	scratch->decoded_ready_cap = 0;
+	scratch->decoded_pgno = P_INVALID;
+	scratch->decoded_gen = 0;
 }
 
 static int mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp, const MDB_val *old_trunk);
