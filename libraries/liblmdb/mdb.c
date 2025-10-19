@@ -686,6 +686,13 @@ static txnid_t mdb_debug_start;
 #define ENV_MAXKEY(env)	((env)->me_maxkey)
 #endif
 
+	/** Scratch space reserved per cursor for decompressed keys. */
+#if MDB_MAXKEYSIZE
+#define MDB_KEYBUF_MAX	(MDB_MAXKEYSIZE)
+#else
+#define MDB_KEYBUF_MAX	511
+#endif
+
 	/**	@brief The maximum size of a data item.
 	 *
 	 *	We only store a 32 bit value for node sizes.
@@ -1209,13 +1216,6 @@ typedef struct MDB_node {
 	 */
 #define LEAF2KEY(p, i, ks)	((char *)(p) + PAGEHDRSZ + ((i)*(ks)))
 
-	/** Set the \b node's key into \b keyptr, if requested. */
-#define MDB_GET_KEY(mp, node, keyptr)	{ if ((keyptr) != NULL) { \
-	(keyptr)->mv_size = NODEKSZ(node); (keyptr)->mv_data = NODEKEY(mp, node); } }
-
-	/** Set the \b node's key into \b key. */
-#define MDB_GET_KEY2(mp, node, key)	{ key.mv_size = NODEKSZ(node); key.mv_data = NODEKEY(mp, node); }
-
 static void
 mdb_node_set_count(MDB_page *mp, MDB_node *node, uint64_t value)
 {
@@ -1230,6 +1230,138 @@ mdb_node_get_count(const MDB_page *mp, const MDB_node *node)
 	if (IS_BRANCH(mp) && IS_COUNTED(mp))
 		memcpy(&value, node->mn_data, sizeof(value));
 	return value;
+}
+
+#define MDB_VARINT_MAX	9U
+
+static size_t
+mdb_varint_length(uint64_t value)
+{
+	size_t len = 1;
+	while (value >= 0x80) {
+		value >>= 7;
+		len++;
+	}
+	return len;
+}
+
+static size_t
+mdb_varint_encode(uint64_t value, unsigned char *dest)
+{
+	size_t len = mdb_varint_length(value);
+	size_t idx = len;
+	while (idx) {
+		unsigned char byte = (unsigned char)(value & 0x7f);
+		dest[--idx] = byte;
+		value >>= 7;
+	}
+	for (size_t i = 0; i + 1 < len; ++i)
+		dest[i] |= 0x80;
+	return len;
+}
+
+static int
+mdb_varint_decode(const unsigned char *src, size_t available,
+	uint64_t *out, size_t *used)
+{
+	uint64_t value = 0;
+	size_t consumed = 0;
+
+	while (consumed < available && consumed < MDB_VARINT_MAX) {
+		unsigned char byte = src[consumed++];
+		value = (value << 7) | (byte & 0x7f);
+		if ((byte & 0x80) == 0) {
+			if (out)
+				*out = value;
+			if (used)
+				*used = consumed;
+			return MDB_SUCCESS;
+		}
+	}
+	return MDB_CORRUPTED;
+}
+
+static size_t
+mdb_leaf_shared_prefix(const MDB_val *a, const MDB_val *b)
+{
+	size_t limit = a->mv_size < b->mv_size ? a->mv_size : b->mv_size;
+	const unsigned char *lhs = (const unsigned char *)a->mv_data;
+	const unsigned char *rhs = (const unsigned char *)b->mv_data;
+	size_t i = 0;
+	for (; i < limit && lhs[i] == rhs[i]; ++i)
+		;
+	return i;
+}
+
+static size_t
+mdb_leaf_encoded_size(const MDB_val *trunk, const MDB_val *key, size_t *shared_out)
+{
+	if (!trunk || !trunk->mv_data)
+		return key->mv_size;
+	size_t shared = mdb_leaf_shared_prefix(trunk, key);
+	if (shared_out)
+		*shared_out = shared;
+	return mdb_varint_length(shared) + (key->mv_size - shared);
+}
+
+static size_t
+mdb_leaf_encode_key(const MDB_val *trunk, const MDB_val *key,
+	unsigned char *dest, size_t *shared_out)
+{
+	if (!trunk || !trunk->mv_data) {
+		memcpy(dest, key->mv_data, key->mv_size);
+		if (shared_out)
+			*shared_out = 0;
+		return key->mv_size;
+	}
+	size_t shared = mdb_leaf_shared_prefix(trunk, key);
+	size_t header = mdb_varint_encode(shared, dest);
+	memcpy(dest + header,
+	    (const unsigned char *)key->mv_data + shared,
+	    key->mv_size - shared);
+	if (shared_out)
+		*shared_out = shared;
+	return header + (key->mv_size - shared);
+}
+
+static int
+mdb_leaf_decode_key(const MDB_val *trunk, const unsigned char *encoded,
+	size_t encoded_len, MDB_val *out, void *buf, size_t buf_size,
+	int allow_trunk_alias)
+{
+	if (!trunk || !trunk->mv_data) {
+		if (!allow_trunk_alias) {
+			if (encoded_len > buf_size)
+				return MDB_BAD_VALSIZE;
+			memcpy(buf, encoded, encoded_len);
+			out->mv_data = buf;
+		} else {
+			out->mv_data = (void *)encoded;
+		}
+		out->mv_size = encoded_len;
+		return MDB_SUCCESS;
+	}
+
+	size_t used = 0;
+	uint64_t shared = 0;
+	int rc = mdb_varint_decode(encoded, encoded_len, &shared, &used);
+	if (rc != MDB_SUCCESS)
+		return rc;
+	if (shared > trunk->mv_size)
+		return MDB_CORRUPTED;
+	if (used > encoded_len)
+		return MDB_CORRUPTED;
+
+	size_t suffix_len = encoded_len - used;
+	size_t full_len = (size_t)shared + suffix_len;
+	if (full_len > buf_size)
+		return MDB_BAD_VALSIZE;
+
+	memcpy(buf, trunk->mv_data, shared);
+	memcpy((unsigned char *)buf + shared, encoded + used, suffix_len);
+	out->mv_data = buf;
+	out->mv_size = full_len;
+	return MDB_SUCCESS;
 }
 
 	/** Information about a single database in the environment. */
@@ -1248,7 +1380,7 @@ typedef struct MDB_db {
 #define PERSISTENT_FLAGS	(0xffff & ~(MDB_VALID))
 	/** #mdb_dbi_open() flags */
 #define VALID_FLAGS	(MDB_REVERSEKEY|MDB_DUPSORT|MDB_INTEGERKEY|MDB_DUPFIXED|\
-	MDB_INTEGERDUP|MDB_REVERSEDUP|MDB_COUNTED|MDB_CREATE)
+	MDB_INTEGERDUP|MDB_REVERSEDUP|MDB_COUNTED|MDB_PREFIX_COMPRESSION|MDB_CREATE)
 
 	/** Handle for the DB used to track free pages. */
 #define	FREE_DBI	0
@@ -1485,6 +1617,8 @@ struct MDB_cursor {
 #	define MC_OVPG(mc)			((MDB_page *)0)
 #	define MC_SET_OVPG(mc, pg)	((void)0)
 #endif
+	MDB_val		mc_key;			/**< scratch buffer for decompressed keys */
+	unsigned char	mc_keybuf[MDB_KEYBUF_MAX];
 };
 
 	/** Context for sorted-dup records.
@@ -1519,6 +1653,93 @@ typedef struct MDB_xcursor {
 	if ((xr_node->mn_flags & (F_DUPDATA|F_SUBDATA)) == F_DUPDATA) \
 		(mc)->mc_xcursor->mx_cursor.mc_pg[0] = NODEDATA(xr_node); \
 } while (0)
+
+static int
+mdb_leaf_write_key(MDB_cursor *mc, MDB_page *mp, indx_t idx, const MDB_val *full_key)
+{
+	if (!IS_LEAF(mp) || IS_LEAF2(mp))
+		return MDB_SUCCESS;
+	if (!(mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION))
+		return MDB_SUCCESS;
+
+	MDB_node *node = NODEPTR(mp, idx);
+	MDB_node *trunk_node = NODEPTR(mp, 0);
+	MDB_val trunk = { trunk_node->mn_ksize, NODEKEY(mp, trunk_node) };
+	size_t old_key = node->mn_ksize;
+	size_t data_len;
+	if (F_ISSET(node->mn_flags, F_BIGDATA))
+		data_len = sizeof(pgno_t);
+	else
+		data_len = NODEDSZ(node);
+
+	size_t new_key = (idx == 0) ? full_key->mv_size :
+	    mdb_leaf_encoded_size(&trunk, full_key, NULL);
+	size_t old_node = EVEN(NODESIZE + old_key + data_len);
+	size_t new_node = EVEN(NODESIZE + new_key + data_len);
+	ssize_t delta = (ssize_t)new_node - (ssize_t)old_node;
+	indx_t ptr = MP_PTRS(mp)[idx];
+	if (delta > 0 && (ssize_t)SIZELEFT(mp) < delta)
+		return MDB_PAGE_FULL;
+
+	if (delta) {
+		indx_t numkeys = NUMKEYS(mp);
+		for (indx_t i = 0; i < numkeys; ++i) {
+			if (MP_PTRS(mp)[i] <= ptr)
+				MP_PTRS(mp)[i] -= delta;
+		}
+		char *base = (char *)mp + MP_UPPER(mp) + PAGEBASE;
+		size_t len = ptr - MP_UPPER(mp) + old_node;
+		memmove(base - delta, base, len);
+		MP_UPPER(mp) -= delta;
+		node = NODEPTR(mp, idx);
+		trunk_node = NODEPTR(mp, 0);
+		trunk.mv_size = trunk_node->mn_ksize;
+		trunk.mv_data = NODEKEY(mp, trunk_node);
+	} else {
+		trunk_node = NODEPTR(mp, 0);
+		trunk.mv_size = trunk_node->mn_ksize;
+		trunk.mv_data = NODEKEY(mp, trunk_node);
+	}
+
+	node->mn_ksize = new_key;
+	if (idx == 0)
+		mdb_leaf_encode_key(NULL, full_key, NODEKEY(mp, node), NULL);
+	else
+		mdb_leaf_encode_key(&trunk, full_key, NODEKEY(mp, node), NULL);
+	return MDB_SUCCESS;
+}
+
+static int
+mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
+{
+	if (!out)
+		return MDB_SUCCESS;
+	if (IS_LEAF2(mp)) {
+		out->mv_size = mp->mp_pad;
+		out->mv_data = LEAF2KEY(mp, idx, out->mv_size);
+		return MDB_SUCCESS;
+	}
+	MDB_node *node = NODEPTR(mp, idx);
+	if (IS_LEAF(mp)) {
+		if (!(mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) || idx == 0) {
+			out->mv_size = node->mn_ksize;
+			out->mv_data = NODEKEY(mp, node);
+			return MDB_SUCCESS;
+		}
+		MDB_node *trunk_node = NODEPTR(mp, 0);
+		MDB_val trunk = { trunk_node->mn_ksize, NODEKEY(mp, trunk_node) };
+		int rc = mdb_leaf_decode_key(&trunk, NODEKEY(mp, node), node->mn_ksize,
+		    &mc->mc_key, mc->mc_keybuf, MDB_KEYBUF_MAX, 0);
+		if (rc != MDB_SUCCESS)
+			return rc;
+		*out = mc->mc_key;
+		return MDB_SUCCESS;
+	}
+	out->mv_size = node->mn_ksize;
+	out->mv_data = NODEKEY(mp, node);
+	return MDB_SUCCESS;
+}
+
 
 	/** State of FreeDB old pages, stored in the MDB_env */
 typedef struct MDB_pgstate {
@@ -1680,14 +1901,16 @@ static void mdb_env_close0(MDB_env *env, int excl);
 
 static MDB_node *mdb_node_search(MDB_cursor *mc, MDB_val *key, int *exactp);
 static int  mdb_node_add(MDB_cursor *mc, indx_t indx,
-			    MDB_val *key, MDB_val *data, pgno_t pgno, unsigned int flags,
-			    MDB_page *child_hint, uint64_t count_hint);
+ 		    MDB_val *key, MDB_val *data, pgno_t pgno, unsigned int flags,
+ 		    MDB_page *child_hint, uint64_t count_hint);
 static void mdb_node_del(MDB_cursor *mc, int ksize);
 static void mdb_node_shrink(MDB_page *mp, indx_t indx);
 static int	mdb_node_move(MDB_cursor *csrc, MDB_cursor *cdst, int fromleft);
 static int  mdb_node_read(MDB_cursor *mc, MDB_node *leaf, MDB_val *data);
-static size_t	mdb_leaf_size(MDB_env *env, MDB_val *key, MDB_val *data);
+static size_t	mdb_leaf_size(MDB_env *env, MDB_page *mp, indx_t indx, MDB_val *key, MDB_val *data, int prefix_enabled);
 static size_t	mdb_branch_size(MDB_env *env, MDB_page *mp, MDB_val *key);
+static int mdb_leaf_write_key(MDB_cursor *mc, MDB_page *mp, indx_t idx, const MDB_val *full_key);
+static int mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out);
 
 static int	mdb_rebalance(MDB_cursor *mc);
 static int	mdb_update_key(MDB_cursor *mc, MDB_val *key);
@@ -6493,6 +6716,7 @@ mdb_node_search(MDB_cursor *mc, MDB_val *key, int *exactp)
 	unsigned int	 i = 0, nkeys;
 	int		 low, high;
 	int		 rc = 0;
+	int		 cmp_res = 0;
 	MDB_page *mp = mc->mc_pg[mc->mc_top];
 	MDB_node	*node = NULL;
 	MDB_val	 nodekey;
@@ -6525,12 +6749,12 @@ mdb_node_search(MDB_cursor *mc, MDB_val *key, int *exactp)
 		while (low <= high) {
 			i = (low + high) >> 1;
 			nodekey.mv_data = LEAF2KEY(mp, i, nodekey.mv_size);
-			rc = cmp(key, &nodekey);
+			cmp_res = cmp(key, &nodekey);
 			DPRINTF(("found leaf index %u [%s], rc = %i",
-			    i, DKEY(&nodekey), rc));
-			if (rc == 0)
+			    i, DKEY(&nodekey), cmp_res));
+			if (cmp_res == 0)
 				break;
-			if (rc > 0)
+			if (cmp_res > 0)
 				low = i + 1;
 			else
 				high = i - 1;
@@ -6539,35 +6763,41 @@ mdb_node_search(MDB_cursor *mc, MDB_val *key, int *exactp)
 		while (low <= high) {
 			i = (low + high) >> 1;
 
-		node = NODEPTR(mp, i);
-		nodekey.mv_size = NODEKSZ(node);
-		nodekey.mv_data = NODEKEY(mp, node);
+			node = NODEPTR(mp, i);
+			if (IS_LEAF(mp) && (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION)) {
+				rc = mdb_cursor_read_key_at(mc, mp, i, &nodekey);
+				if (rc != MDB_SUCCESS)
+					goto bad;
+			} else {
+				nodekey.mv_size = NODEKSZ(node);
+				nodekey.mv_data = NODEKEY(mp, node);
+			}
 
-			rc = cmp(key, &nodekey);
+			cmp_res = cmp(key, &nodekey);
 #if MDB_DEBUG
 			if (IS_LEAF(mp))
 				DPRINTF(("found leaf index %u [%s], rc = %i",
-				    i, DKEY(&nodekey), rc));
+				    i, DKEY(&nodekey), cmp_res));
 			else
 				DPRINTF(("found branch index %u [%s -> %"Yu"], rc = %i",
-				    i, DKEY(&nodekey), NODEPGNO(node), rc));
+				    i, DKEY(&nodekey), NODEPGNO(node), cmp_res));
 #endif
-			if (rc == 0)
+			if (cmp_res == 0)
 				break;
-			if (rc > 0)
+			if (cmp_res > 0)
 				low = i + 1;
 			else
 				high = i - 1;
 		}
 	}
 
-	if (rc > 0) {	/* Found entry is less than the key. */
+	if (cmp_res > 0) {	/* Found entry is less than the key. */
 		i++;	/* Skip to get the smallest entry larger than key. */
 		if (!IS_LEAF2(mp))
 			node = NODEPTR(mp, i);
 	}
 	if (exactp)
-		*exactp = (rc == 0 && nkeys > 0);
+		*exactp = (cmp_res == 0 && nkeys > 0);
 	/* store the key index */
 	mc->mc_ki[mc->mc_top] = i;
 	if (i >= nkeys)
@@ -6576,6 +6806,10 @@ mdb_node_search(MDB_cursor *mc, MDB_val *key, int *exactp)
 
 	/* nodeptr is fake for LEAF2 */
 	return node;
+
+bad:
+	mc->mc_txn->mt_flags |= MDB_TXN_ERROR;
+	return NULL;
 }
 
 #if 0
@@ -7431,8 +7665,11 @@ mdb_cursor_next(MDB_cursor *mc, MDB_val *key, MDB_val *data, MDB_cursor_op op)
 			if (op == MDB_NEXT || op == MDB_NEXT_DUP) {
 				rc = mdb_cursor_next(&mc->mc_xcursor->mx_cursor, data, NULL, MDB_NEXT);
 				if (op != MDB_NEXT || rc != MDB_NOTFOUND) {
-					if (rc == MDB_SUCCESS)
-						MDB_GET_KEY(mp, leaf, key);
+					if (rc == MDB_SUCCESS && key) {
+						int krc = mdb_cursor_read_key_at(mc, mp, mc->mc_ki[mc->mc_top], key);
+						if (krc != MDB_SUCCESS)
+							return krc;
+					}
 					return rc;
 				}
 			}
@@ -7487,7 +7724,11 @@ skip:
 			return rc;
 	}
 
-	MDB_GET_KEY(mp, leaf, key);
+	if (key) {
+		rc = mdb_cursor_read_key_at(mc, mp, mc->mc_ki[mc->mc_top], key);
+		if (rc != MDB_SUCCESS)
+			return rc;
+	}
 	return MDB_SUCCESS;
 }
 
@@ -7515,10 +7756,13 @@ mdb_cursor_prev(MDB_cursor *mc, MDB_val *key, MDB_val *data, MDB_cursor_op op)
 			if (op == MDB_PREV || op == MDB_PREV_DUP) {
 				rc = mdb_cursor_prev(&mc->mc_xcursor->mx_cursor, data, NULL, MDB_PREV);
 				if (op != MDB_PREV || rc != MDB_NOTFOUND) {
-					if (rc == MDB_SUCCESS) {
-						MDB_GET_KEY(mp, leaf, key);
-						mc->mc_flags &= ~C_EOF;
+					if (rc == MDB_SUCCESS && key) {
+						int krc = mdb_cursor_read_key_at(mc, mp, mc->mc_ki[mc->mc_top], key);
+						if (krc != MDB_SUCCESS)
+							return krc;
 					}
+					if (rc == MDB_SUCCESS)
+						mc->mc_flags &= ~C_EOF;
 					return rc;
 				}
 			}
@@ -7572,7 +7816,11 @@ mdb_cursor_prev(MDB_cursor *mc, MDB_val *key, MDB_val *data, MDB_cursor_op op)
 			return rc;
 	}
 
-	MDB_GET_KEY(mp, leaf, key);
+	if (key) {
+		rc = mdb_cursor_read_key_at(mc, mp, mc->mc_ki[mc->mc_top], key);
+		if (rc != MDB_SUCCESS)
+			return rc;
+	}
 	return MDB_SUCCESS;
 }
 
@@ -7608,7 +7856,9 @@ mdb_cursor_set(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 			nodekey.mv_data = LEAF2KEY(mp, 0, nodekey.mv_size);
 		} else {
 			leaf = NODEPTR(mp, 0);
-			MDB_GET_KEY2(mp, leaf, nodekey);
+			rc = mdb_cursor_read_key_at(mc, mp, 0, &nodekey);
+			if (rc != MDB_SUCCESS)
+				return rc;
 		}
 		rc = mc->mc_dbx->md_cmp(key, &nodekey);
 		if (rc == 0) {
@@ -7629,7 +7879,9 @@ mdb_cursor_set(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 						 nkeys-1, nodekey.mv_size);
 				} else {
 				leaf = NODEPTR(mp, nkeys-1);
-				MDB_GET_KEY2(mp, leaf, nodekey);
+				rc = mdb_cursor_read_key_at(mc, mp, nkeys-1, &nodekey);
+				if (rc != MDB_SUCCESS)
+					return rc;
 				}
 				rc = mc->mc_dbx->md_cmp(key, &nodekey);
 				if (rc == 0) {
@@ -7647,7 +7899,9 @@ mdb_cursor_set(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 								 mc->mc_ki[mc->mc_top], nodekey.mv_size);
 						} else {
 					leaf = NODEPTR(mp, mc->mc_ki[mc->mc_top]);
-					MDB_GET_KEY2(mp, leaf, nodekey);
+					rc = mdb_cursor_read_key_at(mc, mp, mc->mc_ki[mc->mc_top], &nodekey);
+					if (rc != MDB_SUCCESS)
+						return rc;
 						}
 						rc = mc->mc_dbx->md_cmp(key, &nodekey);
 						if (rc == 0) {
@@ -7767,8 +8021,11 @@ set1:
 	}
 
 	/* The key already matches in all other cases */
-	if (op == MDB_SET_RANGE || op == MDB_SET_KEY)
-		MDB_GET_KEY(mp, leaf, key);
+	if (op == MDB_SET_RANGE || op == MDB_SET_KEY) {
+		rc = mdb_cursor_read_key_at(mc, mp, mc->mc_ki[mc->mc_top], key);
+		if (rc != MDB_SUCCESS)
+			return rc;
+	}
 	DPRINTF(("==> cursor placed on key [%s]", DKEY(key)));
 
 	return rc;
@@ -7819,7 +8076,11 @@ mdb_cursor_first(MDB_cursor *mc, MDB_val *key, MDB_val *data)
 			return rc;
 	}
 
-	MDB_GET_KEY(mp, leaf, key);
+	if (key) {
+		rc = mdb_cursor_read_key_at(mc, mp, 0, key);
+		if (rc != MDB_SUCCESS)
+			return rc;
+	}
 	return MDB_SUCCESS;
 }
 
@@ -7866,7 +8127,11 @@ mdb_cursor_last(MDB_cursor *mc, MDB_val *key, MDB_val *data)
 			return rc;
 	}
 
-	MDB_GET_KEY(mp, leaf, key);
+	if (key) {
+		rc = mdb_cursor_read_key_at(mc, mp, mc->mc_ki[mc->mc_top], key);
+		if (rc != MDB_SUCCESS)
+			return rc;
+	}
 	return MDB_SUCCESS;
 }
 
@@ -7902,7 +8167,11 @@ mdb_cursor_get(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 				key->mv_data = LEAF2KEY(mp, mc->mc_ki[mc->mc_top], key->mv_size);
 			} else {
 				MDB_node *leaf = NODEPTR(mp, mc->mc_ki[mc->mc_top]);
-				MDB_GET_KEY(mp, leaf, key);
+				if (key) {
+					int krc = mdb_cursor_read_key_at(mc, mp, mc->mc_ki[mc->mc_top], key);
+					if (krc != MDB_SUCCESS)
+						return krc;
+				}
 				if (data) {
 					if (F_ISSET(leaf->mn_flags, F_DUPDATA)) {
 						rc = mdb_cursor_get(&mc->mc_xcursor->mx_cursor, data, NULL, MDB_GET_CURRENT);
@@ -8030,7 +8299,11 @@ fetchm:
 			MDB_page *mp = mc->mc_pg[mc->mc_top];
 			MDB_node *leaf = NODEPTR(mp, mc->mc_ki[mc->mc_top]);
 			if (!F_ISSET(leaf->mn_flags, F_DUPDATA)) {
-				MDB_GET_KEY(mp, leaf, key);
+				if (key) {
+					int krc = mdb_cursor_read_key_at(mc, mp, mc->mc_ki[mc->mc_top], key);
+					if (krc != MDB_SUCCESS)
+						return krc;
+				}
 				rc = mdb_node_read(mc, leaf, data);
 				break;
 			}
@@ -8358,17 +8631,19 @@ more:
 					/* Too big for a sub-page, convert to sub-DB */
 					fp_flags &= ~P_SUBP;
 prep_subDB:
-					if (mc->mc_db->md_flags & MDB_DUPFIXED) {
-						fp_flags |= P_LEAF2;
-						dummy.md_pad = fp->mp_pad;
-						dummy.md_flags = MDB_DUPFIXED;
-						if (mc->mc_db->md_flags & MDB_INTEGERDUP)
-							dummy.md_flags |= MDB_INTEGERKEY;
-					} else {
-						dummy.md_pad = 0;
-						dummy.md_flags = 0;
-					}
-				dummy.md_depth = 1;
+			if (mc->mc_db->md_flags & MDB_DUPFIXED) {
+				fp_flags |= P_LEAF2;
+				dummy.md_pad = fp->mp_pad;
+				dummy.md_flags = MDB_DUPFIXED;
+				if (mc->mc_db->md_flags & MDB_INTEGERDUP)
+					dummy.md_flags |= MDB_INTEGERKEY;
+			} else {
+				dummy.md_pad = 0;
+				dummy.md_flags = 0;
+			}
+			if (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION)
+				dummy.md_flags |= MDB_PREFIX_COMPRESSION;
+			dummy.md_depth = 1;
 				dummy.md_branch_pages = 0;
 					dummy.md_leaf_pages = 1;
 					dummy.md_overflow_pages = 0;
@@ -8500,7 +8775,10 @@ new_ksize:
 
 new_sub:
 	nflags = flags & NODE_ADD_FLAGS;
-	nsize = IS_LEAF2(mc->mc_pg[mc->mc_top]) ? key->mv_size : mdb_leaf_size(env, key, rdata);
+		MDB_page *cur_pg = mc->mc_pg[mc->mc_top];
+		int prefix_enabled = (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) != 0;
+		nsize = IS_LEAF2(cur_pg) ? key->mv_size :
+		    mdb_leaf_size(env, cur_pg, mc->mc_ki[mc->mc_top], key, rdata, prefix_enabled);
 	if (SIZELEFT(mc->mc_pg[mc->mc_top]) < nsize) {
 		if (( flags & (F_DUPDATA|F_SUBDATA)) == F_DUPDATA )
 			nflags &= ~MDB_APPEND; /* sub-page may need room to grow */
@@ -8833,11 +9111,23 @@ mdb_page_new(MDB_cursor *mc, uint32_t flags, int num, MDB_page **mp)
  * @return The number of bytes needed to store the node.
  */
 static size_t
-mdb_leaf_size(MDB_env *env, MDB_val *key, MDB_val *data)
+mdb_leaf_size(MDB_env *env, MDB_page *mp, indx_t indx, MDB_val *key, MDB_val *data, int prefix_enabled)
 {
-	size_t		 sz;
+	MDB_val trunk = {0, NULL};
+	size_t key_bytes;
+	size_t sz;
 
-	sz = LEAFSIZE(key, data);
+	if (prefix_enabled && mp && !IS_LEAF2(mp)) {
+		indx_t total = NUMKEYS(mp);
+		if (total > 0 && indx != 0) {
+			MDB_node *tr = NODEPTR(mp, 0);
+			trunk.mv_size = tr->mn_ksize;
+			trunk.mv_data = NODEKEY(mp, tr);
+		}
+	}
+
+	key_bytes = mdb_leaf_encoded_size(trunk.mv_data ? &trunk : NULL, key, NULL);
+	sz = NODESIZE + key_bytes + data->mv_size;
 	if (sz > env->me_nodemax) {
 		/* put on overflow page */
 		sz -= data->mv_size - sizeof(pgno_t);
@@ -8906,6 +9196,12 @@ mdb_node_add(MDB_cursor *mc, indx_t indx,
 	MDB_page	*counted_child = child_hint;
 	uint64_t	 child_count = count_hint;
 	DKBUF;
+	MDB_val	trunk = {0, NULL};
+	size_t	key_bytes = 0;
+	unsigned char old_trunk_buf[MDB_KEYBUF_MAX];
+	MDB_val	old_trunk = {0, NULL};
+	int	need_reencode = 0;
+	int	prefix_enabled = (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) != 0;
 
 	mdb_cassert(mc, MP_UPPER(mp) >= MP_LOWER(mp));
 
@@ -8933,8 +9229,31 @@ mdb_node_add(MDB_cursor *mc, indx_t indx,
 
 	room = (ssize_t)SIZELEFT(mp) - (ssize_t)sizeof(indx_t);
 	node_size += count_sz;
-	if (key != NULL)
-		node_size += key->mv_size;
+	if (key != NULL) {
+		if (IS_LEAF(mp)) {
+			if (prefix_enabled) {
+				indx_t total = NUMKEYS(mp);
+				if (total > 0 && indx != 0) {
+					MDB_node *tr = NODEPTR(mp, 0);
+					trunk.mv_size = tr->mn_ksize;
+					trunk.mv_data = NODEKEY(mp, tr);
+				}
+			}
+			key_bytes = mdb_leaf_encoded_size(prefix_enabled ? &trunk : NULL, key, NULL);
+		} else {
+			key_bytes = key->mv_size;
+		}
+		node_size += key_bytes;
+	}
+	if (prefix_enabled && IS_LEAF(mp) && !IS_LEAF2(mp) && indx == 0 && NUMKEYS(mp) > 0) {
+		MDB_node *old = NODEPTR(mp, 0);
+		if (old->mn_ksize > MDB_KEYBUF_MAX)
+			return MDB_BAD_VALSIZE;
+		old_trunk.mv_size = old->mn_ksize;
+		old_trunk.mv_data = old_trunk_buf;
+		memcpy(old_trunk_buf, NODEKEY(mp, old), old_trunk.mv_size);
+		need_reencode = 1;
+	}
 	if (IS_LEAF(mp)) {
 		mdb_cassert(mc, key && data);
 		if (F_ISSET(flags, F_BIGDATA)) {
@@ -8976,7 +9295,7 @@ update:
 
 	/* Write the node data. */
 	node = NODEPTR(mp, indx);
-	node->mn_ksize = (key == NULL) ? 0 : key->mv_size;
+	node->mn_ksize = (key == NULL) ? 0 : key_bytes;
 	node->mn_flags = flags;
 	if (IS_LEAF(mp))
 		SETDSZ(node,data->mv_size);
@@ -8984,8 +9303,15 @@ update:
 		SETPGNO(node,pgno);
 
 	mdb_node_set_count(mp, node, 0);
-	if (key)
-		memcpy(NODEKEY(mp, node), key->mv_data, key->mv_size);
+	if (key) {
+		if (IS_LEAF(mp)) {
+			size_t wrote = mdb_leaf_encode_key(prefix_enabled ? &trunk : NULL,
+			    key, NODEKEY(mp, node), NULL);
+			mdb_cassert(mc, wrote == key_bytes);
+		} else {
+			memcpy(NODEKEY(mp, node), key->mv_data, key->mv_size);
+		}
+	}
 
 	if (IS_LEAF(mp)) {
 		ndata = NODEDATA(node);
@@ -9003,6 +9329,20 @@ update:
 				data->mv_data = ndata;
 			else
 				memcpy(ndata, data->mv_data, data->mv_size);
+		}
+	}
+	if (prefix_enabled && need_reencode) {
+		indx_t total = NUMKEYS(mp);
+		MDB_val decoded = {0, mc->mc_keybuf};
+		for (indx_t i = 1; i < total; ++i) {
+			MDB_node *cur = NODEPTR(mp, i);
+			int rc = mdb_leaf_decode_key(&old_trunk, NODEKEY(mp, cur),
+			    cur->mn_ksize, &decoded, mc->mc_keybuf, MDB_KEYBUF_MAX, 0);
+			if (rc != MDB_SUCCESS)
+				return rc;
+			rc = mdb_leaf_write_key(mc, mp, i, &decoded);
+			if (rc != MDB_SUCCESS)
+				return rc;
 		}
 	}
 
@@ -9043,11 +9383,23 @@ mdb_node_del(MDB_cursor *mc, int ksize)
 	indx_t		 i, j, numkeys, ptr;
 	MDB_node	*node;
 	char		*base;
+	unsigned char old_trunk_buf[MDB_KEYBUF_MAX];
+	MDB_val old_trunk = {0, NULL};
+	int removing_trunk = 0;
+	int prefix_enabled = (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) != 0;
 
 	DPRINTF(("delete node %u on %s page %"Yu, indx,
 	    IS_LEAF(mp) ? "leaf" : "branch", mdb_dbg_pgno(mp)));
 	numkeys = NUMKEYS(mp);
 	mdb_cassert(mc, indx < numkeys);
+	if (prefix_enabled && IS_LEAF(mp) && !IS_LEAF2(mp) && indx == 0 && numkeys > 0) {
+		MDB_node *first = NODEPTR(mp, 0);
+		mdb_cassert(mc, first->mn_ksize <= MDB_KEYBUF_MAX);
+		old_trunk.mv_size = first->mn_ksize;
+		old_trunk.mv_data = old_trunk_buf;
+		memcpy(old_trunk_buf, NODEKEY(mp, first), old_trunk.mv_size);
+		removing_trunk = 1;
+	}
 
 	if (IS_LEAF2(mp)) {
 		int x = numkeys - 1 - indx;
@@ -9086,6 +9438,39 @@ mdb_node_del(MDB_cursor *mc, int ksize)
 
 	MP_LOWER(mp) -= sizeof(indx_t);
 	MP_UPPER(mp) += sz;
+	if (prefix_enabled && removing_trunk) {
+		indx_t total = NUMKEYS(mp);
+		if (total > 0) {
+			MDB_val decoded = {0, mc->mc_keybuf};
+			int rc;
+			MDB_node *new_trunk = NODEPTR(mp, 0);
+			rc = mdb_leaf_decode_key(&old_trunk, NODEKEY(mp, new_trunk),
+			    new_trunk->mn_ksize, &decoded, mc->mc_keybuf, MDB_KEYBUF_MAX, 0);
+			if (rc != MDB_SUCCESS) {
+				mc->mc_txn->mt_flags |= MDB_TXN_ERROR;
+				return;
+			}
+			rc = mdb_leaf_write_key(mc, mp, 0, &decoded);
+			if (rc != MDB_SUCCESS) {
+				mc->mc_txn->mt_flags |= MDB_TXN_ERROR;
+				return;
+			}
+			for (indx_t i = 1; i < total; ++i) {
+				MDB_node *cur = NODEPTR(mp, i);
+				rc = mdb_leaf_decode_key(&old_trunk, NODEKEY(mp, cur),
+				    cur->mn_ksize, &decoded, mc->mc_keybuf, MDB_KEYBUF_MAX, 0);
+				if (rc != MDB_SUCCESS) {
+					mc->mc_txn->mt_flags |= MDB_TXN_ERROR;
+					return;
+				}
+				rc = mdb_leaf_write_key(mc, mp, i, &decoded);
+				if (rc != MDB_SUCCESS) {
+					mc->mc_txn->mt_flags |= MDB_TXN_ERROR;
+					return;
+				}
+			}
+		}
+	}
 }
 
 /** Compact the main page after deleting a node on a subpage.
@@ -9207,6 +9592,8 @@ mdb_xcursor_init1(MDB_cursor *mc, MDB_node *node)
 		if (mc->mc_db->md_flags & MDB_COUNTED)
 			mx->mx_db.md_flags |= MDB_COUNTED;
 	}
+	if (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION)
+		mx->mx_db.md_flags |= MDB_PREFIX_COMPRESSION;
 	DPRINTF(("Sub-db -%u root page %"Yu, mx->mx_cursor.mc_dbi,
 		mx->mx_db.md_root));
 	mx->mx_dbflag = DB_VALID|DB_USRVALID|DB_DUPDATA;
@@ -9263,6 +9650,8 @@ mdb_cursor_init(MDB_cursor *mc, MDB_txn *txn, MDB_dbi dbi, MDB_xcursor *mx)
 	mc->mc_ki[0] = 0;
 	MC_SET_OVPG(mc, NULL);
 	mc->mc_flags = txn->mt_flags & (C_ORIG_RDONLY|C_WRITEMAP);
+	mc->mc_key.mv_data = mc->mc_keybuf;
+	mc->mc_key.mv_size = 0;
 	if (txn->mt_dbs[dbi].md_flags & MDB_DUPSORT) {
 		mdb_tassert(txn, mx != NULL);
 		mc->mc_xcursor = mx;
@@ -9551,14 +9940,30 @@ mdb_node_move(MDB_cursor *csrc, MDB_cursor *cdst, int fromleft)
 				key.mv_data = LEAF2KEY(csrc->mc_pg[csrc->mc_top], 0, key.mv_size);
 			} else {
 				s2 = NODEPTR(csrc->mc_pg[csrc->mc_top], 0);
-				key.mv_size = NODEKSZ(s2);
-				key.mv_data = NODEKEY(csrc->mc_pg[csrc->mc_top], s2);
+				if ((csrc->mc_db->md_flags & MDB_PREFIX_COMPRESSION)) {
+					rc = mdb_cursor_read_key_at(csrc, csrc->mc_pg[csrc->mc_top], 0, &key);
+					if (rc != MDB_SUCCESS)
+						return rc;
+				} else {
+					key.mv_size = NODEKSZ(s2);
+					key.mv_data = NODEKEY(csrc->mc_pg[csrc->mc_top], s2);
+				}
 			}
 			csrc->mc_snum = snum--;
 			csrc->mc_top = snum;
 		} else {
 			key.mv_size = NODEKSZ(srcnode);
 			key.mv_data = NODEKEY(csrc->mc_pg[csrc->mc_top], srcnode);
+		}
+	if ((csrc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) && IS_LEAF(psrc) && !IS_LEAF2(psrc)) {
+		MDB_node *tr = NODEPTR(psrc, 0);
+		MDB_val trunk = { tr->mn_ksize, NODEKEY(psrc, tr) };
+		MDB_val decoded = {0, csrc->mc_keybuf};
+		rc = mdb_leaf_decode_key(&trunk, key.mv_data, key.mv_size,
+		    &decoded, csrc->mc_keybuf, MDB_KEYBUF_MAX, 0);
+			if (rc != MDB_SUCCESS)
+				return rc;
+			key = decoded;
 		}
 		data.mv_size = NODEDSZ(srcnode);
 		data.mv_data = NODEDATA(srcnode);
@@ -9578,8 +9983,14 @@ mdb_node_move(MDB_cursor *csrc, MDB_cursor *cdst, int fromleft)
 			bkey.mv_data = LEAF2KEY(mn.mc_pg[mn.mc_top], 0, bkey.mv_size);
 		} else {
 			s2 = NODEPTR(mn.mc_pg[mn.mc_top], 0);
-			bkey.mv_size = NODEKSZ(s2);
-			bkey.mv_data = NODEKEY(mn.mc_pg[mn.mc_top], s2);
+			if (mn.mc_db->md_flags & MDB_PREFIX_COMPRESSION) {
+				rc = mdb_cursor_read_key_at(&mn, mn.mc_pg[mn.mc_top], 0, &bkey);
+				if (rc != MDB_SUCCESS)
+					return rc;
+			} else {
+				bkey.mv_size = NODEKSZ(s2);
+				bkey.mv_data = NODEKEY(mn.mc_pg[mn.mc_top], s2);
+			}
 		}
 		mn.mc_snum = snum--;
 		mn.mc_top = snum;
@@ -9677,8 +10088,14 @@ mdb_node_move(MDB_cursor *csrc, MDB_cursor *cdst, int fromleft)
 				key.mv_data = LEAF2KEY(csrc->mc_pg[csrc->mc_top], 0, key.mv_size);
 			} else {
 				srcnode = NODEPTR(csrc->mc_pg[csrc->mc_top], 0);
-				key.mv_size = NODEKSZ(srcnode);
-				key.mv_data = NODEKEY(csrc->mc_pg[csrc->mc_top], srcnode);
+				if (csrc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) {
+					rc = mdb_cursor_read_key_at(csrc, csrc->mc_pg[csrc->mc_top], 0, &key);
+					if (rc != MDB_SUCCESS)
+						return rc;
+				} else {
+					key.mv_size = NODEKSZ(srcnode);
+					key.mv_data = NODEKEY(csrc->mc_pg[csrc->mc_top], srcnode);
+				}
 			}
 			DPRINTF(("update separator for source page %"Yu" to [%s]",
 				csrc->mc_pg[csrc->mc_top]->mp_pgno, DKEY(&key)));
@@ -9707,9 +10124,15 @@ mdb_node_move(MDB_cursor *csrc, MDB_cursor *cdst, int fromleft)
 			if (IS_LEAF2(csrc->mc_pg[csrc->mc_top])) {
 				key.mv_data = LEAF2KEY(cdst->mc_pg[cdst->mc_top], 0, key.mv_size);
 			} else {
-			srcnode = NODEPTR(cdst->mc_pg[cdst->mc_top], 0);
-			key.mv_size = NODEKSZ(srcnode);
-			key.mv_data = NODEKEY(cdst->mc_pg[cdst->mc_top], srcnode);
+				srcnode = NODEPTR(cdst->mc_pg[cdst->mc_top], 0);
+				if (cdst->mc_db->md_flags & MDB_PREFIX_COMPRESSION) {
+					rc = mdb_cursor_read_key_at(cdst, cdst->mc_pg[cdst->mc_top], 0, &key);
+					if (rc != MDB_SUCCESS)
+						return rc;
+				} else {
+					key.mv_size = NODEKSZ(srcnode);
+					key.mv_data = NODEKEY(cdst->mc_pg[cdst->mc_top], srcnode);
+				}
 			}
 			DPRINTF(("update separator for destination page %"Yu" to [%s]",
 				cdst->mc_pg[cdst->mc_top]->mp_pgno, DKEY(&key)));
@@ -9837,12 +10260,24 @@ mdb_page_merge(MDB_cursor *csrc, MDB_cursor *cdst)
 					key.mv_data = LEAF2KEY(mn.mc_pg[mn.mc_top], 0, key.mv_size);
 				} else {
 					s2 = NODEPTR(mn.mc_pg[mn.mc_top], 0);
-					key.mv_size = NODEKSZ(s2);
-					key.mv_data = NODEKEY(mn.mc_pg[mn.mc_top], s2);
+				if (mn.mc_db->md_flags & MDB_PREFIX_COMPRESSION) {
+					rc = mdb_cursor_read_key_at(&mn, mn.mc_pg[mn.mc_top], 0, &key);
+					if (rc != MDB_SUCCESS)
+						return rc;
+					} else {
+						key.mv_size = NODEKSZ(s2);
+						key.mv_data = NODEKEY(mn.mc_pg[mn.mc_top], s2);
+					}
 				}
 			} else {
-				key.mv_size = srcnode->mn_ksize;
-				key.mv_data = NODEKEY(psrc, srcnode);
+				if (IS_LEAF(psrc) && (csrc->mc_db->md_flags & MDB_PREFIX_COMPRESSION)) {
+					rc = mdb_cursor_read_key_at(csrc, psrc, i, &key);
+					if (rc != MDB_SUCCESS)
+						return rc;
+				} else {
+					key.mv_size = srcnode->mn_ksize;
+					key.mv_data = NODEKEY(psrc, srcnode);
+				}
 			}
 
 			data.mv_size = NODEDSZ(srcnode);
@@ -9969,6 +10404,12 @@ mdb_cursor_copy(const MDB_cursor *csrc, MDB_cursor *cdst)
 	cdst->mc_snum = csrc->mc_snum;
 	cdst->mc_top = csrc->mc_top;
 	cdst->mc_flags = csrc->mc_flags;
+	cdst->mc_key.mv_data = cdst->mc_keybuf;
+	cdst->mc_key.mv_size = 0;
+	if (csrc->mc_key.mv_size && csrc->mc_key.mv_size <= MDB_KEYBUF_MAX) {
+		memcpy(cdst->mc_keybuf, csrc->mc_keybuf, csrc->mc_key.mv_size);
+		cdst->mc_key.mv_size = csrc->mc_key.mv_size;
+	}
 	MC_SET_OVPG(cdst, MC_OVPG(csrc));
 
 	for (i=0; i<csrc->mc_snum; i++) {
@@ -10532,9 +10973,10 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 			/* Threshold number of keys considered "small" */
 			keythresh = env->me_psize >> 7;
 
-			if (IS_LEAF(mp))
-				nsize = mdb_leaf_size(env, newkey, newdata);
-			else
+			if (IS_LEAF(mp)) {
+				int prefix_enabled = (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) != 0;
+				nsize = mdb_leaf_size(env, mp, newindx, newkey, newdata, prefix_enabled);
+			} else
 				nsize = mdb_branch_size(env, mp, newkey);
 			nsize = EVEN(nsize);
 
@@ -10603,14 +11045,33 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 					}
 				}
 			}
-			if (split_indx == newindx) {
-				sepkey.mv_size = newkey->mv_size;
-				sepkey.mv_data = newkey->mv_data;
+		if (split_indx == newindx) {
+			sepkey.mv_size = newkey->mv_size;
+			sepkey.mv_data = newkey->mv_data;
+		} else {
+			node = (MDB_node *)((char *)mp + copy->mp_ptrs[split_indx] + PAGEBASE);
+			if (IS_LEAF(mp) && (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION)) {
+				if (split_indx == 0) {
+					if (node->mn_ksize > MDB_KEYBUF_MAX)
+						return MDB_BAD_VALSIZE;
+					memcpy(mc->mc_keybuf, NODEKEY(mp, node), node->mn_ksize);
+					mc->mc_key.mv_size = node->mn_ksize;
+					mc->mc_key.mv_data = mc->mc_keybuf;
+					sepkey = mc->mc_key;
+				} else {
+					MDB_node *trunk = NODEPTR(mp, 0);
+					MDB_val trunkv = { trunk->mn_ksize, NODEKEY(mp, trunk) };
+					int rc2 = mdb_leaf_decode_key(&trunkv, NODEKEY(mp, node), node->mn_ksize,
+					    &mc->mc_key, mc->mc_keybuf, MDB_KEYBUF_MAX, 0);
+					if (rc2 != MDB_SUCCESS)
+						return rc2;
+					sepkey = mc->mc_key;
+				}
 			} else {
-				node = (MDB_node *)((char *)mp + copy->mp_ptrs[split_indx] + PAGEBASE);
 				sepkey.mv_size = node->mn_ksize;
 				sepkey.mv_data = NODEKEY(mp, node);
 			}
+		}
 		}
 	}
 
@@ -10702,8 +11163,31 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 				mc->mc_ki[mc->mc_top] = j;
 			} else {
 				node = (MDB_node *)((char *)mp + copy->mp_ptrs[i] + PAGEBASE);
-				rkey.mv_data = NODEKEY(mp, node);
-				rkey.mv_size = node->mn_ksize;
+				if (IS_LEAF(mp) && (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION)) {
+					if (i == 0) {
+						if (node->mn_ksize > MDB_KEYBUF_MAX) {
+							rc = MDB_BAD_VALSIZE;
+							goto done;
+						}
+						memcpy(mc->mc_keybuf, NODEKEY(mp, node), node->mn_ksize);
+						mc->mc_key.mv_size = node->mn_ksize;
+						mc->mc_key.mv_data = mc->mc_keybuf;
+						rkey = mc->mc_key;
+					} else {
+						MDB_node *trunk = NODEPTR(mp, 0);
+						MDB_val trunkv = { trunk->mn_ksize, NODEKEY(mp, trunk) };
+						int rc2 = mdb_leaf_decode_key(&trunkv, NODEKEY(mp, node), node->mn_ksize,
+						    &mc->mc_key, mc->mc_keybuf, MDB_KEYBUF_MAX, 0);
+						if (rc2 != MDB_SUCCESS) {
+							rc = rc2;
+							goto done;
+						}
+						rkey = mc->mc_key;
+					}
+				} else {
+					rkey.mv_data = NODEKEY(mp, node);
+					rkey.mv_size = node->mn_ksize;
+				}
 				if (IS_LEAF(mp)) {
 					xdata.mv_data = NODEDATA(node);
 					xdata.mv_size = NODEDSZ(node);

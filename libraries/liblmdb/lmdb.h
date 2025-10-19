@@ -355,6 +355,8 @@ typedef void (MDB_rel_func)(MDB_val *item, void *oldptr, void *newptr, void *rel
 #define MDB_REVERSEDUP	0x40
 	/** enable counted branch nodes for fast range counts */
 #define MDB_COUNTED	0x80
+	/** enable prefix compression for leaf keys */
+#define MDB_PREFIX_COMPRESSION	0x100
 	/** create DB if not already existing */
 #define MDB_CREATE		0x40000
 /** @} */
