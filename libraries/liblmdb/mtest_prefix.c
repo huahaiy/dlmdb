@@ -44,6 +44,17 @@ static size_t pf_entry_count;
 static uint64_t pf_rng_state = UINT64_C(0x9e3779b97f4a7c15);
 static uint64_t pf_key_nonce;
 static size_t pf_op_index;
+static int pf_trace_ops_enabled = -1;
+
+static int
+pf_trace_ops(void)
+{
+	if (pf_trace_ops_enabled < 0) {
+		const char *env = getenv("PF_TRACE_OPS");
+		pf_trace_ops_enabled = (env && env[0] != '\0');
+	}
+	return pf_trace_ops_enabled;
+}
 
 static void test_prefix_leaf_splits(void);
 static void test_prefix_alternating_prefixes(void);
@@ -1007,8 +1018,9 @@ pf_do_insert(MDB_env *env, MDB_dbi dbi)
 	unsigned char valbuf[PF_VALUE_MAX_LEN];
 	size_t key_len = pf_make_key(keybuf, sizeof(keybuf));
 	size_t val_len = pf_make_value(valbuf, sizeof(valbuf));
-	fprintf(stderr, "op%zu: insert %.*s len=%zu\n",
-	    pf_op_index, (int)key_len, keybuf, val_len);
+	if (pf_trace_ops())
+		fprintf(stderr, "op%zu: insert %.*s len=%zu\n",
+		    pf_op_index, (int)key_len, keybuf, val_len);
 
 	MDB_val key = { key_len, keybuf };
 	MDB_val val = { val_len, valbuf };
@@ -1034,8 +1046,9 @@ pf_do_delete(MDB_env *env, MDB_dbi dbi)
 	size_t idx = (size_t)(pf_rng_next() % pf_entry_count);
 	PFEntry *entry = &pf_entries[idx];
 	MDB_val key = { entry->key_len, entry->key };
-	fprintf(stderr, "op%zu: delete %.*s\n",
-	    pf_op_index, (int)entry->key_len, entry->key);
+	if (pf_trace_ops())
+		fprintf(stderr, "op%zu: delete %.*s\n",
+		    pf_op_index, (int)entry->key_len, entry->key);
 
 	MDB_txn *txn = NULL;
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
@@ -1074,7 +1087,7 @@ test_prefix_fuzz(void)
 	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
 	CHECK_CALL(mdb_txn_commit(txn));
 
-	const size_t operations = 400;
+	const size_t operations = 10000;
 	for (size_t op = 0; op < operations; ++op) {
 		pf_op_index = op;
 		int do_insert = (pf_entry_count < PF_MAX_ENTRIES) &&

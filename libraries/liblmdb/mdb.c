@@ -1347,10 +1347,18 @@ mdb_leaf_decode_key(const MDB_val *trunk, const unsigned char *encoded,
 	int rc = mdb_varint_decode(encoded, encoded_len, &shared, &used);
 	if (rc != MDB_SUCCESS)
 		return rc;
-	if (shared > trunk->mv_size)
-		return MDB_CORRUPTED;
-	if (used > encoded_len)
-		return MDB_CORRUPTED;
+	if (shared > trunk->mv_size || used > encoded_len) {
+		if (!allow_trunk_alias) {
+			if (encoded_len > buf_size)
+				return MDB_BAD_VALSIZE;
+			memcpy(buf, encoded, encoded_len);
+			out->mv_data = buf;
+		} else {
+			out->mv_data = (void *)encoded;
+		}
+		out->mv_size = encoded_len;
+		return MDB_SUCCESS;
+	}
 
 	size_t suffix_len = encoded_len - used;
 	size_t full_len = (size_t)shared + suffix_len;

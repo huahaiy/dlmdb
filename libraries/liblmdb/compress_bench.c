@@ -98,6 +98,7 @@ static void fill_value(uint64_t index, size_t len, char *buf);
 static double elapsed_ms(const struct timespec *start,
     const struct timespec *end);
 static size_t *generate_access_pattern(const bench_config *cfg);
+static size_t *generate_permutation(size_t count, uint64_t seed);
 static void add_variant_spec(bench_config *cfg, const char *arg);
 static unsigned int bench_variant_db_flags(const bench_variant *variant);
 static MDB_env *bench_open_env(const bench_config *cfg,
@@ -129,6 +130,8 @@ static double safe_ratio(double baseline, double test);
 static void print_metrics(const bench_variant *variant);
 static void print_comparison(const bench_variant *baseline,
     const bench_variant *test);
+
+static const char *g_current_variant = NULL;
 
 int
 main(int argc, char **argv)
@@ -381,6 +384,27 @@ generate_access_pattern(const bench_config *cfg)
 	return order;
 }
 
+static size_t *
+generate_permutation(size_t count, uint64_t seed)
+{
+	size_t *order = malloc(count * sizeof(size_t));
+	if (!order)
+		return NULL;
+	for (size_t i = 0; i < count; ++i)
+		order[i] = i;
+	if (count <= 1)
+		return order;
+
+	uint64_t state = seed ? seed : 1;
+	for (size_t i = count - 1; i > 0; --i) {
+		size_t j = (size_t)(prng_next(&state) % (i + 1));
+		size_t tmp = order[i];
+		order[i] = order[j];
+		order[j] = tmp;
+	}
+	return order;
+}
+
 static void
 add_variant_spec(bench_config *cfg, const char *arg)
 {
@@ -486,6 +510,9 @@ static void
 run_bench_variant(const bench_config *cfg, bench_variant *variant,
     const size_t *read_order)
 {
+	const char *prev = g_current_variant;
+	g_current_variant = variant->label;
+
 	prepare_dir(variant->dir);
 
 	memset(&variant->metrics, 0, sizeof(variant->metrics));
@@ -525,6 +552,8 @@ run_bench_variant(const bench_config *cfg, bench_variant *variant,
 		bench_do_repack(cfg, variant, env, &variant->metrics);
 	mdb_dbi_close(env, dbi);
 	mdb_env_close(env);
+
+	g_current_variant = prev;
 }
 
 static void
@@ -547,18 +576,33 @@ bench_do_inserts(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
 	struct timespec start, end;
 	clock_gettime(CLOCK_MONOTONIC, &start);
 
-	for (size_t i = 0; i < cfg->entries; ++i) {
-		size_t klen = format_key(i, cfg->prefix_len, keybuf, key_buflen);
+	size_t *order = generate_permutation(cfg->entries,
+	    cfg->seed ^ UINT64_C(0xC6BC279692B5CC83));
+	if (!order) {
+		fprintf(stderr, "bench_do_inserts: permutation allocation failure\n");
+		exit(EXIT_FAILURE);
+	}
+	for (size_t pos = 0; pos < cfg->entries; ++pos) {
+		size_t idx = order[pos];
+		size_t klen = format_key(idx, cfg->prefix_len, keybuf, key_buflen);
 		if (cfg->value_size)
-			fill_value(i, cfg->value_size, valbuf);
+			fill_value(idx, cfg->value_size, valbuf);
 		MDB_val key = {.mv_size = klen, .mv_data = keybuf};
 		MDB_val val = {.mv_size = cfg->value_size, .mv_data = valbuf};
-		CHECK_RC(mdb_put(txn, dbi, &key, &val, 0), "mdb_put");
+		int rc = mdb_put(txn, dbi, &key, &val, 0);
+		if (rc != MDB_SUCCESS) {
+			fprintf(stderr,
+			    "[%s] mdb_put failed during insert at pos=%zu idx=%zu rc=%s\n",
+			    g_current_variant ? g_current_variant : "?",
+			    pos, idx, mdb_strerror(rc));
+			exit(EXIT_FAILURE);
+		}
 	}
 
 	clock_gettime(CLOCK_MONOTONIC, &end);
 	CHECK_RC(mdb_txn_commit(txn), "mdb_txn_commit(write)");
 
+	free(order);
 	if (cfg->value_size)
 		free(valbuf);
 	free(keybuf);
@@ -655,8 +699,17 @@ bench_do_deletes(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
 	struct timespec start, end;
 	clock_gettime(CLOCK_MONOTONIC, &start);
 
+	size_t *order = generate_permutation(cfg->entries,
+	    cfg->seed ^ UINT64_C(0x9E3779B97F4A7C15));
+	if (!order) {
+		fprintf(stderr, "bench_do_deletes: permutation allocation failure\n");
+		free(indices);
+		free(keybuf);
+		exit(EXIT_FAILURE);
+	}
+
 	for (size_t i = 0; i < actual; ++i) {
-		size_t idx = cfg->entries - 1 - i;
+		size_t idx = order[i];
 		indices[i] = idx;
 		size_t klen = format_key(idx, cfg->prefix_len, keybuf, key_buflen);
 		MDB_val key = {.mv_size = klen, .mv_data = keybuf};
@@ -673,6 +726,7 @@ bench_do_deletes(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
 	clock_gettime(CLOCK_MONOTONIC, &end);
 	CHECK_RC(mdb_txn_commit(txn), "mdb_txn_commit(delete)");
 
+	free(order);
 	free(keybuf);
 
 	bench_record_timing(&m->deletes, actual, &start, &end);
