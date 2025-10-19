@@ -1344,9 +1344,17 @@ mdb_leaf_decode_key(const MDB_val *trunk, const unsigned char *encoded,
 
 	size_t used = 0;
 	uint64_t shared = 0;
-	int rc = mdb_varint_decode(encoded, encoded_len, &shared, &used);
-	if (rc != MDB_SUCCESS)
-		return rc;
+	if (encoded_len == 0)
+		return MDB_CORRUPTED;
+	unsigned char first = encoded[0];
+	if ((first & 0x80) == 0) {
+		shared = first;
+		used = 1;
+	} else {
+		int rc = mdb_varint_decode(encoded, encoded_len, &shared, &used);
+		if (rc != MDB_SUCCESS)
+			return rc;
+	}
 	if (shared > trunk->mv_size || used > encoded_len) {
 		if (!allow_trunk_alias) {
 			if (encoded_len > buf_size)
