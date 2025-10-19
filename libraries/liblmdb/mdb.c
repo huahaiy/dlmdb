@@ -1449,6 +1449,17 @@ typedef struct MDB_dbx {
 	void		*md_relctx;		/**< user-provided context for md_rel */
 } MDB_dbx;
 
+struct MDB_prefix_rebuild_entry;
+
+typedef struct MDB_prefix_scratch {
+	void		*snapshot;		/**< cached page copy for prefix rebuild */
+	size_t		snapshot_size;	/**< allocated bytes for snapshot */
+	struct MDB_prefix_rebuild_entry *entries; /**< cached entry descriptors */
+	unsigned int	entries_cap;	/**< number of cached entry slots */
+	unsigned char	*keybuf;	/**< contiguous decoded key storage */
+	size_t		keybuf_size;	/**< allocated bytes for decoded keys */
+} MDB_prefix_scratch;
+
 	/** A database transaction.
 	 *	Every operation requires a transaction handle.
 	 */
@@ -1507,6 +1518,7 @@ struct MDB_txn {
 	MDB_cursor	**mt_cursors;
 	/** Array of flags for each DB */
 	unsigned char	*mt_dbflags;
+	MDB_prefix_scratch mt_prefix;	/**< scratch buffers for prefix compression maintenance */
 #ifdef MDB_VL32
 	/** List of read-only pages (actually chunks) */
 	MDB_ID3L	mt_rpages;
@@ -1864,6 +1876,87 @@ typedef struct MDB_prefix_rebuild_entry {
 	unsigned short flags;
 } MDB_prefix_rebuild_entry;
 
+static int
+mdb_prefix_ensure_snapshot(MDB_txn *txn, size_t size, MDB_page **out)
+{
+	MDB_prefix_scratch *scratch = &txn->mt_prefix;
+
+	if (scratch->snapshot_size < size) {
+		void *ptr = realloc(scratch->snapshot, size);
+		if (!ptr)
+			return ENOMEM;
+		scratch->snapshot = ptr;
+		scratch->snapshot_size = size;
+	}
+	if (out)
+		*out = (MDB_page *)scratch->snapshot;
+	return MDB_SUCCESS;
+}
+
+static int
+mdb_prefix_ensure_entries(MDB_txn *txn, unsigned int count, MDB_prefix_rebuild_entry **out)
+{
+	MDB_prefix_scratch *scratch = &txn->mt_prefix;
+
+	if (count == 0) {
+		if (out)
+			*out = NULL;
+		return MDB_SUCCESS;
+	}
+	if (scratch->entries_cap < count) {
+		MDB_prefix_rebuild_entry *ptr = realloc(scratch->entries,
+		    sizeof(MDB_prefix_rebuild_entry) * count);
+		if (!ptr)
+			return ENOMEM;
+		scratch->entries = ptr;
+		scratch->entries_cap = count;
+	}
+	if (out)
+		*out = scratch->entries;
+	return MDB_SUCCESS;
+}
+
+static int
+mdb_prefix_ensure_keybuf(MDB_txn *txn, size_t size, unsigned char **out)
+{
+	MDB_prefix_scratch *scratch = &txn->mt_prefix;
+
+	if (size == 0)
+		size = 1;
+	if (scratch->keybuf_size < size) {
+		unsigned char *ptr = realloc(scratch->keybuf, size);
+		if (!ptr)
+			return ENOMEM;
+		scratch->keybuf = ptr;
+		scratch->keybuf_size = size;
+	}
+	if (out)
+		*out = scratch->keybuf;
+	return MDB_SUCCESS;
+}
+
+static void
+mdb_prefix_scratch_clear(MDB_prefix_scratch *scratch)
+{
+	if (!scratch)
+		return;
+	if (scratch->snapshot) {
+		free(scratch->snapshot);
+		scratch->snapshot = NULL;
+	}
+	if (scratch->entries) {
+		free(scratch->entries);
+		scratch->entries = NULL;
+	}
+	if (scratch->keybuf) {
+		free(scratch->keybuf);
+		scratch->keybuf = NULL;
+	}
+	scratch->snapshot_size = 0;
+	scratch->entries_cap = 0;
+	scratch->keybuf_size = 0;
+}
+
 static int mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp, const MDB_val *old_trunk);
 static int mdb_leaf_rebuild_apply(MDB_cursor *mc, MDB_page *mp, MDB_prefix_rebuild_entry *entries, unsigned int count);
 
@@ -1872,12 +1965,15 @@ mdb_leaf_rebuild_after_trunk_delete(MDB_cursor *mc, MDB_page *mp, indx_t removed
     const MDB_val *old_trunk)
 {
 	MDB_env *env = mc->mc_txn->mt_env;
+	MDB_txn *txn = mc->mc_txn;
 	unsigned int total = NUMKEYS(mp);
 	unsigned int remain;
-	MDB_page *snapshot = NULL;
+	MDB_page *snapshot;
 	MDB_prefix_rebuild_entry *entries = NULL;
-	unsigned char *key_storage = NULL;
+	unsigned char *key_storage;
 	unsigned char *key_cursor;
+	unsigned char keybuf[MDB_KEYBUF_MAX];
+	MDB_val decoded = {0, keybuf};
 	unsigned int out, i;
 	size_t total_key_bytes = 0;
 	int rc = MDB_SUCCESS;
@@ -1887,99 +1983,79 @@ mdb_leaf_rebuild_after_trunk_delete(MDB_cursor *mc, MDB_page *mp, indx_t removed
 
 	remain = total - 1;
 
-	snapshot = malloc(env->me_psize);
-	if (!snapshot) {
-		rc = ENOMEM;
-		goto done;
-	}
+	rc = mdb_prefix_ensure_snapshot(txn, env->me_psize, &snapshot);
+	if (rc != MDB_SUCCESS)
+		return rc;
 	memcpy(snapshot, mp, env->me_psize);
 
-	if (remain) {
-		entries = malloc(sizeof(MDB_prefix_rebuild_entry) * remain);
-		if (!entries) {
-			rc = ENOMEM;
-			goto done;
-		}
+	if (remain == 0)
+		return mdb_leaf_rebuild_apply(mc, mp, NULL, 0);
+
+	rc = mdb_prefix_ensure_entries(txn, remain, &entries);
+	if (rc != MDB_SUCCESS)
+		return rc;
+
+	out = 0;
+	for (i = 0; i < total; ++i) {
+		MDB_node *src;
+		if (i == removed)
+			continue;
+		src = NODEPTR(snapshot, i);
+		entries[out].flags = src->mn_flags;
+		entries[out].data_size = NODEDSZ(src);
+		if (F_ISSET(src->mn_flags, F_BIGDATA))
+			entries[out].data_payload = sizeof(pgno_t);
+		else
+			entries[out].data_payload = entries[out].data_size;
+		entries[out].data_ptr = NODEDATA(src);
+
+		rc = mdb_leaf_decode_key(old_trunk, NODEKEY(snapshot, src),
+		    src->mn_ksize, &decoded, keybuf, MDB_KEYBUF_MAX, 0);
+		if (rc != MDB_SUCCESS)
+			return rc;
+		entries[out].key.mv_size = decoded.mv_size;
+		total_key_bytes += decoded.mv_size;
+		++out;
 	}
 
-	{
-		unsigned char keybuf[MDB_KEYBUF_MAX];
-		MDB_val decoded = {0, keybuf};
-		out = 0;
-		for (i = 0; i < total; ++i) {
-			MDB_node *src;
-			if (i == removed)
-				continue;
-			src = NODEPTR(snapshot, i);
-			entries[out].flags = src->mn_flags;
-			entries[out].data_size = NODEDSZ(src);
-			if (F_ISSET(src->mn_flags, F_BIGDATA))
-				entries[out].data_payload = sizeof(pgno_t);
-			else
-				entries[out].data_payload = entries[out].data_size;
-			entries[out].data_ptr = NODEDATA(src);
-
-			rc = mdb_leaf_decode_key(old_trunk, NODEKEY(snapshot, src),
-			    src->mn_ksize, &decoded, keybuf, MDB_KEYBUF_MAX, 0);
-			if (rc != MDB_SUCCESS)
-				goto done;
-			entries[out].key.mv_size = decoded.mv_size;
-			total_key_bytes += decoded.mv_size;
-			++out;
-		}
-	}
-
-	if (remain) {
-		size_t alloc_bytes = total_key_bytes ? total_key_bytes : 1;
-		key_storage = malloc(alloc_bytes);
-		if (!key_storage) {
-			rc = ENOMEM;
-			goto done;
-		}
-	}
+	rc = mdb_prefix_ensure_keybuf(txn, total_key_bytes, &key_storage);
+	if (rc != MDB_SUCCESS)
+		return rc;
 
 	key_cursor = key_storage;
-	if (remain) {
-		out = 0;
-		for (i = 0; i < total; ++i) {
-			MDB_node *src;
-			MDB_val decoded;
-			if (i == removed)
-				continue;
-			src = NODEPTR(snapshot, i);
-			decoded.mv_data = key_cursor;
-			decoded.mv_size = entries[out].key.mv_size;
-			rc = mdb_leaf_decode_key(old_trunk, NODEKEY(snapshot, src),
-			    src->mn_ksize, &decoded, key_cursor, entries[out].key.mv_size, 0);
-			if (rc != MDB_SUCCESS)
-				goto done;
-			entries[out].key.mv_data = key_cursor;
-			key_cursor += entries[out].key.mv_size;
-			++out;
-		}
+	out = 0;
+	for (i = 0; i < total; ++i) {
+		MDB_node *src;
+		MDB_val full;
+		if (i == removed)
+			continue;
+		src = NODEPTR(snapshot, i);
+		full.mv_data = key_cursor;
+		full.mv_size = entries[out].key.mv_size;
+		rc = mdb_leaf_decode_key(old_trunk, NODEKEY(snapshot, src),
+		    src->mn_ksize, &full, key_cursor, entries[out].key.mv_size, 0);
+		if (rc != MDB_SUCCESS)
+			return rc;
+		entries[out].key.mv_data = key_cursor;
+		key_cursor += entries[out].key.mv_size;
+		++out;
 	}
 
-	rc = mdb_leaf_rebuild_apply(mc, mp, entries, remain);
-
-done:
-	if (key_storage)
-		free(key_storage);
-	if (entries)
-		free(entries);
-	if (snapshot)
-		free(snapshot);
-	return rc;
+	return mdb_leaf_rebuild_apply(mc, mp, entries, remain);
 }
 
 static int
 mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp, const MDB_val *old_trunk)
 {
 	MDB_env *env = mc->mc_txn->mt_env;
+	MDB_txn *txn = mc->mc_txn;
 	unsigned int total = NUMKEYS(mp);
-	MDB_page *snapshot = NULL;
-	MDB_prefix_rebuild_entry *entries = NULL;
-	unsigned char *key_storage = NULL;
+	MDB_page *snapshot;
+	MDB_prefix_rebuild_entry *entries;
+	unsigned char *key_storage;
 	unsigned char *key_cursor;
+	unsigned char keybuf[MDB_KEYBUF_MAX];
+	MDB_val decoded = {0, keybuf};
 	size_t total_key_bytes = 0;
 	unsigned int i;
 	int rc = MDB_SUCCESS;
@@ -1987,22 +2063,15 @@ mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp, const MDB_val 
 	if (!IS_LEAF(mp) || IS_LEAF2(mp) || total == 0)
 		return MDB_SUCCESS;
 
-	snapshot = malloc(env->me_psize);
-	if (!snapshot) {
-		rc = ENOMEM;
-		goto done;
-	}
+	rc = mdb_prefix_ensure_snapshot(txn, env->me_psize, &snapshot);
+	if (rc != MDB_SUCCESS)
+		return rc;
 	memcpy(snapshot, mp, env->me_psize);
 
-	entries = malloc(sizeof(MDB_prefix_rebuild_entry) * total);
-	if (!entries) {
-		rc = ENOMEM;
-		goto done;
-	}
+	rc = mdb_prefix_ensure_entries(txn, total, &entries);
+	if (rc != MDB_SUCCESS)
+		return rc;
 
-	{
-		unsigned char keybuf[MDB_KEYBUF_MAX];
-		MDB_val decoded = {0, keybuf};
 	for (i = 0; i < total; ++i) {
 		MDB_node *src = NODEPTR(snapshot, i);
 		entries[i].flags = src->mn_flags;
@@ -2014,10 +2083,8 @@ mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp, const MDB_val 
 		entries[i].data_ptr = NODEDATA(src);
 
 		if (i == 0) {
-			if (src->mn_ksize > MDB_KEYBUF_MAX) {
-				rc = MDB_BAD_VALSIZE;
-				goto done;
-			}
+			if (src->mn_ksize > MDB_KEYBUF_MAX)
+				return MDB_BAD_VALSIZE;
 			entries[i].key.mv_size = src->mn_ksize;
 			total_key_bytes += entries[i].key.mv_size;
 		} else if (src->mn_ksize == old_trunk->mv_size &&
@@ -2028,54 +2095,38 @@ mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp, const MDB_val 
 			rc = mdb_leaf_decode_key(old_trunk, NODEKEY(snapshot, src),
 			    src->mn_ksize, &decoded, keybuf, MDB_KEYBUF_MAX, 0);
 			if (rc != MDB_SUCCESS)
-				goto done;
+				return rc;
 			entries[i].key.mv_size = decoded.mv_size;
 			total_key_bytes += decoded.mv_size;
 		}
 	}
-	}
 
-	if (total_key_bytes) {
-		key_storage = malloc(total_key_bytes ? total_key_bytes : 1);
-		if (!key_storage) {
-			rc = ENOMEM;
-			goto done;
-		}
-	}
+	rc = mdb_prefix_ensure_keybuf(txn, total_key_bytes, &key_storage);
+	if (rc != MDB_SUCCESS)
+		return rc;
 
 	key_cursor = key_storage;
 	for (i = 0; i < total; ++i) {
-	MDB_node *src = NODEPTR(snapshot, i);
-	if (i == 0) {
-		if (entries[i].key.mv_size)
-			memcpy(key_cursor, NODEKEY(snapshot, src), entries[i].key.mv_size);
-	} else {
-		if (entries[i].key.mv_size == old_trunk->mv_size &&
+		MDB_node *src = NODEPTR(snapshot, i);
+		if (i == 0) {
+			if (entries[i].key.mv_size)
+				memcpy(key_cursor, NODEKEY(snapshot, src), entries[i].key.mv_size);
+		} else if (entries[i].key.mv_size == old_trunk->mv_size &&
 		    src->mn_ksize == old_trunk->mv_size &&
 		    memcmp(NODEKEY(snapshot, src), old_trunk->mv_data, src->mn_ksize) == 0) {
 			memcpy(key_cursor, old_trunk->mv_data, old_trunk->mv_size);
 		} else {
-			MDB_val decoded = { entries[i].key.mv_size, key_cursor };
+			MDB_val full = { entries[i].key.mv_size, key_cursor };
 			rc = mdb_leaf_decode_key(old_trunk, NODEKEY(snapshot, src),
-			    src->mn_ksize, &decoded, key_cursor, entries[i].key.mv_size, 0);
+			    src->mn_ksize, &full, key_cursor, entries[i].key.mv_size, 0);
 			if (rc != MDB_SUCCESS)
-				goto done;
+				return rc;
 		}
-	}
 		entries[i].key.mv_data = key_cursor;
 		key_cursor += entries[i].key.mv_size;
 	}
 
-	rc = mdb_leaf_rebuild_apply(mc, mp, entries, total);
-
-done:
-	if (key_storage)
-		free(key_storage);
-	if (entries)
-		free(entries);
-	if (snapshot)
-		free(snapshot);
-	return rc;
+	return mdb_leaf_rebuild_apply(mc, mp, entries, total);
 }
 
 static int
@@ -4368,8 +4419,10 @@ mdb_txn_end(MDB_txn *txn, unsigned mode)
 			free(tl);
 	}
 #endif
-	if (mode & MDB_END_FREE)
+	if (mode & MDB_END_FREE) {
+		mdb_prefix_scratch_clear(&txn->mt_prefix);
 		free(txn);
+	}
 }
 
 void
@@ -6701,6 +6754,10 @@ mdb_env_close0(MDB_env *env, int excl)
 #ifdef MDB_VL32
 	if (env->me_txn0 && env->me_txn0->mt_rpages)
 		free(env->me_txn0->mt_rpages);
+#endif
+	if (env->me_txn0)
+		mdb_prefix_scratch_clear(&env->me_txn0->mt_prefix);
+#ifdef MDB_VL32
 	if (env->me_rpages) {
 		MDB_ID3L el = env->me_rpages;
 		unsigned int x;

@@ -62,6 +62,7 @@ test:	all
 	./mtest && ./mdb_stat testdb
 	rm -rf testdb_count
 	./mtest_count
+	./mtest_prefix
 
 liblmdb.a:	mdb.o midl.o
 	$(AR) rs $@ mdb.o midl.o
