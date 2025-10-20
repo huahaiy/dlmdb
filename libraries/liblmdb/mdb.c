@@ -1656,6 +1656,7 @@ struct MDB_cursor {
 #define C_UNTRACK	0x40		/**< Un-track cursor when closing */
 #define C_WRITEMAP	MDB_TXN_WRITEMAP /**< Copy of txn flag */
 #define C_LEAFCACHE	0x80		/**< Cursor supports leaf decode caching */
+#define C_SEQEXPECT	0x100		/**< Cursor expects sequential decode reuse */
 /** Read-only cursor into the txn's original snapshot in the map.
  *	Set for read-only txns, and in #mdb_page_alloc() for #FREE_DBI when
  *	#MDB_DEVEL & 2. Only implements code which is necessary for this.
@@ -1675,6 +1676,10 @@ struct MDB_cursor {
 #endif
 	MDB_val		mc_key;			/**< scratch buffer for decompressed keys */
 	unsigned char	mc_keybuf[MDB_KEYBUF_MAX];
+	pgno_t		mc_key_pgno;		/**< leaf page that mc_key currently describes */
+	indx_t		mc_key_last;		/**< index last decoded into mc_key */
+	pgno_t		mc_seq_pgno;		/**< leaf page of last user-visible key */
+	indx_t		mc_seq_idx;		/**< leaf index of last user-visible key */
 	MDB_cursor_leaf_cache mc_leaf_cache; /**< cursor-local decoded leaf cache */
 };
 
@@ -1730,16 +1735,24 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 	if (IS_LEAF(mp)) {
 		int prefix_enabled = (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) != 0;
 		MDB_prefix_scratch *scratch = &mc->mc_txn->mt_prefix;
+
 		if (!prefix_enabled || idx == 0) {
-			if (prefix_enabled && idx == 0)
+			if (prefix_enabled && idx == 0) {
 				scratch->metrics.leaf_decode_cache_hits++;
+				mc->mc_key_pgno = mp->mp_pgno;
+				mc->mc_key_last = idx;
+				mc->mc_key.mv_size = node->mn_ksize;
+				mc->mc_key.mv_data = NODEKEY(mp, node);
+			}
 			out->mv_size = node->mn_ksize;
 			out->mv_data = NODEKEY(mp, node);
 			return MDB_SUCCESS;
 		}
+
 	if (prefix_enabled && !IS_SUBP(mp) &&
 	    (mc->mc_txn->mt_flags & MDB_TXN_RDONLY) &&
-	    (mc->mc_flags & C_LEAFCACHE)) {
+	    (mc->mc_flags & C_LEAFCACHE) &&
+	    !(mc->mc_flags & C_SEQEXPECT)) {
 			int prc = mdb_cursor_leaf_cache_prepare(mc, mp);
 			if (prc != MDB_SUCCESS)
 				return prc;
@@ -1767,14 +1780,73 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 				return MDB_SUCCESS;
 			}
 		}
+
+		mc->mc_key.mv_data = mc->mc_keybuf;
+
+	if (prefix_enabled && idx > 0 && (mc->mc_flags & C_SEQEXPECT)) {
+		const unsigned char *encoded = NODEKEY(mp, node);
+		size_t encoded_len = node->mn_ksize;
+
+		if (encoded_len > 0) {
+			size_t used = 0;
+			size_t shared = 0;
+			unsigned char first = encoded[0];
+
+			if ((first & 0x80) == 0) {
+				shared = first;
+				used = 1;
+			} else {
+				uint64_t shared64 = 0;
+				int vrc = mdb_varint_decode(encoded, encoded_len,
+				    &shared64, &used);
+				if (vrc == MDB_SUCCESS)
+					shared = (size_t)shared64;
+				else
+					used = encoded_len + 1; /* force fallback */
+			}
+
+			if (used <= encoded_len) {
+				MDB_node *trunk_node = NODEPTR(mp, 0);
+				const unsigned char *trunk_key = NODEKEY(mp, trunk_node);
+				size_t trunk_len = trunk_node->mn_ksize;
+				const unsigned char *suffix = encoded + used;
+				size_t suffix_len = encoded_len - used;
+				size_t needed;
+
+				if (shared > trunk_len)
+					shared = trunk_len;
+				needed = shared + suffix_len;
+
+				if (needed <= MDB_KEYBUF_MAX) {
+					unsigned char *dst = mc->mc_keybuf;
+
+					if (shared)
+						memcpy(dst, trunk_key, shared);
+					if (suffix_len)
+						memcpy(dst + shared, suffix, suffix_len);
+
+					mc->mc_key.mv_data = dst;
+					mc->mc_key.mv_size = needed;
+					mc->mc_key_pgno = mp->mp_pgno;
+					mc->mc_key_last = idx;
+					scratch->metrics.leaf_decode_cache_hits++;
+					*out = mc->mc_key;
+					return MDB_SUCCESS;
+				}
+			}
+		}
+	}
+
 		MDB_node *trunk_node = NODEPTR(mp, 0);
 		MDB_val trunk = { trunk_node->mn_ksize, NODEKEY(mp, trunk_node) };
 		int rc = mdb_leaf_decode_key(&trunk, NODEKEY(mp, node), node->mn_ksize,
 		    &mc->mc_key, mc->mc_keybuf, MDB_KEYBUF_MAX, 0);
 		if (rc != MDB_SUCCESS)
 			return rc;
-		if (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) {
-			MDB_prefix_scratch *scratch = &mc->mc_txn->mt_prefix;
+
+		mc->mc_key_pgno = mp->mp_pgno;
+		mc->mc_key_last = idx;
+		if (prefix_enabled) {
 			const unsigned char *encoded = NODEKEY(mp, node);
 			int fast_path = (encoded[0] & 0x80) == 0;
 			scratch->metrics.leaf_decode_calls++;
@@ -3570,6 +3642,10 @@ mdb_cursor_unref(MDB_cursor *mc)
 	}
 	mc->mc_snum = mc->mc_top = 0;
 	mc->mc_pg[0] = NULL;
+	mc->mc_key_pgno = P_INVALID;
+	mc->mc_key_last = (indx_t)~0;
+	mc->mc_seq_pgno = P_INVALID;
+	mc->mc_seq_idx = (indx_t)~0;
 	mdb_cursor_leaf_cache_reset(&mc->mc_leaf_cache);
 	mc->mc_flags &= ~C_INITIALIZED;
 }
@@ -8463,9 +8539,28 @@ skip:
 	}
 
 	if (key) {
+		if (mc->mc_ki[mc->mc_top] > 0) {
+			mc->mc_flags |= C_SEQEXPECT;
+			mc->mc_seq_pgno = mp->mp_pgno;
+			mc->mc_seq_idx = mc->mc_ki[mc->mc_top] - 1;
+		} else {
+			mc->mc_flags &= ~C_SEQEXPECT;
+			mc->mc_seq_pgno = P_INVALID;
+			mc->mc_seq_idx = (indx_t)~0;
+		}
 		rc = mdb_cursor_read_key_at(mc, mp, mc->mc_ki[mc->mc_top], key);
-		if (rc != MDB_SUCCESS)
+		mc->mc_flags &= ~C_SEQEXPECT;
+		if (rc != MDB_SUCCESS) {
+			mc->mc_seq_pgno = P_INVALID;
+			mc->mc_seq_idx = (indx_t)~0;
 			return rc;
+		}
+		mc->mc_seq_pgno = mp->mp_pgno;
+		mc->mc_seq_idx = mc->mc_ki[mc->mc_top];
+	} else {
+		mc->mc_flags &= ~C_SEQEXPECT;
+		mc->mc_seq_pgno = P_INVALID;
+		mc->mc_seq_idx = (indx_t)~0;
 	}
 	return MDB_SUCCESS;
 }
@@ -8574,6 +8669,7 @@ mdb_cursor_set(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 
 	if (key->mv_size == 0)
 		return MDB_BAD_VALSIZE;
+
 
 	if (mc->mc_xcursor) {
 		MDB_CURSOR_UNREF(&mc->mc_xcursor->mx_cursor, 0);
@@ -8829,7 +8925,6 @@ mdb_cursor_last(MDB_cursor *mc, MDB_val *key, MDB_val *data)
 	int		 rc;
 	MDB_node	*leaf;
 	MDB_page	*mp;
-
 	if (mc->mc_xcursor) {
 		MDB_CURSOR_UNREF(&mc->mc_xcursor->mx_cursor, 0);
 		mc->mc_xcursor->mx_cursor.mc_flags &= ~(C_INITIALIZED|C_EOF);
@@ -10239,9 +10334,13 @@ mdb_xcursor_init0(MDB_cursor *mc)
 	mx->mx_cursor.mc_dbflag = &mx->mx_dbflag;
 	mx->mx_cursor.mc_snum = 0;
 	mx->mx_cursor.mc_top = 0;
+	mx->mx_cursor.mc_key.mv_data = mx->mx_cursor.mc_keybuf;
+	mx->mx_cursor.mc_key.mv_size = 0;
+	mx->mx_cursor.mc_key_pgno = P_INVALID;
+	mx->mx_cursor.mc_key_last = (indx_t)~0;
 	mdb_cursor_leaf_cache_reset(&mx->mx_cursor.mc_leaf_cache);
 	MC_SET_OVPG(&mx->mx_cursor, NULL);
-	mx->mx_cursor.mc_flags = C_SUB | (mc->mc_flags & (C_ORIG_RDONLY|C_WRITEMAP));
+	mx->mx_cursor.mc_flags = C_SUB | (mc->mc_flags & (C_ORIG_RDONLY|C_WRITEMAP|C_LEAFCACHE));
 	mx->mx_cursor.mc_flags |= C_LEAFCACHE;
 	mx->mx_dbx.md_name.mv_size = 0;
 	mx->mx_dbx.md_name.mv_data = NULL;
@@ -10356,6 +10455,10 @@ mdb_cursor_init(MDB_cursor *mc, MDB_txn *txn, MDB_dbi dbi, MDB_xcursor *mx)
 	mc->mc_flags = (txn->mt_flags & (C_ORIG_RDONLY|C_WRITEMAP)) | keep;
 	mc->mc_key.mv_data = mc->mc_keybuf;
 	mc->mc_key.mv_size = 0;
+	mc->mc_key_pgno = P_INVALID;
+	mc->mc_key_last = (indx_t)~0;
+	mc->mc_seq_pgno = P_INVALID;
+	mc->mc_seq_idx = (indx_t)~0;
 	mdb_cursor_leaf_cache_reset(&mc->mc_leaf_cache);
 	if (txn->mt_dbs[dbi].md_flags & MDB_DUPSORT) {
 		mdb_tassert(txn, mx != NULL);
@@ -11113,6 +11216,10 @@ mdb_cursor_copy(const MDB_cursor *csrc, MDB_cursor *cdst)
 	cdst->mc_flags = csrc->mc_flags;
 	cdst->mc_key.mv_data = cdst->mc_keybuf;
 	cdst->mc_key.mv_size = 0;
+	cdst->mc_key_pgno = csrc->mc_key_pgno;
+	cdst->mc_key_last = csrc->mc_key_last;
+	cdst->mc_seq_pgno = csrc->mc_seq_pgno;
+	cdst->mc_seq_idx = csrc->mc_seq_idx;
 	mdb_cursor_leaf_cache_reset(&cdst->mc_leaf_cache);
 	if (csrc->mc_key.mv_size && csrc->mc_key.mv_size <= MDB_KEYBUF_MAX) {
 		memcpy(cdst->mc_keybuf, csrc->mc_keybuf, csrc->mc_key.mv_size);
