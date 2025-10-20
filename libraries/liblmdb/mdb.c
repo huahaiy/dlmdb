@@ -1719,7 +1719,6 @@ struct MDB_cursor {
 #define C_UNTRACK	0x40		/**< Un-track cursor when closing */
 #define C_WRITEMAP	MDB_TXN_WRITEMAP /**< Copy of txn flag */
 #define C_LEAFCACHE	0x80		/**< Cursor supports leaf decode caching */
-#define C_SEQEXPECT	0x100		/**< Cursor expects sequential decode reuse */
 /** Read-only cursor into the txn's original snapshot in the map.
  *	Set for read-only txns, and in #mdb_page_alloc() for #FREE_DBI when
  *	#MDB_DEVEL & 2. Only implements code which is necessary for this.
@@ -1803,6 +1802,8 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 	MDB_node *node = NODEPTR(mp, idx);
 	if (IS_LEAF(mp)) {
 		int prefix_enabled = (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) != 0;
+		int seq_hint = (mc->mc_key_pgno == mp->mp_pgno) &&
+		    (mc->mc_key_last + 1u == idx);
 		MDB_prefix_scratch *scratch = &mc->mc_txn->mt_prefix;
 
 		if (!prefix_enabled || idx == 0) {
@@ -1832,7 +1833,7 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 		if (prefix_enabled && !IS_SUBP(mp) &&
 		    (mc->mc_txn->mt_flags & MDB_TXN_RDONLY) &&
 		    (mc->mc_flags & C_LEAFCACHE) &&
-		    !(mc->mc_flags & C_SEQEXPECT)) {
+		    !seq_hint) {
 			PROFILE_SCOPE_START(read_key_cache);
 			int prc = mdb_cursor_leaf_cache_prepare(mc, mp);
 			if (prc != MDB_SUCCESS) {
@@ -1886,7 +1887,7 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 			PROFILE_SCOPE_END(read_key_cache_ns, read_key_cache_calls, read_key_cache);
 		}
 
-		if (prefix_enabled && idx > 0 && (mc->mc_flags & C_SEQEXPECT)) {
+		if (prefix_enabled && idx > 0 && seq_hint) {
 			PROFILE_SCOPE_START(read_key_seq);
 			const unsigned char *encoded = NODEKEY(mp, node);
 			size_t encoded_len = node->mn_ksize;
@@ -8649,6 +8650,7 @@ mdb_cursor_next(MDB_cursor *mc, MDB_val *key, MDB_val *data, MDB_cursor_op op)
 {
 	MDB_page	*mp;
 	MDB_node	*leaf;
+	const int dupsort = (mc->mc_db->md_flags & MDB_DUPSORT) != 0;
 	int rc;
 
 	PROFILE_SCOPE_START(cursor_next);
@@ -8669,7 +8671,7 @@ mdb_cursor_next(MDB_cursor *mc, MDB_val *key, MDB_val *data, MDB_cursor_op op)
 		mc->mc_flags ^= C_EOF;
 	}
 
-	if (mc->mc_db->md_flags & MDB_DUPSORT) {
+	if (dupsort) {
 		leaf = NODEPTR(mp, mc->mc_ki[mc->mc_top]);
 		if (F_ISSET(leaf->mn_flags, F_DUPDATA)) {
 			if (op == MDB_NEXT || op == MDB_NEXT_DUP) {
@@ -8722,7 +8724,7 @@ skip:
 	}
 
 	mdb_cassert(mc, IS_LEAF(mp));
-	if (mc->mc_db->md_flags & MDB_DUPSORT) {
+	if (dupsort) {
 		leaf = NODEPTR(mp, mc->mc_ki[mc->mc_top]);
 		if (F_ISSET(leaf->mn_flags, F_DUPDATA)) {
 			mdb_xcursor_init1(mc, leaf);
@@ -8740,17 +8742,12 @@ skip:
 	}
 
 	if (key) {
-		if (mc->mc_ki[mc->mc_top] > 0) {
-			mc->mc_flags |= C_SEQEXPECT;
-			mc->mc_seq_pgno = mp->mp_pgno;
-		} else {
-			mc->mc_flags &= ~C_SEQEXPECT;
+		if (mc->mc_ki[mc->mc_top] == 0) {
 			mc->mc_seq_pgno = P_INVALID;
 			mc->mc_seq_shared = 0;
 			mc->mc_seq_trunk_len = 0;
 		}
 		rc = mdb_cursor_read_key_at(mc, mp, mc->mc_ki[mc->mc_top], key);
-		mc->mc_flags &= ~C_SEQEXPECT;
 		if (rc != MDB_SUCCESS) {
 			mc->mc_seq_pgno = P_INVALID;
 			mc->mc_seq_shared = 0;
@@ -8759,7 +8756,6 @@ skip:
 		}
 		mc->mc_seq_pgno = mp->mp_pgno;
 	} else {
-		mc->mc_flags &= ~C_SEQEXPECT;
 		mc->mc_seq_pgno = P_INVALID;
 		mc->mc_seq_shared = 0;
 		mc->mc_seq_trunk_len = 0;
