@@ -70,6 +70,10 @@ typedef struct {
 	MDB_prefix_metrics prefix_read_warm;
 	MDB_prefix_metrics prefix_scan_cold;
 	MDB_prefix_metrics prefix_scan_warm;
+#ifdef MDB_PROFILE_RANGE
+	MDB_profile_stats profile_scan_cold;
+	MDB_profile_stats profile_scan_warm;
+#endif
 	size_t value_size;
 	size_t prefix_len;
 	uint64_t entries;
@@ -128,7 +132,11 @@ static void bench_do_repack(const bench_config *cfg,
 static void bench_do_reads(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
     const size_t *read_order, bench_timing *timing, MDB_prefix_metrics *pm);
 static void bench_do_scan(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
-    bench_timing *timing, MDB_prefix_metrics *pm);
+    bench_timing *timing, MDB_prefix_metrics *pm
+#ifdef MDB_PROFILE_RANGE
+    , MDB_profile_stats *profile
+#endif
+    );
 static void bench_collect_stats(const bench_config *cfg, const bench_variant *v,
     MDB_env *env, MDB_dbi dbi, bench_metrics *m);
 static const char *format_bytes(double bytes, char *buf, size_t bufsize);
@@ -139,6 +147,9 @@ static void print_comparison(const bench_variant *baseline,
 static bool prefix_metrics_has_data(const MDB_prefix_metrics *pm);
 static void print_prefix_metrics_line(const char *label,
     const MDB_prefix_metrics *pm);
+#ifdef MDB_PROFILE_RANGE
+static void print_profile_stats_line(const char *label, const MDB_profile_stats *ps);
+#endif
 
 static const char *g_current_variant = NULL;
 
@@ -567,9 +578,17 @@ run_bench_variant(const bench_config *cfg, bench_variant *variant,
 	env = bench_open_env(cfg, variant);
 	dbi = bench_open_dbi(env, variant, 0, MDB_RDONLY);
 	bench_do_scan(cfg, env, dbi, &variant->metrics.scan_cold,
-	    &variant->metrics.prefix_scan_cold);
+	    &variant->metrics.prefix_scan_cold
+#ifdef MDB_PROFILE_RANGE
+	    , &variant->metrics.profile_scan_cold
+#endif
+	    );
 	bench_do_scan(cfg, env, dbi, &variant->metrics.scan_warm,
-	    &variant->metrics.prefix_scan_warm);
+	    &variant->metrics.prefix_scan_warm
+#ifdef MDB_PROFILE_RANGE
+	    , &variant->metrics.profile_scan_warm
+#endif
+	    );
 	bench_collect_stats(cfg, variant, env, dbi, &variant->metrics);
 	if (cfg->do_repack)
 		bench_do_repack(cfg, variant, env, &variant->metrics);
@@ -878,7 +897,11 @@ bench_do_reads(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
 
 static void
 bench_do_scan(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
-    bench_timing *timing, MDB_prefix_metrics *pm)
+    bench_timing *timing, MDB_prefix_metrics *pm
+#ifdef MDB_PROFILE_RANGE
+    , MDB_profile_stats *profile
+#endif
+    )
 {
 	if (!timing)
 		return;
@@ -889,6 +912,11 @@ bench_do_scan(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
 
 	MDB_cursor *cursor = NULL;
 	CHECK_RC(mdb_cursor_open(txn, dbi, &cursor), "mdb_cursor_open");
+
+#ifdef MDB_PROFILE_RANGE
+	if (profile)
+		mdb_profile_reset();
+#endif
 
 	struct timespec start, end;
 	clock_gettime(CLOCK_MONOTONIC, &start);
@@ -948,6 +976,11 @@ bench_do_scan(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
 		if (mdb_prefix_metrics(txn, pm, 1) != MDB_SUCCESS)
 			memset(pm, 0, sizeof(*pm));
 	}
+
+#ifdef MDB_PROFILE_RANGE
+	if (profile)
+		mdb_profile_snapshot(profile);
+#endif
 
 	mdb_cursor_close(cursor);
 	mdb_txn_abort(txn);
@@ -1057,6 +1090,74 @@ print_prefix_metrics_line(const char *label, const MDB_prefix_metrics *pm)
 	    pm->leaf_cache_pages);
 }
 
+#ifdef MDB_PROFILE_RANGE
+static void
+print_profile_stats_line(const char *label, const MDB_profile_stats *ps)
+{
+	if (!ps)
+		return;
+	if (!(ps->leaf_decode_calls || ps->leaf_cache_prepare_calls ||
+	    ps->cursor_next_calls || ps->prefix_contrib_calls ||
+	    ps->read_key_total_calls || ps->read_key_cache_calls ||
+	    ps->read_key_seq_calls || ps->read_key_decode_calls))
+		return;
+	printf("Range scan profile (%s):\n", label);
+	if (ps->leaf_decode_calls) {
+		double total_ms = (double)ps->leaf_decode_ns / 1e6;
+		double avg_ns = (double)ps->leaf_decode_ns / ps->leaf_decode_calls;
+		printf("  leaf_decode:    %10" PRIu64 " calls, %8.3f ms total, %7.1f ns/call\n",
+		    ps->leaf_decode_calls, total_ms, avg_ns);
+	}
+	if (ps->leaf_cache_prepare_calls) {
+		double total_ms = (double)ps->leaf_cache_prepare_ns / 1e6;
+		double avg_ns = (double)ps->leaf_cache_prepare_ns /
+		    ps->leaf_cache_prepare_calls;
+		printf("  cache_prepare:  %10" PRIu64 " calls, %8.3f ms total, %7.1f ns/call\n",
+		    ps->leaf_cache_prepare_calls, total_ms, avg_ns);
+	}
+	if (ps->cursor_next_calls) {
+		double total_ms = (double)ps->cursor_next_ns / 1e6;
+		double avg_ns = (double)ps->cursor_next_ns / ps->cursor_next_calls;
+		printf("  cursor_next:    %10" PRIu64 " calls, %8.3f ms total, %7.1f ns/call\n",
+		    ps->cursor_next_calls, total_ms, avg_ns);
+	}
+	if (ps->prefix_contrib_calls) {
+		double total_ms = (double)ps->prefix_contrib_ns / 1e6;
+		double avg_ns = (double)ps->prefix_contrib_ns /
+		    ps->prefix_contrib_calls;
+		printf("  prefix_accum:   %10" PRIu64 " calls, %8.3f ms total, %7.1f ns/call\n",
+		    ps->prefix_contrib_calls, total_ms, avg_ns);
+	}
+	if (ps->read_key_total_calls) {
+		double total_ms = (double)ps->read_key_total_ns / 1e6;
+		double avg_ns = (double)ps->read_key_total_ns / ps->read_key_total_calls;
+		printf("  read_key total: %10" PRIu64 " calls, %8.3f ms total, %7.1f ns/call\n",
+		    ps->read_key_total_calls, total_ms, avg_ns);
+	}
+	if (ps->read_key_cache_calls) {
+		double total_ms = (double)ps->read_key_cache_ns / 1e6;
+		double avg_ns = ps->read_key_cache_calls ?
+		    (double)ps->read_key_cache_ns / ps->read_key_cache_calls : 0.0;
+		printf("    cache path:   %10" PRIu64 " calls, %8.3f ms total, %7.1f ns/call\n",
+		    ps->read_key_cache_calls, total_ms, avg_ns);
+	}
+	if (ps->read_key_seq_calls) {
+		double total_ms = (double)ps->read_key_seq_ns / 1e6;
+		double avg_ns = ps->read_key_seq_calls ?
+		    (double)ps->read_key_seq_ns / ps->read_key_seq_calls : 0.0;
+		printf("    seq fastpath: %10" PRIu64 " calls, %8.3f ms total, %7.1f ns/call\n",
+		    ps->read_key_seq_calls, total_ms, avg_ns);
+	}
+	if (ps->read_key_decode_calls) {
+		double total_ms = (double)ps->read_key_decode_ns / 1e6;
+		double avg_ns = ps->read_key_decode_calls ?
+		    (double)ps->read_key_decode_ns / ps->read_key_decode_calls : 0.0;
+		printf("    decode slow:  %10" PRIu64 " calls, %8.3f ms total, %7.1f ns/call\n",
+		    ps->read_key_decode_calls, total_ms, avg_ns);
+	}
+}
+#endif
+
 static void
 print_metrics(const bench_variant *variant)
 {
@@ -1096,6 +1197,10 @@ print_metrics(const bench_variant *variant)
 			print_prefix_metrics_line("Range Scan (warm)",
 			    &m->prefix_scan_warm);
 		}
+#ifdef MDB_PROFILE_RANGE
+		print_profile_stats_line("cold", &m->profile_scan_cold);
+		print_profile_stats_line("warm", &m->profile_scan_warm);
+#endif
 	}
 	if (m->repack.ops) {
 		printf("Repack output: %s%s\n",

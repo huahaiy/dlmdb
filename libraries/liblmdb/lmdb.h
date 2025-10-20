@@ -1242,6 +1242,30 @@ typedef struct MDB_prefix_metrics {
  */
 int mdb_prefix_metrics(MDB_txn *txn, MDB_prefix_metrics *out, int reset);
 
+#ifdef MDB_PROFILE_RANGE
+typedef struct MDB_profile_stats {
+	uint64_t leaf_decode_ns;
+	uint64_t leaf_decode_calls;
+	uint64_t leaf_cache_prepare_ns;
+	uint64_t leaf_cache_prepare_calls;
+	uint64_t cursor_next_ns;
+	uint64_t cursor_next_calls;
+	uint64_t prefix_contrib_ns;
+	uint64_t prefix_contrib_calls;
+	uint64_t read_key_total_ns;
+	uint64_t read_key_total_calls;
+	uint64_t read_key_cache_ns;
+	uint64_t read_key_cache_calls;
+	uint64_t read_key_seq_ns;
+	uint64_t read_key_seq_calls;
+	uint64_t read_key_decode_ns;
+	uint64_t read_key_decode_calls;
+} MDB_profile_stats;
+
+void mdb_profile_reset(void);
+void mdb_profile_snapshot(MDB_profile_stats *out);
+#endif
+
 	/** @brief Retrieve the element at a given rank in a counted database.
 	 *
 	 * Works with plain and dupsort DBIs opened with #MDB_COUNTED. The
