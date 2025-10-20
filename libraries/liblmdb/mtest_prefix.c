@@ -59,6 +59,8 @@ pf_trace_ops(void)
 static void test_prefix_leaf_splits(void);
 static void test_prefix_alternating_prefixes(void);
 static void test_prefix_update_reinsert(void);
+static void test_prefix_dupsort_cursor_walk(void);
+static void test_prefix_dupsort_get_both_range(void);
 static void test_prefix_dupsort_smoke(void);
 
 static void
@@ -540,6 +542,297 @@ test_prefix_dupsort_transitions(void)
 	else
 		mdb_txn_abort(txn);
 
+	mdb_env_close(env);
+}
+
+static void
+test_prefix_dupsort_cursor_walk(void)
+{
+	static const char *dir = "testdb_prefix_dupsort_walk";
+	MDB_env *env = create_env(dir);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	unsigned int flags = MDB_PREFIX_COMPRESSION | MDB_DUPSORT;
+	CHECK_CALL(mdb_dbi_open(txn, "walkdb", MDB_CREATE | flags, &dbi));
+
+	static const char *keys[] = {
+		"dup-walk-alpha",
+		"dup-walk-bravo",
+		"dup-walk-charlie"
+	};
+	static const char *dup_values[][3] = {
+		{"dup-alpha-001", "dup-alpha-002", "dup-alpha-003"},
+		{"dup-bravo-001", "dup-bravo-002", "dup-bravo-003"},
+		{"dup-charlie-001", "dup-charlie-002", "dup-charlie-003"}
+	};
+	const size_t dup_count = ARRAY_SIZE(dup_values[0]);
+
+	for (size_t i = 0; i < ARRAY_SIZE(keys); ++i) {
+		MDB_val key = {strlen(keys[i]), (void *)keys[i]};
+		for (size_t j = 0; j < dup_count; ++j) {
+			MDB_val data = {strlen(dup_values[i][j]), (void *)dup_values[i][j]};
+			CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+		}
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, "walkdb", flags, &dbi));
+	MDB_cursor *cur = NULL;
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+	MDB_val key = {0, NULL};
+	MDB_val data = {0, NULL};
+
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_FIRST));
+	if (key.mv_size != strlen(keys[0]) ||
+	    memcmp(key.mv_data, keys[0], key.mv_size) != 0 ||
+	    data.mv_size != strlen(dup_values[0][0]) ||
+	    memcmp(data.mv_data, dup_values[0][0], data.mv_size) != 0) {
+		fprintf(stderr, "dupsort walk: unexpected first entry\n");
+		exit(EXIT_FAILURE);
+	}
+
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_NEXT_DUP));
+	if (data.mv_size != strlen(dup_values[0][1]) ||
+	    memcmp(data.mv_data, dup_values[0][1], data.mv_size) != 0) {
+		fprintf(stderr, "dupsort walk: second duplicate mismatch\n");
+		exit(EXIT_FAILURE);
+	}
+
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_NEXT_DUP));
+	if (data.mv_size != strlen(dup_values[0][2]) ||
+	    memcmp(data.mv_data, dup_values[0][2], data.mv_size) != 0) {
+		fprintf(stderr, "dupsort walk: third duplicate mismatch\n");
+		exit(EXIT_FAILURE);
+	}
+
+	int rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT_DUP);
+	if (rc != MDB_NOTFOUND) {
+		fprintf(stderr, "dupsort walk: expected end of duplicates\n");
+		exit(EXIT_FAILURE);
+	}
+
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_NEXT));
+	if (key.mv_size != strlen(keys[1]) ||
+	    memcmp(key.mv_data, keys[1], key.mv_size) != 0 ||
+	    data.mv_size != strlen(dup_values[1][0]) ||
+	    memcmp(data.mv_data, dup_values[1][0], data.mv_size) != 0) {
+		fprintf(stderr, "dupsort walk: MDB_NEXT did not reach next key\n");
+		exit(EXIT_FAILURE);
+	}
+
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_NEXT_DUP));
+	if (data.mv_size != strlen(dup_values[1][1]) ||
+	    memcmp(data.mv_data, dup_values[1][1], data.mv_size) != 0) {
+		fprintf(stderr, "dupsort walk: MDB_NEXT_DUP failed within second key\n");
+		exit(EXIT_FAILURE);
+	}
+
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_PREV_DUP));
+	if (data.mv_size != strlen(dup_values[1][0]) ||
+	    memcmp(data.mv_data, dup_values[1][0], data.mv_size) != 0) {
+		fprintf(stderr, "dupsort walk: MDB_PREV_DUP failed to rewind\n");
+		exit(EXIT_FAILURE);
+	}
+
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_NEXT_DUP));
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_NEXT_DUP));
+	if (data.mv_size != strlen(dup_values[1][2]) ||
+	    memcmp(data.mv_data, dup_values[1][2], data.mv_size) != 0) {
+		fprintf(stderr, "dupsort walk: MDB_NEXT_DUP missed last duplicate\n");
+		exit(EXIT_FAILURE);
+	}
+
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_NEXT_NODUP));
+	if (key.mv_size != strlen(keys[2]) ||
+	    memcmp(key.mv_data, keys[2], key.mv_size) != 0 ||
+	    data.mv_size != strlen(dup_values[2][0]) ||
+	    memcmp(data.mv_data, dup_values[2][0], data.mv_size) != 0) {
+		fprintf(stderr, "dupsort walk: MDB_NEXT_NODUP did not land on third key\n");
+		exit(EXIT_FAILURE);
+	}
+
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_NEXT_DUP));
+	if (data.mv_size != strlen(dup_values[2][1]) ||
+	    memcmp(data.mv_data, dup_values[2][1], data.mv_size) != 0) {
+		fprintf(stderr, "dupsort walk: MDB_NEXT_DUP mismatch in third key\n");
+		exit(EXIT_FAILURE);
+	}
+
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_NEXT_DUP));
+	if (data.mv_size != strlen(dup_values[2][2]) ||
+	    memcmp(data.mv_data, dup_values[2][2], data.mv_size) != 0) {
+		fprintf(stderr, "dupsort walk: MDB_NEXT_DUP missed tail duplicate\n");
+		exit(EXIT_FAILURE);
+	}
+
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_PREV_NODUP));
+	if (key.mv_size != strlen(keys[1]) ||
+	    memcmp(key.mv_data, keys[1], key.mv_size) != 0 ||
+	    data.mv_size != strlen(dup_values[1][2]) ||
+	    memcmp(data.mv_data, dup_values[1][2], data.mv_size) != 0) {
+		fprintf(stderr, "dupsort walk: MDB_PREV_NODUP did not target prior key tail\n");
+		exit(EXIT_FAILURE);
+	}
+
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_PREV_DUP));
+	if (data.mv_size != strlen(dup_values[1][1]) ||
+	    memcmp(data.mv_data, dup_values[1][1], data.mv_size) != 0) {
+		fprintf(stderr, "dupsort walk: MDB_PREV_DUP failed in reverse iteration\n");
+		exit(EXIT_FAILURE);
+	}
+
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_PREV_DUP));
+	if (data.mv_size != strlen(dup_values[1][0]) ||
+	    memcmp(data.mv_data, dup_values[1][0], data.mv_size) != 0) {
+		fprintf(stderr, "dupsort walk: MDB_PREV_DUP missed earliest duplicate\n");
+		exit(EXIT_FAILURE);
+	}
+
+	rc = mdb_cursor_get(cur, &key, &data, MDB_PREV_DUP);
+	if (rc != MDB_NOTFOUND) {
+		fprintf(stderr, "dupsort walk: expected start of dup chain\n");
+		exit(EXIT_FAILURE);
+	}
+
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_PREV_NODUP));
+	if (key.mv_size != strlen(keys[0]) ||
+	    memcmp(key.mv_data, keys[0], key.mv_size) != 0 ||
+	    data.mv_size != strlen(dup_values[0][2]) ||
+	    memcmp(data.mv_data, dup_values[0][2], data.mv_size) != 0) {
+		fprintf(stderr, "dupsort walk: MDB_PREV_NODUP missed previous key tail\n");
+		exit(EXIT_FAILURE);
+	}
+
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_PREV));
+	if (data.mv_size != strlen(dup_values[0][1]) ||
+	    memcmp(data.mv_data, dup_values[0][1], data.mv_size) != 0) {
+		fprintf(stderr, "dupsort walk: MDB_PREV did not step within key\n");
+		exit(EXIT_FAILURE);
+	}
+
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_PREV));
+	if (data.mv_size != strlen(dup_values[0][0]) ||
+	    memcmp(data.mv_data, dup_values[0][0], data.mv_size) != 0) {
+		fprintf(stderr, "dupsort walk: MDB_PREV missed first duplicate\n");
+		exit(EXIT_FAILURE);
+	}
+
+	rc = mdb_cursor_get(cur, &key, &data, MDB_PREV);
+	if (rc != MDB_NOTFOUND) {
+		fprintf(stderr, "dupsort walk: expected start of database\n");
+		exit(EXIT_FAILURE);
+	}
+
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+	mdb_env_close(env);
+}
+
+static void
+test_prefix_dupsort_get_both_range(void)
+{
+	static const char *dir = "testdb_prefix_dupsort_get_both";
+	MDB_env *env = create_env(dir);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	unsigned int flags = MDB_PREFIX_COMPRESSION | MDB_DUPSORT;
+	CHECK_CALL(mdb_dbi_open(txn, "bothdb", MDB_CREATE | flags, &dbi));
+
+	static const char *keys[] = {
+		"range-key-alpha",
+		"range-key-beta"
+	};
+	static const char *alpha_dups[] = {
+		"dup-0001",
+		"dup-0005",
+		"dup-0010"
+	};
+	static const char *beta_dups[] = {
+		"dup-0100",
+		"dup-0200",
+		"dup-0300"
+	};
+
+	MDB_val key = {strlen(keys[0]), (void *)keys[0]};
+	for (size_t i = 0; i < ARRAY_SIZE(alpha_dups); ++i) {
+		MDB_val data = {strlen(alpha_dups[i]), (void *)alpha_dups[i]};
+		CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+	}
+
+	key.mv_size = strlen(keys[1]);
+	key.mv_data = (void *)keys[1];
+	for (size_t i = 0; i < ARRAY_SIZE(beta_dups); ++i) {
+		MDB_val data = {strlen(beta_dups[i]), (void *)beta_dups[i]};
+		CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, "bothdb", flags, &dbi));
+	MDB_cursor *cur = NULL;
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+
+	MDB_val exact_key = {strlen(keys[0]), (void *)keys[0]};
+	MDB_val exact_data = {strlen(alpha_dups[1]), (void *)alpha_dups[1]};
+	CHECK_CALL(mdb_cursor_get(cur, &exact_key, &exact_data, MDB_GET_BOTH));
+	if (exact_key.mv_size != strlen(keys[0]) ||
+	    memcmp(exact_key.mv_data, keys[0], exact_key.mv_size) != 0 ||
+	    exact_data.mv_size != strlen(alpha_dups[1]) ||
+	    memcmp(exact_data.mv_data, alpha_dups[1], exact_data.mv_size) != 0) {
+		fprintf(stderr, "dupsort get_both: exact lookup failed\n");
+		exit(EXIT_FAILURE);
+	}
+
+	MDB_val range_key = {strlen(keys[0]), (void *)keys[0]};
+	MDB_val range_data = {strlen("dup-0004"), "dup-0004"};
+	CHECK_CALL(mdb_cursor_get(cur, &range_key, &range_data, MDB_GET_BOTH_RANGE));
+	if (range_data.mv_size != strlen(alpha_dups[1]) ||
+	    memcmp(range_data.mv_data, alpha_dups[1], range_data.mv_size) != 0) {
+		fprintf(stderr, "dupsort get_both: range lookup did not advance to dup-0005\n");
+		exit(EXIT_FAILURE);
+	}
+
+	range_key.mv_size = strlen(keys[0]);
+	range_key.mv_data = (void *)keys[0];
+	range_data.mv_size = strlen("dup-0011");
+	range_data.mv_data = "dup-0011";
+	int rc = mdb_cursor_get(cur, &range_key, &range_data, MDB_GET_BOTH_RANGE);
+	if (rc != MDB_NOTFOUND) {
+		fprintf(stderr, "dupsort get_both: expected no match beyond last duplicate\n");
+		exit(EXIT_FAILURE);
+	}
+
+	MDB_val beta_key = {strlen(keys[1]), (void *)keys[1]};
+	MDB_val beta_data = {strlen("dup-0000"), "dup-0000"};
+	CHECK_CALL(mdb_cursor_get(cur, &beta_key, &beta_data, MDB_GET_BOTH_RANGE));
+	if (beta_data.mv_size != strlen(beta_dups[0]) ||
+	    memcmp(beta_data.mv_data, beta_dups[0], beta_data.mv_size) != 0) {
+		fprintf(stderr, "dupsort get_both: range lookup on second key failed\n");
+		exit(EXIT_FAILURE);
+	}
+
+	CHECK_CALL(mdb_cursor_get(cur, &beta_key, &beta_data, MDB_NEXT_DUP));
+	if (beta_data.mv_size != strlen(beta_dups[1]) ||
+	    memcmp(beta_data.mv_data, beta_dups[1], beta_data.mv_size) != 0) {
+		fprintf(stderr, "dupsort get_both: MDB_NEXT_DUP did not continue range walk\n");
+		exit(EXIT_FAILURE);
+	}
+
+	MDB_val missing_key = {strlen(keys[1]), (void *)keys[1]};
+	MDB_val missing_data = {strlen("dup-9999"), "dup-9999"};
+	rc = mdb_cursor_get(cur, &missing_key, &missing_data, MDB_GET_BOTH);
+	if (rc != MDB_NOTFOUND) {
+		fprintf(stderr, "dupsort get_both: unexpected success for missing duplicate\n");
+		exit(EXIT_FAILURE);
+	}
+
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
 	mdb_env_close(env);
 }
 
@@ -1186,6 +1479,8 @@ main(void)
     test_mixed_pattern_and_unicode();
     test_cursor_buffer_sharing();
     test_prefix_dupsort_transitions();
+    test_prefix_dupsort_cursor_walk();
+    test_prefix_dupsort_get_both_range();
     test_prefix_leaf_splits();
     test_prefix_alternating_prefixes();
     test_prefix_update_reinsert();

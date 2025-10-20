@@ -1064,6 +1064,28 @@ test_random_access_plain(MDB_env *env)
         expect_val_eq(&got_key, expect_key, "rank plain cursor key");
         expect_val_eq(&got_data, expect_data, "rank plain cursor data");
 
+        MDB_val lookup_key = {strlen(expect_key), (void *)expect_key};
+        uint64_t key_rank = UINT64_MAX;
+        CHECK(mdb_get_key_rank(txn, dbi, &lookup_key, NULL, &key_rank),
+              "rank plain api key rank");
+        expect_eq(key_rank, idx, "rank plain api key rank value");
+
+        MDB_val lookup_data = {strlen(expect_data), (void *)expect_data};
+        key_rank = UINT64_MAX;
+        CHECK(mdb_get_key_rank(txn, dbi, &lookup_key, &lookup_data, &key_rank),
+              "rank plain api key/data rank");
+        expect_eq(key_rank, idx, "rank plain api key/data rank value");
+
+        uint64_t cursor_rank = UINT64_MAX;
+        CHECK(mdb_cursor_key_rank(cur, &lookup_key, NULL, 0, &cursor_rank),
+              "rank plain cursor key rank");
+        expect_eq(cursor_rank, idx, "rank plain cursor key rank value");
+
+        cursor_rank = UINT64_MAX;
+        CHECK(mdb_cursor_key_rank(cur, &lookup_key, &lookup_data, 0, &cursor_rank),
+              "rank plain cursor key/data rank");
+        expect_eq(cursor_rank, idx, "rank plain cursor key/data rank value");
+
         MDB_val api_key, api_data;
         CHECK(mdb_get_rank(txn, dbi, idx, &api_key, &api_data),
               "rank plain api");
@@ -1085,7 +1107,25 @@ test_random_access_plain(MDB_env *env)
         }
     }
 
-    int rc = mdb_cursor_get_rank(cur, count, &key, &data, 0);
+    uint64_t dummy_rank = 0;
+    const char *flag_key_str = "rp00000";
+    MDB_val flag_key = {strlen(flag_key_str), (void *)flag_key_str};
+    int rc = mdb_cursor_key_rank(cur, &flag_key, NULL, 1, &dummy_rank);
+    expect_rc(rc, EINVAL, "rank plain cursor key rank flags");
+
+    const char *missing_key_str = "rp99999";
+    MDB_val missing_key = {strlen(missing_key_str), (void *)missing_key_str};
+    rc = mdb_get_key_rank(txn, dbi, &missing_key, NULL, &dummy_rank);
+    expect_rc(rc, MDB_NOTFOUND, "rank plain missing key");
+
+    const char *mismatch_key_str = "rp00010";
+    const char *mismatch_data_str = "rv99999";
+    MDB_val mismatch_key = {strlen(mismatch_key_str), (void *)mismatch_key_str};
+    MDB_val mismatch_data = {strlen(mismatch_data_str), (void *)mismatch_data_str};
+    rc = mdb_get_key_rank(txn, dbi, &mismatch_key, &mismatch_data, &dummy_rank);
+    expect_rc(rc, MDB_NOTFOUND, "rank plain mismatched data");
+
+    rc = mdb_cursor_get_rank(cur, count, &key, &data, 0);
     expect_rc(rc, MDB_NOTFOUND, "rank plain eof");
 
     rc = mdb_cursor_get_rank(cur, 0, NULL, NULL, 1);
@@ -1115,6 +1155,10 @@ test_random_access_plain(MDB_env *env)
     CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "rank plain uncounted rd");
     rc = mdb_get_rank(txn, uncounted, 0, &key, &data);
     expect_rc(rc, MDB_INCOMPATIBLE, "rank plain incompatible");
+    uint64_t rank_check = 0;
+    MDB_val sample_key = {1, &uk};
+    rc = mdb_get_key_rank(txn, uncounted, &sample_key, NULL, &rank_check);
+    expect_rc(rc, MDB_INCOMPATIBLE, "rank plain key incompatible");
     mdb_txn_abort(txn);
 
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "rank plain uncounted drop begin");
@@ -1177,17 +1221,46 @@ test_random_access_dupsort(MDB_env *env)
     CHECK(mdb_txn_commit(txn), "rank dup commit");
 
     qsort(expected, total, sizeof(expected[0]), pair_cmp);
+    size_t prefix[num_keys + 1];
+    prefix[0] = 0;
+    for (int i = 0; i < num_keys; ++i)
+        prefix[i + 1] = prefix[i] + (size_t)dup_counts[i];
 
     CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "rank dup rd");
     MDB_cursor *cur;
     CHECK(mdb_cursor_open(txn, dbi, &cur), "rank dup cursor");
 
+    size_t group = 0;
     for (uint64_t idx = 0; idx < total; ++idx) {
         MDB_val got_key, got_data;
         CHECK(mdb_cursor_get_rank(cur, idx, &got_key, &got_data, 0),
               "rank dup cursor get");
         expect_val_match(&got_key, &expected[idx].key, "rank dup key");
         expect_val_match(&got_data, &expected[idx].data, "rank dup data");
+
+        uint64_t pair_rank = UINT64_MAX;
+        CHECK(mdb_get_key_rank(txn, dbi, &expected[idx].key, &expected[idx].data, &pair_rank),
+              "rank dup api key/data rank");
+        expect_eq(pair_rank, idx, "rank dup api key/data rank value");
+
+        uint64_t cursor_pair_rank = UINT64_MAX;
+        CHECK(mdb_cursor_key_rank(cur, &expected[idx].key, &expected[idx].data, 0, &cursor_pair_rank),
+              "rank dup cursor key/data rank");
+        expect_eq(cursor_pair_rank, idx, "rank dup cursor key/data rank value");
+
+        while (group + 1 <= (size_t)num_keys && idx >= prefix[group + 1])
+            group++;
+        if (idx == prefix[group]) {
+            uint64_t first_rank = UINT64_MAX;
+            CHECK(mdb_get_key_rank(txn, dbi, &expected[idx].key, NULL, &first_rank),
+                  "rank dup api key rank");
+            expect_eq(first_rank, idx, "rank dup api key rank value");
+
+            uint64_t cursor_first = UINT64_MAX;
+            CHECK(mdb_cursor_key_rank(cur, &expected[idx].key, NULL, 0, &cursor_first),
+                  "rank dup cursor key rank");
+            expect_eq(cursor_first, idx, "rank dup cursor key rank value");
+        }
 
         if (idx == 3) {
             MDB_val key_only;
@@ -1197,6 +1270,20 @@ test_random_access_dupsort(MDB_env *env)
                              "rank dup key only value");
         }
     }
+
+    uint64_t dup_dummy = 0;
+    int rc = mdb_cursor_key_rank(cur, &expected[0].key, &expected[0].data, 1, &dup_dummy);
+    expect_rc(rc, EINVAL, "rank dup cursor key rank flags");
+
+    const char *missing_dup_key = "zz";
+    MDB_val missing_dup = {strlen(missing_dup_key), (void *)missing_dup_key};
+    rc = mdb_get_key_rank(txn, dbi, &missing_dup, NULL, &dup_dummy);
+    expect_rc(rc, MDB_NOTFOUND, "rank dup missing key");
+
+    const char *bad_data_str = "dv_bad";
+    MDB_val bad_data = {strlen(bad_data_str), (void *)bad_data_str};
+    rc = mdb_get_key_rank(txn, dbi, &expected[0].key, &bad_data, &dup_dummy);
+    expect_rc(rc, MDB_NOTFOUND, "rank dup missing data");
 
     unsigned int verify_seed = 0x1234abcdu;
     for (int i = 0; i < 10; ++i) {
@@ -1215,7 +1302,7 @@ test_random_access_dupsort(MDB_env *env)
                      "rank dup tail match");
 
     MDB_val key, data;
-    int rc = mdb_cursor_get_rank(cur, total, &key, &data, 0);
+    rc = mdb_cursor_get_rank(cur, total, &key, &data, 0);
     expect_rc(rc, MDB_NOTFOUND, "rank dup eof");
 
     rc = mdb_cursor_get_rank(cur, 0, &key, &data, 1);

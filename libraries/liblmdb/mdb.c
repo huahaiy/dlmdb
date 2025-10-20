@@ -13195,6 +13195,67 @@ mdb_prefix_metrics(MDB_txn *txn, MDB_prefix_metrics *out, int reset)
 }
 
 static int
+mdb_rank_for_key(MDB_txn *txn, MDB_dbi dbi,
+	const MDB_val *key, const MDB_val *data,
+	unsigned flags, uint64_t *rank_out)
+{
+	MDB_db *db;
+	MDB_cursor mc = {0};
+	MDB_xcursor mx = {0};
+	MDB_val seek_key = {0};
+	MDB_val stored_data = {0};
+	int rc;
+	int dupsort;
+
+	if (!txn || !key || !rank_out)
+		return EINVAL;
+	if (flags)
+		return EINVAL;
+	if (!TXN_DBI_EXIST(txn, dbi, DB_USRVALID))
+		return EINVAL;
+	if (txn->mt_flags & MDB_TXN_BLOCKED)
+		return MDB_BAD_TXN;
+
+	db = &txn->mt_dbs[dbi];
+	if (!(db->md_flags & MDB_COUNTED))
+		return MDB_INCOMPATIBLE;
+
+	dupsort = (db->md_flags & MDB_DUPSORT) != 0;
+	mdb_cursor_init(&mc, txn, dbi, dupsort ? &mx : NULL);
+
+	seek_key = *key;
+	rc = mdb_cursor_get(&mc, &seek_key, &stored_data, MDB_SET_KEY);
+	if (rc != MDB_SUCCESS)
+		goto done;
+
+	if (data) {
+		if (dupsort) {
+			MDB_val seek_data = {data->mv_size, (void *)data->mv_data};
+			rc = mdb_cursor_get(&mc, &seek_key, &seek_data, MDB_GET_BOTH);
+			if (rc != MDB_SUCCESS)
+				goto done;
+		} else {
+			if (stored_data.mv_size != data->mv_size ||
+			    memcmp(stored_data.mv_data, data->mv_data, data->mv_size) != 0) {
+				rc = MDB_NOTFOUND;
+				goto done;
+			}
+		}
+	}
+
+	rc = MDB_SUCCESS;
+
+done:
+	MDB_CURSOR_UNREF(&mc, 1);
+	if (rc != MDB_SUCCESS)
+		return rc;
+
+	if (dupsort && data)
+		return mdb_prefix_pair_leq(txn, dbi, key, 1, data, 0, rank_out);
+	return mdb_prefix_pair_leq(txn, dbi, key, 0, NULL, 0, rank_out);
+}
+
+static int
 mdb_cursor_rank_search(MDB_cursor *mc, uint64_t rank, uint64_t *entry_offset)
 {
 	MDB_page *mp;
@@ -13334,6 +13395,15 @@ mdb_cursor_get_rank(MDB_cursor *mc, uint64_t rank,
 }
 
 int ESECT
+mdb_cursor_key_rank(MDB_cursor *mc, const MDB_val *key,
+	const MDB_val *data, unsigned flags, uint64_t *rank_out)
+{
+	if (!mc)
+		return EINVAL;
+	return mdb_rank_for_key(mc->mc_txn, mc->mc_dbi, key, data, flags, rank_out);
+}
+
+int ESECT
 mdb_get_rank(MDB_txn *txn, MDB_dbi dbi, uint64_t rank,
 	MDB_val *key, MDB_val *data)
 {
@@ -13354,6 +13424,13 @@ MDB_xcursor mx = (MDB_xcursor){0};
 	rc = mdb_cursor_get_rank(&mc, rank, key, data, 0);
 	MDB_CURSOR_UNREF(&mc, 1);
 	return rc;
+}
+
+int ESECT
+mdb_get_key_rank(MDB_txn *txn, MDB_dbi dbi,
+	const MDB_val *key, const MDB_val *data, uint64_t *rank_out)
+{
+	return mdb_rank_for_key(txn, dbi, key, data, 0, rank_out);
 }
 
 int ESECT

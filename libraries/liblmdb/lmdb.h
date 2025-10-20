@@ -1261,6 +1261,26 @@ int mdb_cursor_get_rank(MDB_cursor *cursor, uint64_t rank,
 int mdb_get_rank(MDB_txn *txn, MDB_dbi dbi, uint64_t rank,
 	MDB_val *key, MDB_val *data);
 
+	/** @brief Determine the rank of a key (and optional data) in a counted database.
+	 *
+	 * Works with plain and dupsort DBIs opened with #MDB_COUNTED. The rank is
+	 * zero-based and counts individual key/value pairs in sorted order. When the
+	 * database uses #MDB_DUPSORT and \b data is provided, the rank includes only
+	 * duplicates that precede the specified data item.
+	 *
+	 * @param[in] cursor Cursor referencing the counted database.
+	 * @param[in] key Key whose rank should be computed. Must not be NULL.
+	 * @param[in] data Optional duplicate data to refine the rank; ignored for plain DBs.
+	 * @param[in] flags Reserved for future use, must be 0.
+	 * @param[out] rank Destination for the computed zero-based rank.
+	 */
+int mdb_cursor_key_rank(MDB_cursor *cursor, const MDB_val *key,
+	const MDB_val *data, unsigned flags, uint64_t *rank);
+
+	/** @brief Convenience wrapper around #mdb_cursor_key_rank(). */
+int mdb_get_key_rank(MDB_txn *txn, MDB_dbi dbi,
+	const MDB_val *key, const MDB_val *data, uint64_t *rank);
+
 	/** @brief Close a database handle. Normally unnecessary. Use with care:
 	 *
 	 * This call is not mutex protected. Handles should only be closed by
