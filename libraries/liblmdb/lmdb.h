@@ -1217,6 +1217,31 @@ int mdb_range_count_values(MDB_txn *txn, MDB_dbi dbi,
 	const MDB_val *key_low, const MDB_val *key_high, unsigned key_flags,
 	uint64_t *out);
 
+/** @brief Prefix-compression read-path metrics.
+ *
+ * These counters track how many times prefix-compressed keys were decoded or
+ * served from the per-transaction cache while iterating a database. They are
+ * useful for diagnosing read amplification when #MDB_PREFIX_COMPRESSION is
+ * enabled. All counters are reset to zero when the transaction is renewed or
+ * when #mdb_prefix_metrics() is called with reset != 0.
+ */
+typedef struct MDB_prefix_metrics {
+	uint64_t leaf_decode_calls; /**< Total calls that decoded a key suffix */
+	uint64_t leaf_decode_cache_hits; /**< Requests served by cached decoded key */
+	uint64_t leaf_decode_cache_misses; /**< Requests requiring fresh decode */
+	uint64_t leaf_cache_pages; /**< Leaf pages prepared in the decode cache */
+	uint64_t leaf_decode_fastpath; /**< Decodes that used the 1-byte prefix path */
+} MDB_prefix_metrics;
+
+/** @brief Retrieve prefix-compression metrics for a transaction.
+ *
+ * @param[in] txn Read or write transaction handle.
+ * @param[out] out Destination for collected metrics. Must not be NULL.
+ * @param[in] reset If non-zero, counters are cleared after being copied.
+ * @return 0 on success, or EINVAL if parameters are invalid.
+ */
+int mdb_prefix_metrics(MDB_txn *txn, MDB_prefix_metrics *out, int reset);
+
 	/** @brief Retrieve the element at a given rank in a counted database.
 	 *
 	 * Works with plain and dupsort DBIs opened with #MDB_COUNTED. The

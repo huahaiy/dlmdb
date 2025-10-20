@@ -1482,9 +1482,26 @@ typedef struct MDB_prefix_scratch {
 	size_t		decoded_stride;	/**< bytes reserved per decoded key */
 	unsigned char	*decoded_ready;	/**< bitmap of decoded key slots */
 	unsigned int	decoded_ready_cap; /**< capacity for decoded_ready */
+	uint64_t	*decoded_prefix;	/**< prefix sums for entry contributions */
+	unsigned int	decoded_prefix_cap; /**< capacity for decoded_prefix */
+	unsigned int	decoded_prefix_count; /**< entries populated in decoded_prefix */
 	pgno_t		decoded_pgno;	/**< leaf page number currently cached */
 	txnid_t		decoded_gen;	/**< txnid that generated decoded cache */
+	MDB_prefix_metrics metrics; /**< instrumentation counters for prefix reads */
 } MDB_prefix_scratch;
+
+typedef struct MDB_cursor_leaf_cache {
+	MDB_val		*decoded_vals;		/**< cached decoded keys for this cursor */
+	unsigned int	decoded_vals_cap;	/**< capacity for decoded_vals */
+	unsigned char	*decoded_ready;		/**< bitmap of decoded key slots */
+	unsigned int	decoded_ready_cap;	/**< capacity for decoded_ready */
+	unsigned char	*decoded_buf;		/**< contiguous decoded key storage */
+	size_t		decoded_buf_size;	/**< allocated bytes for decoded_buf */
+	size_t		decoded_stride;		/**< bytes reserved per decoded key */
+	unsigned int	decoded_count;		/**< total keys in cached page */
+	pgno_t		decoded_pgno;		/**< leaf page number currently cached */
+	txnid_t		decoded_gen;		/**< txnid that generated decoded cache */
+} MDB_cursor_leaf_cache;
 
 	/** A database transaction.
 	 *	Every operation requires a transaction handle.
@@ -1638,6 +1655,7 @@ struct MDB_cursor {
 #define C_DEL	0x08			/**< last op was a cursor_del */
 #define C_UNTRACK	0x40		/**< Un-track cursor when closing */
 #define C_WRITEMAP	MDB_TXN_WRITEMAP /**< Copy of txn flag */
+#define C_LEAFCACHE	0x80		/**< Cursor supports leaf decode caching */
 /** Read-only cursor into the txn's original snapshot in the map.
  *	Set for read-only txns, and in #mdb_page_alloc() for #FREE_DBI when
  *	#MDB_DEVEL & 2. Only implements code which is necessary for this.
@@ -1657,6 +1675,7 @@ struct MDB_cursor {
 #endif
 	MDB_val		mc_key;			/**< scratch buffer for decompressed keys */
 	unsigned char	mc_keybuf[MDB_KEYBUF_MAX];
+	MDB_cursor_leaf_cache mc_leaf_cache; /**< cursor-local decoded leaf cache */
 };
 
 	/** Context for sorted-dup records.
@@ -1675,7 +1694,10 @@ typedef struct MDB_xcursor {
 	unsigned char mx_dbflag;
 } MDB_xcursor;
 
-static int mdb_prefix_cache_page(MDB_cursor *mc, MDB_page *mp);
+static void mdb_cursor_leaf_cache_init(MDB_cursor_leaf_cache *cache);
+static void mdb_cursor_leaf_cache_reset(MDB_cursor_leaf_cache *cache);
+static void mdb_cursor_leaf_cache_clear(MDB_cursor_leaf_cache *cache);
+static int mdb_cursor_leaf_cache_prepare(MDB_cursor *mc, MDB_page *mp);
 
 	/** Check if there is an inited xcursor */
 #define XCURSOR_INITED(mc) \
@@ -1706,36 +1728,42 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 	}
 	MDB_node *node = NODEPTR(mp, idx);
 	if (IS_LEAF(mp)) {
-		if (!(mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) || idx == 0) {
+		int prefix_enabled = (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) != 0;
+		MDB_prefix_scratch *scratch = &mc->mc_txn->mt_prefix;
+		if (!prefix_enabled || idx == 0) {
+			if (prefix_enabled && idx == 0)
+				scratch->metrics.leaf_decode_cache_hits++;
 			out->mv_size = node->mn_ksize;
 			out->mv_data = NODEKEY(mp, node);
 			return MDB_SUCCESS;
 		}
-		if (!IS_SUBP(mp) && (mc->mc_txn->mt_flags & MDB_TXN_RDONLY)) {
-			MDB_prefix_scratch *scratch = &mc->mc_txn->mt_prefix;
-			if (scratch->decoded_pgno != mp->mp_pgno ||
-			    scratch->decoded_gen != mc->mc_txn->mt_txnid ||
-			    scratch->decoded_count != NUMKEYS(mp)) {
-				int prc = mdb_prefix_cache_page(mc, mp);
-				if (prc != MDB_SUCCESS)
-					return prc;
-			}
-			if (idx < scratch->decoded_count &&
-			    scratch->decoded_pgno == mp->mp_pgno) {
-				if (!scratch->decoded_ready[idx]) {
-					if (idx == 0) {
-						scratch->decoded_ready[0] = 1;
-					} else {
-						MDB_val *slot = &scratch->decoded_vals[idx];
-						int drc = mdb_leaf_decode_key(&scratch->decoded_vals[0],
-						    NODEKEY(mp, node), node->mn_ksize,
-						    slot, slot->mv_data, scratch->decoded_stride, 0);
-						if (drc != MDB_SUCCESS)
-							return drc;
-						scratch->decoded_ready[idx] = 1;
-					}
+	if (prefix_enabled && !IS_SUBP(mp) &&
+	    (mc->mc_txn->mt_flags & MDB_TXN_RDONLY) &&
+	    (mc->mc_flags & C_LEAFCACHE)) {
+			int prc = mdb_cursor_leaf_cache_prepare(mc, mp);
+			if (prc != MDB_SUCCESS)
+				return prc;
+			MDB_cursor_leaf_cache *cache = &mc->mc_leaf_cache;
+			if (idx < cache->decoded_count &&
+			    cache->decoded_pgno == mp->mp_pgno) {
+				if (!cache->decoded_ready[idx]) {
+					MDB_val *slot = &cache->decoded_vals[idx];
+					const unsigned char *encoded = NODEKEY(mp, node);
+					int fast_path = node->mn_ksize > 0 && (encoded[0] & 0x80) == 0;
+					int drc = mdb_leaf_decode_key(&cache->decoded_vals[0],
+					    NODEKEY(mp, node), node->mn_ksize,
+					    slot, slot->mv_data, cache->decoded_stride, 0);
+					if (drc != MDB_SUCCESS)
+						return drc;
+					cache->decoded_ready[idx] = 1;
+					scratch->metrics.leaf_decode_calls++;
+					scratch->metrics.leaf_decode_cache_misses++;
+					if (fast_path)
+						scratch->metrics.leaf_decode_fastpath++;
+				} else {
+					scratch->metrics.leaf_decode_cache_hits++;
 				}
-				*out = scratch->decoded_vals[idx];
+				*out = cache->decoded_vals[idx];
 				return MDB_SUCCESS;
 			}
 		}
@@ -1745,6 +1773,15 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 		    &mc->mc_key, mc->mc_keybuf, MDB_KEYBUF_MAX, 0);
 		if (rc != MDB_SUCCESS)
 			return rc;
+		if (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) {
+			MDB_prefix_scratch *scratch = &mc->mc_txn->mt_prefix;
+			const unsigned char *encoded = NODEKEY(mp, node);
+			int fast_path = (encoded[0] & 0x80) == 0;
+			scratch->metrics.leaf_decode_calls++;
+			scratch->metrics.leaf_decode_cache_misses++;
+			if (fast_path)
+				scratch->metrics.leaf_decode_fastpath++;
+		}
 		*out = mc->mc_key;
 		return MDB_SUCCESS;
 	}
@@ -1923,12 +1960,58 @@ static int  mdb_node_read(MDB_cursor *mc, MDB_node *leaf, MDB_val *data);
 static size_t	mdb_leaf_size(MDB_env *env, MDB_page *mp, indx_t indx, MDB_val *key, MDB_val *data, int prefix_enabled);
 static size_t	mdb_branch_size(MDB_env *env, MDB_page *mp, MDB_val *key);
 static int mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out);
-static void mdb_prefix_cache_reset(MDB_prefix_scratch *scratch);
-static int mdb_prefix_ensure_decoded_vals(MDB_txn *txn, unsigned int count, MDB_val **out);
-static int mdb_prefix_ensure_ready(MDB_txn *txn, unsigned int count, unsigned char **out);
 static size_t mdb_prefix_maxkey(const MDB_env *env);
-static int mdb_prefix_reserve_decoded_buf(MDB_txn *txn, size_t need, unsigned char **out);
-static int mdb_prefix_cache_page(MDB_cursor *mc, MDB_page *mp);
+static uint64_t mdb_leaf_entry_contribution(const MDB_page *mp, const MDB_node *node);
+static uint64_t mdb_leaf_prefix_contribution(MDB_txn *txn, MDB_page *mp, indx_t limit);
+
+static size_t
+mdb_prefix_leaf_maxdecoded(const MDB_page *mp)
+{
+	if (!IS_LEAF(mp) || IS_LEAF2(mp))
+		return 0;
+
+	unsigned int total = NUMKEYS(mp);
+	if (!total)
+		return 0;
+
+	MDB_node *trunk = NODEPTR(mp, 0);
+	size_t trunk_len = trunk->mn_ksize;
+	size_t max_len = trunk_len;
+
+	for (unsigned int i = 1; i < total; ++i) {
+		MDB_node *node = NODEPTR(mp, i);
+		size_t encoded_len = node->mn_ksize;
+		if (!encoded_len)
+			continue;
+
+		const unsigned char *encoded = NODEKEY(mp, node);
+		size_t used = 0;
+		size_t shared = 0;
+
+		unsigned char first = encoded[0];
+		if ((first & 0x80) == 0) {
+			shared = first;
+			used = 1;
+		} else {
+			uint64_t decoded = 0;
+			int rc = mdb_varint_decode(encoded, encoded_len, &decoded, &used);
+			if (rc != MDB_SUCCESS || decoded > trunk_len)
+				shared = trunk_len;
+			else
+				shared = (size_t)decoded;
+		}
+
+		if (used > encoded_len)
+			used = encoded_len;
+
+		size_t suffix_len = encoded_len - used;
+		size_t full_len = shared + suffix_len;
+		if (full_len > max_len)
+			max_len = full_len;
+	}
+
+	return max_len ? max_len : trunk_len;
+}
 
 typedef struct MDB_prefix_rebuild_entry {
 	MDB_val key;
@@ -1998,63 +2081,135 @@ mdb_prefix_ensure_keybuf(MDB_txn *txn, size_t size, unsigned char **out)
 }
 
 static void
-mdb_prefix_cache_reset(MDB_prefix_scratch *scratch)
+mdb_cursor_leaf_cache_init(MDB_cursor_leaf_cache *cache)
 {
-	if (!scratch)
+	if (!cache)
 		return;
-	scratch->decoded_count = 0;
-	scratch->decoded_stride = 0;
-	scratch->decoded_pgno = P_INVALID;
-	scratch->decoded_gen = 0;
+	cache->decoded_vals = NULL;
+	cache->decoded_vals_cap = 0;
+	cache->decoded_ready = NULL;
+	cache->decoded_ready_cap = 0;
+	cache->decoded_buf = NULL;
+	cache->decoded_buf_size = 0;
+	cache->decoded_stride = 0;
+	cache->decoded_count = 0;
+	cache->decoded_pgno = P_INVALID;
+	cache->decoded_gen = 0;
+}
+
+static void
+mdb_cursor_leaf_cache_reset(MDB_cursor_leaf_cache *cache)
+{
+	if (!cache)
+		return;
+	cache->decoded_count = 0;
+	cache->decoded_stride = 0;
+	cache->decoded_pgno = P_INVALID;
+	cache->decoded_gen = 0;
+}
+
+static void
+mdb_cursor_leaf_cache_clear(MDB_cursor_leaf_cache *cache)
+{
+	if (!cache)
+		return;
+	if (cache->decoded_vals) {
+		free(cache->decoded_vals);
+		cache->decoded_vals = NULL;
+	}
+	if (cache->decoded_ready) {
+		free(cache->decoded_ready);
+		cache->decoded_ready = NULL;
+	}
+	if (cache->decoded_buf) {
+		free(cache->decoded_buf);
+		cache->decoded_buf = NULL;
+	}
+	mdb_cursor_leaf_cache_init(cache);
 }
 
 static int
-mdb_prefix_ensure_decoded_vals(MDB_txn *txn, unsigned int count, MDB_val **out)
+mdb_cursor_leaf_cache_ensure_vals(MDB_cursor_leaf_cache *cache, unsigned int count)
 {
-	MDB_prefix_scratch *scratch = &txn->mt_prefix;
-
-	if (count == 0) {
-		if (out)
-			*out = NULL;
+	if (count == 0)
 		return MDB_SUCCESS;
-	}
-	if (scratch->decoded_vals_cap < count) {
-		unsigned int newcap = scratch->decoded_vals_cap ? scratch->decoded_vals_cap : 16;
+	if (cache->decoded_vals_cap < count) {
+		unsigned int newcap = cache->decoded_vals_cap ? cache->decoded_vals_cap : 16;
 		while (newcap < count)
 			newcap *= 2;
-		MDB_val *vals = realloc(scratch->decoded_vals, sizeof(MDB_val) * newcap);
+		MDB_val *vals = realloc(cache->decoded_vals, sizeof(MDB_val) * newcap);
 		if (!vals)
 			return ENOMEM;
-		scratch->decoded_vals = vals;
-		scratch->decoded_vals_cap = newcap;
+		cache->decoded_vals = vals;
+		cache->decoded_vals_cap = newcap;
 	}
-	if (out)
-		*out = scratch->decoded_vals;
 	return MDB_SUCCESS;
 }
 
 static int
-mdb_prefix_ensure_ready(MDB_txn *txn, unsigned int count, unsigned char **out)
+mdb_cursor_leaf_cache_ensure_ready(MDB_cursor_leaf_cache *cache, unsigned int count)
+{
+	if (count == 0)
+		return MDB_SUCCESS;
+	if (cache->decoded_ready_cap < count) {
+		unsigned int newcap = cache->decoded_ready_cap ? cache->decoded_ready_cap : 16;
+		while (newcap < count)
+			newcap *= 2;
+		unsigned char *bits = realloc(cache->decoded_ready, newcap);
+		if (!bits)
+			return ENOMEM;
+		cache->decoded_ready = bits;
+		cache->decoded_ready_cap = newcap;
+	}
+	return MDB_SUCCESS;
+}
+
+static int
+mdb_cursor_leaf_cache_reserve_buf(MDB_cursor_leaf_cache *cache, size_t need)
+{
+	size_t size = cache->decoded_buf_size;
+
+	if (size < need) {
+		size_t newsize = size ? size : 256;
+		while (newsize < need) {
+			if (newsize > (SIZE_MAX >> 1)) {
+				newsize = need;
+				break;
+			}
+			newsize *= 2;
+		}
+		unsigned char *buf = realloc(cache->decoded_buf, newsize);
+		if (!buf)
+			return ENOMEM;
+		cache->decoded_buf = buf;
+		cache->decoded_buf_size = newsize;
+	}
+	return MDB_SUCCESS;
+}
+
+static int
+mdb_prefix_ensure_prefix(MDB_txn *txn, unsigned int count, uint64_t **out)
 {
 	MDB_prefix_scratch *scratch = &txn->mt_prefix;
 
-	if (count == 0) {
-		if (out)
-			*out = NULL;
-		return MDB_SUCCESS;
-	}
-	if (scratch->decoded_ready_cap < count) {
-		unsigned int newcap = scratch->decoded_ready_cap ? scratch->decoded_ready_cap : 16;
-		while (newcap < count)
-			newcap *= 2;
-		unsigned char *bits = realloc(scratch->decoded_ready, newcap);
-		if (!bits)
+	if (count == 0)
+		count = 1;
+	if (scratch->decoded_prefix_cap < count) {
+		unsigned int newcap = scratch->decoded_prefix_cap ? scratch->decoded_prefix_cap : 16;
+		while (newcap < count) {
+			if (newcap > (UINT_MAX / 2))
+				newcap = count;
+			else
+				newcap *= 2;
+		}
+		uint64_t *vals = realloc(scratch->decoded_prefix, sizeof(uint64_t) * newcap);
+		if (!vals)
 			return ENOMEM;
-		scratch->decoded_ready = bits;
-		scratch->decoded_ready_cap = newcap;
+		scratch->decoded_prefix = vals;
+		scratch->decoded_prefix_cap = newcap;
 	}
 	if (out)
-		*out = scratch->decoded_ready;
+		*out = scratch->decoded_prefix;
 	return MDB_SUCCESS;
 }
 
@@ -2070,83 +2225,92 @@ mdb_prefix_maxkey(const MDB_env *env)
 }
 
 static int
-mdb_prefix_reserve_decoded_buf(MDB_txn *txn, size_t need, unsigned char **out)
-{
-	MDB_prefix_scratch *scratch = &txn->mt_prefix;
-	size_t size = scratch->decoded_buf_size;
-
-	if (size < need) {
-		size_t newsize = size ? size : txn->mt_env->me_psize;
-		if (newsize < 256)
-			newsize = 256;
-		while (newsize < need) {
-			if (newsize > (SIZE_MAX >> 1)) {
-				newsize = need;
-				break;
-			}
-			newsize *= 2;
-		}
-		unsigned char *buf = realloc(scratch->decoded_buf, newsize);
-		if (!buf)
-			return ENOMEM;
-		scratch->decoded_buf = buf;
-		scratch->decoded_buf_size = newsize;
-	}
-	if (out)
-		*out = scratch->decoded_buf;
-	return MDB_SUCCESS;
-}
-
-static int
-mdb_prefix_cache_page(MDB_cursor *mc, MDB_page *mp)
+mdb_cursor_leaf_cache_prepare(MDB_cursor *mc, MDB_page *mp)
 {
 	MDB_txn *txn = mc->mc_txn;
 	MDB_env *env = txn->mt_env;
 	MDB_prefix_scratch *scratch = &txn->mt_prefix;
+	MDB_cursor_leaf_cache *cache = &mc->mc_leaf_cache;
 	unsigned int total = NUMKEYS(mp);
 	int rc;
 
-	mdb_prefix_cache_reset(scratch);
+	if (cache->decoded_pgno == mp->mp_pgno &&
+	    cache->decoded_gen == txn->mt_txnid &&
+	    cache->decoded_count == total)
+		return MDB_SUCCESS;
 
-	rc = mdb_prefix_ensure_decoded_vals(txn, total, NULL);
+	mdb_cursor_leaf_cache_reset(cache);
+
+	rc = mdb_cursor_leaf_cache_ensure_vals(cache, total);
 	if (rc != MDB_SUCCESS)
 		goto fail;
-	rc = mdb_prefix_ensure_ready(txn, total, NULL);
+	rc = mdb_cursor_leaf_cache_ensure_ready(cache, total);
+	if (rc != MDB_SUCCESS)
+		goto fail;
+	rc = mdb_prefix_ensure_prefix(txn, total + 1, NULL);
 	if (rc != MDB_SUCCESS)
 		goto fail;
 
-	size_t stride = total ? mdb_prefix_maxkey(env) : 0;
-	if (stride == 0 && total)
-		stride = env->me_psize; /* fallback */
-	if (stride == 0)
+	size_t stride = 0;
+	if (total)
+		stride = mdb_prefix_leaf_maxdecoded(mp);
+	if (total && !stride)
+		stride = mdb_prefix_maxkey(env);
+	if (!stride)
+		stride = env->me_psize ? env->me_psize : 1;
+	if (!stride)
 		stride = 1;
+	else {
+		size_t limit = mdb_prefix_maxkey(env);
+		if (limit && stride > limit)
+			stride = limit;
+	}
 	size_t need = (size_t)total * stride;
-	rc = mdb_prefix_reserve_decoded_buf(txn, need, NULL);
+	rc = mdb_cursor_leaf_cache_reserve_buf(cache, need);
 	if (rc != MDB_SUCCESS)
 		goto fail;
 
 	for (unsigned int i = 0; i < total; ++i) {
-		scratch->decoded_vals[i].mv_data = scratch->decoded_buf + (size_t)i * stride;
-		scratch->decoded_vals[i].mv_size = 0;
+		cache->decoded_vals[i].mv_data = cache->decoded_buf + (size_t)i * stride;
+		cache->decoded_vals[i].mv_size = 0;
 	}
 	if (total > 0)
-		memset(scratch->decoded_ready, 0, total);
+		memset(cache->decoded_ready, 0, total);
 
 	if (total > 0) {
 		MDB_node *trunk = NODEPTR(mp, 0);
-		scratch->decoded_vals[0].mv_size = trunk->mn_ksize;
-		memcpy(scratch->decoded_vals[0].mv_data, NODEKEY(mp, trunk), trunk->mn_ksize);
-		scratch->decoded_ready[0] = 1;
+		cache->decoded_vals[0].mv_size = trunk->mn_ksize;
+		memcpy(cache->decoded_vals[0].mv_data, NODEKEY(mp, trunk), trunk->mn_ksize);
+		cache->decoded_ready[0] = 1;
 	}
 
-	scratch->decoded_pgno = mp->mp_pgno;
-	scratch->decoded_gen = txn->mt_txnid;
-	scratch->decoded_count = total;
-	scratch->decoded_stride = stride;
+	if (scratch->decoded_prefix && scratch->decoded_prefix_cap) {
+		scratch->decoded_prefix[0] = 0;
+		scratch->decoded_prefix_count = 1;
+	} else {
+		scratch->decoded_prefix_count = 0;
+	}
+
+	cache->decoded_pgno = mp->mp_pgno;
+	cache->decoded_gen = txn->mt_txnid;
+	cache->decoded_count = total;
+	cache->decoded_stride = stride;
+
+	scratch->decoded_pgno = cache->decoded_pgno;
+	scratch->decoded_gen = cache->decoded_gen;
+	scratch->decoded_count = cache->decoded_count;
+	scratch->decoded_stride = cache->decoded_stride;
+	if (total > 0)
+		scratch->metrics.leaf_cache_pages++;
 	return MDB_SUCCESS;
 
 fail:
-	mdb_prefix_cache_reset(scratch);
+	mdb_cursor_leaf_cache_reset(cache);
+	scratch->decoded_pgno = P_INVALID;
+	scratch->decoded_gen = 0;
+	scratch->decoded_count = 0;
+	scratch->decoded_stride = 0;
+	scratch->decoded_prefix_count = 0;
 	return rc;
 }
 
@@ -2179,6 +2343,10 @@ mdb_prefix_scratch_clear(MDB_prefix_scratch *scratch)
 		free(scratch->decoded_ready);
 		scratch->decoded_ready = NULL;
 	}
+	if (scratch->decoded_prefix) {
+		free(scratch->decoded_prefix);
+		scratch->decoded_prefix = NULL;
+	}
 	scratch->snapshot_size = 0;
 	scratch->entries_cap = 0;
 	scratch->keybuf_size = 0;
@@ -2187,8 +2355,11 @@ mdb_prefix_scratch_clear(MDB_prefix_scratch *scratch)
 	scratch->decoded_buf_size = 0;
 	scratch->decoded_stride = 0;
 	scratch->decoded_ready_cap = 0;
+	scratch->decoded_prefix_cap = 0;
+	scratch->decoded_prefix_count = 0;
 	scratch->decoded_pgno = P_INVALID;
 	scratch->decoded_gen = 0;
+	memset(&scratch->metrics, 0, sizeof(scratch->metrics));
 }
 
 static int mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp, const MDB_val *old_trunk);
@@ -2490,7 +2661,7 @@ mdb_leaf_entry_contribution(const MDB_page *mp, const MDB_node *node)
 }
 
 static uint64_t
-mdb_leaf_prefix_contribution(const MDB_page *mp, indx_t limit)
+mdb_leaf_prefix_contribution(MDB_txn *txn, MDB_page *mp, indx_t limit)
 {
 	if (!IS_LEAF(mp) && !IS_LEAF2(mp))
 		return 0;
@@ -2499,6 +2670,27 @@ mdb_leaf_prefix_contribution(const MDB_page *mp, indx_t limit)
 		limit = count;
 	if (IS_LEAF2(mp))
 		return limit;
+	if (txn && (txn->mt_flags & MDB_TXN_RDONLY)) {
+		MDB_prefix_scratch *scratch = &txn->mt_prefix;
+		if (scratch->decoded_prefix &&
+		    scratch->decoded_prefix_cap >= (unsigned int)(count + 1) &&
+		    scratch->decoded_pgno == mp->mp_pgno &&
+		    scratch->decoded_gen == txn->mt_txnid &&
+		    scratch->decoded_count == count &&
+		    scratch->decoded_prefix_count > 0) {
+			unsigned int filled = scratch->decoded_prefix_count;
+			if ((unsigned int)limit < filled)
+				return scratch->decoded_prefix[limit];
+			uint64_t running = scratch->decoded_prefix[filled - 1];
+			for (unsigned int i = filled - 1; i < (unsigned int)limit; ++i) {
+				MDB_node *node = NODEPTR(mp, i);
+				running += mdb_leaf_entry_contribution(mp, node);
+				scratch->decoded_prefix[i + 1] = running;
+			}
+			scratch->decoded_prefix_count = (unsigned int)limit + 1;
+			return scratch->decoded_prefix[limit];
+		}
+	}
 	uint64_t total = 0;
 	for (indx_t i = 0; i < limit; ++i) {
 		MDB_node *node = NODEPTR(mp, i);
@@ -2661,8 +2853,8 @@ static int
 mdb_prefix_count(MDB_txn *txn, MDB_dbi dbi, const MDB_val *key,
 	int inclusive, uint64_t *out)
 {
-	MDB_cursor mc;
-	int rc;
+	MDB_cursor mc = {0};
+	int rc = MDB_SUCCESS;
 	uint64_t total = 0;
 	MDB_val search;
 	MDB_cmp_func *cmp;
@@ -2677,10 +2869,11 @@ mdb_prefix_count(MDB_txn *txn, MDB_dbi dbi, const MDB_val *key,
 	rc = mdb_cursor_set(&mc, &search, NULL, MDB_SET_RANGE, NULL);
 	if (rc == MDB_NOTFOUND) {
 		*out = txn->mt_dbs[dbi].md_entries;
-		return MDB_SUCCESS;
+		rc = MDB_SUCCESS;
+		goto done;
 	}
 	if (rc != MDB_SUCCESS)
-		return rc;
+		goto done;
 	cmp = txn->mt_dbxs[dbi].md_cmp;
 	int exact = (cmp((MDB_val *)key, &search) == 0);
 
@@ -2696,14 +2889,18 @@ mdb_prefix_count(MDB_txn *txn, MDB_dbi dbi, const MDB_val *key,
 
 	MDB_page *leaf = mc.mc_pg[mc.mc_top];
 	indx_t idx = mc.mc_ki[mc.mc_top];
-	total += mdb_leaf_prefix_contribution(leaf, idx);
+	total += mdb_leaf_prefix_contribution(txn, leaf, idx);
 	if (inclusive && exact && idx < NUMKEYS(leaf)) {
 		MDB_node *node = NODEPTR(leaf, idx);
 		total += mdb_leaf_entry_contribution(leaf, node);
 	}
 
 	*out = total;
-	return MDB_SUCCESS;
+	rc = MDB_SUCCESS;
+
+done:
+	mdb_cursor_leaf_cache_clear(&mc.mc_leaf_cache);
+	return rc;
 }
 
 static int
@@ -2724,8 +2921,9 @@ mdb_dup_prefix_count_internal(const MDB_cursor *base, MDB_cursor *cur,
 	rc = mdb_cursor_set(cur, &search, &data, MDB_SET_RANGE, &exact);
 	if (rc == MDB_NOTFOUND) {
 		uint64_t entries = base->mc_db ? (uint64_t)base->mc_db->md_entries : 0;
-		MDB_cursor edge;
+		MDB_cursor edge = (MDB_cursor){0};
 		MDB_val edge_key = {0}, edge_data = {0};
+		int edge_rc = MDB_SUCCESS;
 
 		mdb_cursor_copy(base, &edge);
 		edge.mc_xcursor = NULL;
@@ -2734,7 +2932,9 @@ mdb_dup_prefix_count_internal(const MDB_cursor *base, MDB_cursor *cur,
 			int cmp_first = cmp(&edge_key, (MDB_val *)value);
 			if (cmp_first > 0 || (cmp_first == 0 && !inclusive)) {
 				*out = 0;
-				return MDB_SUCCESS;
+				edge_rc = MDB_SUCCESS;
+				mdb_cursor_leaf_cache_clear(&edge.mc_leaf_cache);
+				return edge_rc;
 			}
 		}
 
@@ -2745,12 +2945,15 @@ mdb_dup_prefix_count_internal(const MDB_cursor *base, MDB_cursor *cur,
 			int cmp_last = cmp(&edge_key, (MDB_val *)value);
 			if (cmp_last < 0 || (cmp_last == 0 && inclusive)) {
 				*out = entries;
-				return MDB_SUCCESS;
+				edge_rc = MDB_SUCCESS;
+				mdb_cursor_leaf_cache_clear(&edge.mc_leaf_cache);
+				return edge_rc;
 			}
 		}
 
 		*out = entries;
-		return MDB_SUCCESS;
+		mdb_cursor_leaf_cache_clear(&edge.mc_leaf_cache);
+		return edge_rc;
 	}
 	if (rc != MDB_SUCCESS)
 		return rc;
@@ -2775,7 +2978,7 @@ mdb_dup_prefix_count_internal(const MDB_cursor *base, MDB_cursor *cur,
 
 	MDB_page *leaf = cur->mc_pg[cur->mc_top];
 	indx_t leaf_idx = cur->mc_ki[cur->mc_top];
-	total += mdb_leaf_prefix_contribution(leaf, leaf_idx);
+	total += mdb_leaf_prefix_contribution(cur->mc_txn, leaf, leaf_idx);
 	if (inclusive && exact && leaf_idx < NUMKEYS(leaf)) {
 		MDB_node *node = NODEPTR(leaf, leaf_idx);
 		total += mdb_leaf_entry_contribution(leaf, node);
@@ -2791,12 +2994,12 @@ mdb_prefix_pair_leq(MDB_txn *txn, MDB_dbi dbi,
 	const MDB_val *value, int value_inclusive,
 	uint64_t *out)
 {
-	MDB_db *db = &txn->mt_dbs[dbi];
-	MDB_cursor mc;
-	MDB_xcursor mx;
-	MDB_val search, data = {0};
-	uint64_t total = 0;
-	int rc, exact = 0;
+    MDB_db *db = &txn->mt_dbs[dbi];
+    MDB_cursor mc = {0};
+    MDB_xcursor mx = {0};
+    MDB_val search, data = {0};
+    uint64_t total = 0;
+    int rc = MDB_SUCCESS, exact = 0;
 	MDB_cmp_func *kcmp = txn->mt_dbxs[dbi].md_cmp;
 	MDB_cmp_func *dcmp = txn->mt_dbxs[dbi].md_dcmp ?
 	    txn->mt_dbxs[dbi].md_dcmp : kcmp;
@@ -2813,10 +3016,11 @@ mdb_prefix_pair_leq(MDB_txn *txn, MDB_dbi dbi,
 	rc = mdb_cursor_set(&mc, &search, &data, MDB_SET_RANGE, &exact);
 	if (rc == MDB_NOTFOUND) {
 		*out = db->md_entries;
-		return MDB_SUCCESS;
+		rc = MDB_SUCCESS;
+		goto done;
 	}
 	if (rc != MDB_SUCCESS)
-		return rc;
+		goto done;
 
 	for (int level = 0; level < mc.mc_top; ++level) {
 		MDB_page *branch = mc.mc_pg[level];
@@ -2836,40 +3040,45 @@ mdb_prefix_pair_leq(MDB_txn *txn, MDB_dbi dbi,
 
 	MDB_page *leaf = mc.mc_pg[mc.mc_top];
 	indx_t idx = mc.mc_ki[mc.mc_top];
-	total += mdb_leaf_prefix_contribution(leaf, idx);
+	total += mdb_leaf_prefix_contribution(txn, leaf, idx);
 
 	if (key_inclusive && exact && idx < NUMKEYS(leaf)) {
-		if (IS_LEAF2(leaf))
-			return MDB_CORRUPTED;
+		if (IS_LEAF2(leaf)) {
+			rc = MDB_CORRUPTED;
+			goto done;
+		}
 		MDB_node *node = NODEPTR(leaf, idx);
 		if (node->mn_flags & F_DUPDATA) {
-			if (!mc.mc_xcursor)
-				return MDB_INCOMPATIBLE;
+			if (!mc.mc_xcursor) {
+				rc = MDB_INCOMPATIBLE;
+				goto done;
+			}
 			if (!(mc.mc_xcursor->mx_cursor.mc_flags & C_INITIALIZED))
 				mdb_xcursor_init1(&mc, node);
 			uint64_t dup_total = 0;
 			if (!value) {
 				dup_total = mc.mc_xcursor->mx_db.md_entries;
 			} else {
-			MDB_cursor dupcur = {0};
-			MDB_cmp_func *dup_cmp = mc.mc_xcursor->mx_cursor.mc_dbx &&
-			    mc.mc_xcursor->mx_cursor.mc_dbx->md_cmp ?
-			    mc.mc_xcursor->mx_cursor.mc_dbx->md_cmp : dcmp;
+				MDB_cursor dupcur = {0};
+				MDB_cmp_func *dup_cmp = mc.mc_xcursor->mx_cursor.mc_dbx &&
+				    mc.mc_xcursor->mx_cursor.mc_dbx->md_cmp ?
+				    mc.mc_xcursor->mx_cursor.mc_dbx->md_cmp : dcmp;
 				mdb_cursor_copy(&mc.mc_xcursor->mx_cursor, &dupcur);
 				dupcur.mc_xcursor = NULL;
 				dupcur.mc_dbflag = mc.mc_xcursor->mx_cursor.mc_dbflag;
 				rc = mdb_dup_prefix_count_internal(
 				    &mc.mc_xcursor->mx_cursor, &dupcur,
 				    dup_cmp, value, value_inclusive, &dup_total);
+				mdb_cursor_leaf_cache_clear(&dupcur.mc_leaf_cache);
 				if (rc != MDB_SUCCESS)
-					return rc;
+					goto done;
 			}
 			total += dup_total;
 		} else {
 			MDB_val datum;
 			rc = mdb_node_read(&mc, node, &datum);
 			if (rc != MDB_SUCCESS)
-				return rc;
+				goto done;
 			int cmp = value ? dcmp(&datum, (MDB_val *)value) : 0;
 			if (!value) {
 				total += 1;
@@ -2879,7 +3088,11 @@ mdb_prefix_pair_leq(MDB_txn *txn, MDB_dbi dbi,
 		}
 	}
 	*out = total;
-	return MDB_SUCCESS;
+	rc = MDB_SUCCESS;
+
+done:
+	mdb_cursor_leaf_cache_clear(&mc.mc_leaf_cache);
+	return rc;
 }
 
 /** @cond */
@@ -3179,7 +3392,7 @@ mdb_cursor_chk(MDB_cursor *mc)
  */
 static void mdb_audit(MDB_txn *txn)
 {
-	MDB_cursor mc;
+	MDB_cursor mc = (MDB_cursor){0};
 	MDB_val key, data;
 	MDB_ID freecount, count;
 	MDB_dbi i;
@@ -3193,7 +3406,7 @@ static void mdb_audit(MDB_txn *txn)
 
 	count = 0;
 	for (i = 0; i<txn->mt_numdbs; i++) {
-		MDB_xcursor mx;
+		MDB_xcursor mx = (MDB_xcursor){0};
 		if (!(txn->mt_dbflags[i] & DB_VALID))
 			continue;
 		mdb_cursor_init(&mc, txn, i, &mx);
@@ -3226,6 +3439,7 @@ static void mdb_audit(MDB_txn *txn)
 			txn->mt_txnid, freecount, count+NUM_METAS,
 			freecount+count+NUM_METAS, txn->mt_next_pgno);
 	}
+	mdb_cursor_leaf_cache_clear(&mc.mc_leaf_cache);
 }
 #endif
 
@@ -3356,6 +3570,7 @@ mdb_cursor_unref(MDB_cursor *mc)
 	}
 	mc->mc_snum = mc->mc_top = 0;
 	mc->mc_pg[0] = NULL;
+	mdb_cursor_leaf_cache_reset(&mc->mc_leaf_cache);
 	mc->mc_flags &= ~C_INITIALIZED;
 }
 #define MDB_CURSOR_UNREF(mc, force) \
@@ -3701,18 +3916,20 @@ mdb_page_alloc(MDB_cursor *mc, int num, MDB_page **mp)
 	MDB_page *np;
 	txnid_t oldest = 0, last;
 	MDB_cursor_op op;
-	MDB_cursor m2;
-	int found_old = 0;
+    MDB_cursor m2 = (MDB_cursor){0};
+    int found_old = 0;
+
+    rc = MDB_SUCCESS;
 
 	/* If there are any loose pages, just use them */
-	if (num == 1 && txn->mt_loose_pgs) {
-		np = txn->mt_loose_pgs;
-		txn->mt_loose_pgs = NEXT_LOOSE_PAGE(np);
-		txn->mt_loose_count--;
-		DPRINTF(("db %d use loose page %"Yu, DDBI(mc), np->mp_pgno));
-		*mp = np;
-		return MDB_SUCCESS;
-	}
+    if (num == 1 && txn->mt_loose_pgs) {
+        np = txn->mt_loose_pgs;
+        txn->mt_loose_pgs = NEXT_LOOSE_PAGE(np);
+        txn->mt_loose_count--;
+        DPRINTF(("db %d use loose page %"Yu, DDBI(mc), np->mp_pgno));
+        *mp = np;
+        goto done;
+    }
 
 	*mp = NULL;
 
@@ -3861,15 +4078,17 @@ search_done:
 	} else {
 		txn->mt_next_pgno = pgno + num;
 	}
-	np->mp_pgno = pgno;
-	mdb_page_dirty(txn, np);
-	*mp = np;
-
-	return MDB_SUCCESS;
+    np->mp_pgno = pgno;
+    mdb_page_dirty(txn, np);
+    *mp = np;
+    rc = MDB_SUCCESS;
+    goto done;
 
 fail:
-	txn->mt_flags |= MDB_TXN_ERROR;
-	return rc;
+    txn->mt_flags |= MDB_TXN_ERROR;
+done:
+    mdb_cursor_leaf_cache_clear(&m2.mc_leaf_cache);
+    return rc;
 }
 
 /** Copy the used portions of a non-overflow page.
@@ -4704,7 +4923,7 @@ mdb_freelist_save(MDB_txn *txn)
 	 * env->me_pglast and txn->mt_free_pgs[] can only grow.
 	 * Page numbers cannot disappear from txn->mt_free_pgs[].
 	 */
-	MDB_cursor mc;
+	MDB_cursor mc = (MDB_cursor){0};
 	MDB_env	*env = txn->mt_env;
 	int rc, maxfree_1pg = env->me_maxfree_1pg, more = 1;
 	txnid_t	pglast = 0, head_id = 0;
@@ -5335,8 +5554,8 @@ _mdb_txn_commit(MDB_txn *txn)
 	    txn->mt_txnid, (void*)txn, (void*)env, txn->mt_dbs[MAIN_DBI].md_root));
 
 	/* Update DB root pointers */
-	if (txn->mt_numdbs > CORE_DBS) {
-		MDB_cursor mc;
+		if (txn->mt_numdbs > CORE_DBS) {
+			MDB_cursor mc = (MDB_cursor){0};
 		MDB_dbi i;
 		MDB_val data;
 		data.mv_size = sizeof(MDB_db);
@@ -7874,7 +8093,7 @@ mdb_page_search(MDB_cursor *mc, MDB_val *key, int flags)
 	} else {
 		/* Make sure we're using an up-to-date root */
 		if (*mc->mc_dbflag & DB_STALE) {
-				MDB_cursor mc2;
+					MDB_cursor mc2 = (MDB_cursor){0};
 				if (TXN_DBI_CHANGED(mc->mc_txn, mc->mc_dbi))
 					return MDB_BAD_DBI;
 				mdb_cursor_init(&mc2, mc->mc_txn, MAIN_DBI, NULL);
@@ -8068,8 +8287,8 @@ int
 mdb_get(MDB_txn *txn, MDB_dbi dbi,
     MDB_val *key, MDB_val *data)
 {
-	MDB_cursor	mc;
-	MDB_xcursor	mx;
+MDB_cursor	mc = (MDB_cursor){0};
+MDB_xcursor	mx = (MDB_xcursor){0};
 	int exact = 0, rc;
 	DKBUF;
 
@@ -8087,6 +8306,7 @@ mdb_get(MDB_txn *txn, MDB_dbi dbi,
 	 * before doing anything else
 	 */
 	MDB_CURSOR_UNREF(&mc, 1);
+	mdb_cursor_leaf_cache_clear(&mc.mc_leaf_cache);
 	return rc;
 }
 
@@ -8861,8 +9081,8 @@ mdb_cursor_touch(MDB_cursor *mc)
 
 	if (mc->mc_dbi >= CORE_DBS && !(*mc->mc_dbflag & (DB_DIRTY|DB_DUPDATA))) {
 		/* Touch DB record of named DB */
-		MDB_cursor mc2;
-		MDB_xcursor mcx;
+            MDB_cursor mc2 = (MDB_cursor){0};
+            MDB_xcursor mcx = (MDB_xcursor){0};
 		if (TXN_DBI_CHANGED(mc->mc_txn, mc->mc_dbi))
 			return MDB_BAD_DBI;
 		mdb_cursor_init(&mc2, mc->mc_txn, MAIN_DBI, &mcx);
@@ -10019,8 +10239,10 @@ mdb_xcursor_init0(MDB_cursor *mc)
 	mx->mx_cursor.mc_dbflag = &mx->mx_dbflag;
 	mx->mx_cursor.mc_snum = 0;
 	mx->mx_cursor.mc_top = 0;
+	mdb_cursor_leaf_cache_reset(&mx->mx_cursor.mc_leaf_cache);
 	MC_SET_OVPG(&mx->mx_cursor, NULL);
 	mx->mx_cursor.mc_flags = C_SUB | (mc->mc_flags & (C_ORIG_RDONLY|C_WRITEMAP));
+	mx->mx_cursor.mc_flags |= C_LEAFCACHE;
 	mx->mx_dbx.md_name.mv_size = 0;
 	mx->mx_dbx.md_name.mv_data = NULL;
 	mx->mx_dbx.md_cmp = mc->mc_dbx->md_dcmp;
@@ -10039,7 +10261,8 @@ mdb_xcursor_init1(MDB_cursor *mc, MDB_node *node)
 {
 	MDB_xcursor *mx = mc->mc_xcursor;
 
-	mx->mx_cursor.mc_flags &= C_SUB|C_ORIG_RDONLY|C_WRITEMAP;
+	mdb_cursor_leaf_cache_reset(&mx->mx_cursor.mc_leaf_cache);
+	mx->mx_cursor.mc_flags &= C_SUB|C_ORIG_RDONLY|C_WRITEMAP|C_LEAFCACHE;
 	if (node->mn_flags & F_SUBDATA) {
 		memcpy(&mx->mx_db, NODEDATA(node), sizeof(MDB_db));
 		mx->mx_cursor.mc_pg[0] = 0;
@@ -10094,6 +10317,7 @@ mdb_xcursor_init2(MDB_cursor *mc, MDB_xcursor *src_mx, int new_dupdata)
 {
 	MDB_xcursor *mx = mc->mc_xcursor;
 
+	mdb_cursor_leaf_cache_reset(&mx->mx_cursor.mc_leaf_cache);
 	if (new_dupdata) {
 		mx->mx_cursor.mc_snum = 1;
 		mx->mx_cursor.mc_top = 0;
@@ -10116,6 +10340,7 @@ mdb_xcursor_init2(MDB_cursor *mc, MDB_xcursor *src_mx, int new_dupdata)
 static void
 mdb_cursor_init(MDB_cursor *mc, MDB_txn *txn, MDB_dbi dbi, MDB_xcursor *mx)
 {
+	unsigned int keep = mc->mc_flags & C_LEAFCACHE;
 	mc->mc_next = NULL;
 	mc->mc_backup = NULL;
 	mc->mc_dbi = dbi;
@@ -10128,9 +10353,10 @@ mdb_cursor_init(MDB_cursor *mc, MDB_txn *txn, MDB_dbi dbi, MDB_xcursor *mx)
 	mc->mc_pg[0] = 0;
 	mc->mc_ki[0] = 0;
 	MC_SET_OVPG(mc, NULL);
-	mc->mc_flags = txn->mt_flags & (C_ORIG_RDONLY|C_WRITEMAP);
+	mc->mc_flags = (txn->mt_flags & (C_ORIG_RDONLY|C_WRITEMAP)) | keep;
 	mc->mc_key.mv_data = mc->mc_keybuf;
 	mc->mc_key.mv_size = 0;
+	mdb_cursor_leaf_cache_reset(&mc->mc_leaf_cache);
 	if (txn->mt_dbs[dbi].md_flags & MDB_DUPSORT) {
 		mdb_tassert(txn, mx != NULL);
 		mc->mc_xcursor = mx;
@@ -10161,8 +10387,9 @@ mdb_cursor_open(MDB_txn *txn, MDB_dbi dbi, MDB_cursor **ret)
 	if (txn->mt_dbs[dbi].md_flags & MDB_DUPSORT)
 		size += sizeof(MDB_xcursor);
 
-	if ((mc = malloc(size)) != NULL) {
+	if ((mc = calloc(1, size)) != NULL) {
 		mdb_cursor_init(mc, txn, dbi, (MDB_xcursor *)(mc + 1));
+		mc->mc_flags |= C_LEAFCACHE;
 		if (txn->mt_cursors) {
 			mc->mc_next = txn->mt_cursors[dbi];
 			txn->mt_cursors[dbi] = mc;
@@ -10251,6 +10478,7 @@ mdb_cursor_close(MDB_cursor *mc)
 			if (*prev == mc)
 				*prev = mc->mc_next;
 		}
+		mdb_cursor_leaf_cache_clear(&mc->mc_leaf_cache);
 		free(mc);
 	}
 }
@@ -10370,7 +10598,7 @@ mdb_node_move(MDB_cursor *csrc, MDB_cursor *cdst, int fromleft)
 	MDB_node		*srcnode;
 	MDB_val		 key, data;
 	pgno_t	srcpg;
-	MDB_cursor mn;
+	MDB_cursor mn = (MDB_cursor){0};
 	int			 rc;
 	unsigned short flags;
 	MDB_page	*psrc;
@@ -10726,7 +10954,7 @@ mdb_page_merge(MDB_cursor *csrc, MDB_cursor *cdst)
 		for (i = 0; i < NUMKEYS(psrc); i++, j++) {
 			srcnode = NODEPTR(psrc, i);
 			if (i == 0 && IS_BRANCH(psrc)) {
-				MDB_cursor mn;
+					MDB_cursor mn = (MDB_cursor){0};
 				MDB_node *s2;
 				mdb_cursor_copy(csrc, &mn);
 				mn.mc_xcursor = NULL;
@@ -10885,6 +11113,7 @@ mdb_cursor_copy(const MDB_cursor *csrc, MDB_cursor *cdst)
 	cdst->mc_flags = csrc->mc_flags;
 	cdst->mc_key.mv_data = cdst->mc_keybuf;
 	cdst->mc_key.mv_size = 0;
+	mdb_cursor_leaf_cache_reset(&cdst->mc_leaf_cache);
 	if (csrc->mc_key.mv_size && csrc->mc_key.mv_size <= MDB_KEYBUF_MAX) {
 		memcpy(cdst->mc_keybuf, csrc->mc_keybuf, csrc->mc_key.mv_size);
 		cdst->mc_key.mv_size = csrc->mc_key.mv_size;
@@ -11270,8 +11499,8 @@ static int
 mdb_del0(MDB_txn *txn, MDB_dbi dbi,
 	MDB_val *key, MDB_val *data, unsigned flags)
 {
-	MDB_cursor mc;
-	MDB_xcursor mx;
+MDB_cursor mc = (MDB_cursor){0};
+MDB_xcursor mx = (MDB_xcursor){0};
 	MDB_cursor_op op;
 	MDB_val rdata, *xdata;
 	int		 rc, exact = 0;
@@ -11305,6 +11534,7 @@ mdb_del0(MDB_txn *txn, MDB_dbi dbi,
 		rc = _mdb_cursor_del(&mc, flags);
 		txn->mt_cursors[dbi] = mc.mc_next;
 	}
+	mdb_cursor_leaf_cache_clear(&mc.mc_leaf_cache);
 	return rc;
 }
 
@@ -11844,8 +12074,8 @@ int
 mdb_put(MDB_txn *txn, MDB_dbi dbi,
     MDB_val *key, MDB_val *data, unsigned int flags)
 {
-	MDB_cursor mc;
-	MDB_xcursor mx;
+MDB_cursor mc = (MDB_cursor){0};
+MDB_xcursor mx = (MDB_xcursor){0};
 	int rc;
 	DKBUF;
 	DDBUF;
@@ -11866,6 +12096,7 @@ mdb_put(MDB_txn *txn, MDB_dbi dbi,
 	txn->mt_cursors[dbi] = &mc;
 	rc = _mdb_cursor_put(&mc, key, data, flags);
 	txn->mt_cursors[dbi] = mc.mc_next;
+	mdb_cursor_leaf_cache_clear(&mc.mc_leaf_cache);
 	return rc;
 }
 
@@ -12232,7 +12463,7 @@ mdb_env_copyfd1(MDB_env *env, HANDLE fd)
 		 * to find the new last_pg, which also becomes the new root.
 		 */
 		MDB_ID freecount = 0;
-		MDB_cursor mc;
+			MDB_cursor mc = (MDB_cursor){0};
 		MDB_val key, data;
 		mdb_cursor_init(&mc, txn, FREE_DBI, NULL);
 		while ((rc = mdb_cursor_get(&mc, &key, &data, MDB_NEXT)) == 0)
@@ -12572,7 +12803,7 @@ int mdb_dbi_open(MDB_txn *txn, const char *name, unsigned int flags, MDB_dbi *db
 {
 	MDB_val key, data;
 	MDB_dbi i;
-	MDB_cursor mc;
+	MDB_cursor mc = (MDB_cursor){0};
 	MDB_db dummy;
 	int rc, dbflag, exact;
 	unsigned int unused = 0, seq;
@@ -12698,7 +12929,7 @@ mdb_count_all(MDB_txn *txn, MDB_dbi dbi, unsigned flags, uint64_t *out)
 
 	MDB_db *db = &txn->mt_dbs[dbi];
 	unsigned char *dbflag = &txn->mt_dbflags[dbi];
-	MDB_xcursor mx, *mxp = NULL;
+    MDB_xcursor mx = (MDB_xcursor){0}, *mxp = NULL;
 
 	if (!(db->md_flags & MDB_COUNTED))
 		return MDB_INCOMPATIBLE;
@@ -12706,8 +12937,8 @@ mdb_count_all(MDB_txn *txn, MDB_dbi dbi, unsigned flags, uint64_t *out)
 		memset(&mx, 0, sizeof(mx));
 		mxp = &mx;
 	}
-	if (*dbflag & DB_STALE) {
-		MDB_cursor mc;
+		if (*dbflag & DB_STALE) {
+			MDB_cursor mc = (MDB_cursor){0};
 		mdb_cursor_init(&mc, txn, dbi, mxp);
 		/* Refresh pointer after cursor init updates metadata. */
 		db = &txn->mt_dbs[dbi];
@@ -12841,6 +13072,18 @@ mdb_range_count_values(MDB_txn *txn, MDB_dbi dbi,
 	}
 
 	*out = (upper >= lower) ? (upper - lower) : 0;
+	return MDB_SUCCESS;
+}
+
+int ESECT
+mdb_prefix_metrics(MDB_txn *txn, MDB_prefix_metrics *out, int reset)
+{
+	if (!txn || !out)
+		return EINVAL;
+	MDB_prefix_scratch *scratch = &txn->mt_prefix;
+	*out = scratch->metrics;
+	if (reset)
+		memset(&scratch->metrics, 0, sizeof(scratch->metrics));
 	return MDB_SUCCESS;
 }
 
@@ -12987,8 +13230,8 @@ int ESECT
 mdb_get_rank(MDB_txn *txn, MDB_dbi dbi, uint64_t rank,
 	MDB_val *key, MDB_val *data)
 {
-	MDB_cursor mc;
-	MDB_xcursor mx;
+MDB_cursor mc = (MDB_cursor){0};
+MDB_xcursor mx = (MDB_xcursor){0};
 	int rc;
 
 	if (!TXN_DBI_EXIST(txn, dbi, DB_USRVALID))
@@ -13015,9 +13258,9 @@ mdb_stat(MDB_txn *txn, MDB_dbi dbi, MDB_stat *arg)
 	if (txn->mt_flags & MDB_TXN_BLOCKED)
 		return MDB_BAD_TXN;
 
-	if (txn->mt_dbflags[dbi] & DB_STALE) {
-		MDB_cursor mc;
-		MDB_xcursor mx;
+		if (txn->mt_dbflags[dbi] & DB_STALE) {
+			MDB_cursor mc = (MDB_cursor){0};
+			MDB_xcursor mx = (MDB_xcursor){0};
 		/* Stale, must read the DB's root. cursor_init does it for us. */
 		mdb_cursor_init(&mc, txn, dbi, &mx);
 	}
@@ -13064,7 +13307,7 @@ mdb_drop0(MDB_cursor *mc, int subs)
 	if (rc == MDB_SUCCESS) {
 		MDB_txn *txn = mc->mc_txn;
 		MDB_node *ni;
-		MDB_cursor mx;
+			MDB_cursor mx = (MDB_cursor){0};
 		unsigned int i;
 
 		/* DUPSORT sub-DBs have no ovpages/DBs. Omit scanning leaves.

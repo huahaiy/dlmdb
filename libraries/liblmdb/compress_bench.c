@@ -40,6 +40,8 @@ typedef struct {
 	size_t update_ops;
 	size_t delete_ops;
 	bool include_prefix;
+	size_t scan_ops;
+	size_t scan_span;
 } bench_config;
 
 struct variant_spec {
@@ -64,6 +66,10 @@ typedef struct {
 	bench_timing read_warm;
 	bench_timing scan_cold;
 	bench_timing scan_warm;
+	MDB_prefix_metrics prefix_read_cold;
+	MDB_prefix_metrics prefix_read_warm;
+	MDB_prefix_metrics prefix_scan_cold;
+	MDB_prefix_metrics prefix_scan_warm;
 	size_t value_size;
 	size_t prefix_len;
 	uint64_t entries;
@@ -120,9 +126,9 @@ static void bench_do_reinserts(const bench_config *cfg, MDB_env *env,
 static void bench_do_repack(const bench_config *cfg,
     const bench_variant *variant, MDB_env *env, bench_metrics *m);
 static void bench_do_reads(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
-    const size_t *read_order, bench_timing *timing);
+    const size_t *read_order, bench_timing *timing, MDB_prefix_metrics *pm);
 static void bench_do_scan(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
-    bench_timing *timing);
+    bench_timing *timing, MDB_prefix_metrics *pm);
 static void bench_collect_stats(const bench_config *cfg, const bench_variant *v,
     MDB_env *env, MDB_dbi dbi, bench_metrics *m);
 static const char *format_bytes(double bytes, char *buf, size_t bufsize);
@@ -130,6 +136,9 @@ static double safe_ratio(double baseline, double test);
 static void print_metrics(const bench_variant *variant);
 static void print_comparison(const bench_variant *baseline,
     const bench_variant *test);
+static bool prefix_metrics_has_data(const MDB_prefix_metrics *pm);
+static void print_prefix_metrics_line(const char *label,
+    const MDB_prefix_metrics *pm);
 
 static const char *g_current_variant = NULL;
 
@@ -143,15 +152,17 @@ main(int argc, char **argv)
 		.prefix_len = 16,
 		.mapsize_bytes = (size_t)1 << 31, /* 2 GiB */
 		.seed = 1,
-		.dir_prefix = "compress_bench",
-		.keep = false,
-		.do_repack = false,
-		.variant_count = 0,
-		.variants = NULL,
-		.update_ops = 0,
-		.delete_ops = 0,
-		.include_prefix = true,
-	};
+	.dir_prefix = "compress_bench",
+	.keep = false,
+	.do_repack = false,
+	.variant_count = 0,
+	.variants = NULL,
+	.update_ops = 0,
+	.delete_ops = 0,
+	.include_prefix = true,
+	.scan_ops = 1000,
+	.scan_span = 256,
+};
 
 	parse_args(&cfg, argc, argv);
 
@@ -236,14 +247,16 @@ usage(const char *prog)
 	    "Options:\n"
 	    "  -n <entries>      Number of key/value pairs to insert (default 200000)\n"
 	    "  -r <reads>        Number of random read operations (default = entries)\n"
-	    "  -v <value-bytes>  Value size in bytes (default 64)\n"
-	    "  -p <prefix-len>   Shared key prefix length (default 16)\n"
-	    "  -m <MiB>          Map size in mebibytes (default 2048)\n"
-	    "  -C <spec>         Additional variant/control; spec=label:mode or mode, where mode=prefix|plain|off\n"
-	    "  -U <updates>      Number of random value updates after load (default 0)\n"
-	    "  -X <deletes>      Number of deletes to perform before reinserting (default 0)\n"
-	    "  -P                Run a compact copy repack after metrics (default off)\n"
-	    "  -s <seed>         Seed for random read order (default 1)\n"
+	"  -v <value-bytes>  Value size in bytes (default 64)\n"
+	"  -p <prefix-len>   Shared key prefix length (default 16)\n"
+	"  -m <MiB>          Map size in mebibytes (default 2048)\n"
+	"  -C <spec>         Additional variant/control; spec=label:mode or mode, where mode=prefix|plain|off\n"
+	"  -U <updates>      Number of random value updates after load (default 0)\n"
+	"  -X <deletes>      Number of deletes to perform before reinserting (default 0)\n"
+	"  -R <ranges>       Number of range scans per timing (default 1000)\n"
+	"  -L <span>         Entries to scan per range (default 256, 0 = full scan)\n"
+	"  -P                Run a compact copy repack after metrics (default off)\n"
+	"  -s <seed>         Seed for random read order (default 1)\n"
 	    "  -d <prefix>       Directory prefix for environments (default compress_bench)\n"
 	    "  -k                Keep database files after run\n"
 	    "  -h                Show this help\n",
@@ -254,7 +267,7 @@ static void
 parse_args(bench_config *cfg, int argc, char **argv)
 {
 	int opt;
-	while ((opt = getopt(argc, argv, "n:r:v:p:m:s:d:C:U:X:Pkh")) != -1) {
+	while ((opt = getopt(argc, argv, "n:r:v:p:m:s:d:C:U:X:R:L:Pkh")) != -1) {
 		switch (opt) {
 		case 'n':
 			cfg->entries = strtoull(optarg, NULL, 0);
@@ -280,15 +293,21 @@ parse_args(bench_config *cfg, int argc, char **argv)
 		case 'C':
 			add_variant_spec(cfg, optarg);
 			break;
-		case 'U':
-			cfg->update_ops = strtoull(optarg, NULL, 0);
-			break;
-		case 'X':
-			cfg->delete_ops = strtoull(optarg, NULL, 0);
-			break;
-		case 'P':
-			cfg->do_repack = true;
-			break;
+	case 'U':
+		cfg->update_ops = strtoull(optarg, NULL, 0);
+		break;
+	case 'X':
+		cfg->delete_ops = strtoull(optarg, NULL, 0);
+		break;
+	case 'R':
+		cfg->scan_ops = strtoull(optarg, NULL, 0);
+		break;
+	case 'L':
+		cfg->scan_span = strtoull(optarg, NULL, 0);
+		break;
+	case 'P':
+		cfg->do_repack = true;
+		break;
 		case 'k':
 			cfg->keep = true;
 			break;
@@ -538,15 +557,19 @@ run_bench_variant(const bench_config *cfg, bench_variant *variant,
 
 	env = bench_open_env(cfg, variant);
 	dbi = bench_open_dbi(env, variant, 0, MDB_RDONLY);
-	bench_do_reads(cfg, env, dbi, read_order, &variant->metrics.read_cold);
-	bench_do_reads(cfg, env, dbi, read_order, &variant->metrics.read_warm);
+	bench_do_reads(cfg, env, dbi, read_order, &variant->metrics.read_cold,
+	    &variant->metrics.prefix_read_cold);
+	bench_do_reads(cfg, env, dbi, read_order, &variant->metrics.read_warm,
+	    &variant->metrics.prefix_read_warm);
 	mdb_dbi_close(env, dbi);
 	mdb_env_close(env);
 
 	env = bench_open_env(cfg, variant);
 	dbi = bench_open_dbi(env, variant, 0, MDB_RDONLY);
-	bench_do_scan(cfg, env, dbi, &variant->metrics.scan_cold);
-	bench_do_scan(cfg, env, dbi, &variant->metrics.scan_warm);
+	bench_do_scan(cfg, env, dbi, &variant->metrics.scan_cold,
+	    &variant->metrics.prefix_scan_cold);
+	bench_do_scan(cfg, env, dbi, &variant->metrics.scan_warm,
+	    &variant->metrics.prefix_scan_warm);
 	bench_collect_stats(cfg, variant, env, dbi, &variant->metrics);
 	if (cfg->do_repack)
 		bench_do_repack(cfg, variant, env, &variant->metrics);
@@ -811,7 +834,7 @@ bench_do_repack(const bench_config *cfg, const bench_variant *variant,
 
 static void
 bench_do_reads(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
-    const size_t *read_order, bench_timing *timing)
+    const size_t *read_order, bench_timing *timing, MDB_prefix_metrics *pm)
 {
 	if (!timing || cfg->read_ops == 0)
 		return;
@@ -842,6 +865,11 @@ bench_do_reads(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
 
 	clock_gettime(CLOCK_MONOTONIC, &end);
 
+	if (pm) {
+		if (mdb_prefix_metrics(txn, pm, 1) != MDB_SUCCESS)
+			memset(pm, 0, sizeof(*pm));
+	}
+
 	mdb_txn_abort(txn);
 	free(keybuf);
 
@@ -850,9 +878,8 @@ bench_do_reads(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
 
 static void
 bench_do_scan(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
-    bench_timing *timing)
+    bench_timing *timing, MDB_prefix_metrics *pm)
 {
-	(void)cfg;
 	if (!timing)
 		return;
 
@@ -866,17 +893,61 @@ bench_do_scan(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
 	struct timespec start, end;
 	clock_gettime(CLOCK_MONOTONIC, &start);
 
-	MDB_val key, data;
 	uint64_t count = 0;
-	int rc = mdb_cursor_get(cursor, &key, &data, MDB_FIRST);
-	while (rc == MDB_SUCCESS) {
-		++count;
-		rc = mdb_cursor_get(cursor, &key, &data, MDB_NEXT);
+
+	if (cfg->scan_span == 0 || cfg->scan_ops == 0) {
+		MDB_val key, data;
+		int rc = mdb_cursor_get(cursor, &key, &data, MDB_FIRST);
+		while (rc == MDB_SUCCESS) {
+			++count;
+			rc = mdb_cursor_get(cursor, &key, &data, MDB_NEXT);
+		}
+		if (rc != MDB_NOTFOUND)
+			CHECK_RC(rc, "mdb_cursor_get");
+	} else {
+		size_t key_buflen = cfg->prefix_len + 32;
+		if (key_buflen < 32)
+			key_buflen = 32;
+		char *keybuf = malloc(key_buflen);
+		if (!keybuf) {
+			fprintf(stderr, "bench_do_scan: allocation failure\n");
+			exit(EXIT_FAILURE);
+		}
+
+		MDB_val key = {0};
+		MDB_val data = {0};
+		uint64_t state = cfg->seed ? cfg->seed ^
+		    UINT64_C(0xA24BAED4963EE407) : UINT64_C(1);
+		for (uint64_t op = 0; op < cfg->scan_ops; ++op) {
+			size_t idx = (size_t)(prng_next(&state) % cfg->entries);
+			size_t klen = format_key(idx, cfg->prefix_len, keybuf, key_buflen);
+			key.mv_size = klen;
+			key.mv_data = keybuf;
+			int rc = mdb_cursor_get(cursor, &key, &data, MDB_SET_RANGE);
+			if (rc == MDB_NOTFOUND)
+				continue;
+			CHECK_RC(rc, "mdb_cursor_get(range)");
+			++count;
+			size_t remaining = cfg->scan_span > 0 ? cfg->scan_span - 1 : 0;
+			while (remaining--) {
+				rc = mdb_cursor_get(cursor, &key, &data, MDB_NEXT);
+				if (rc != MDB_SUCCESS) {
+					if (rc == MDB_NOTFOUND)
+						break;
+					CHECK_RC(rc, "mdb_cursor_get(next)");
+				}
+				++count;
+			}
+		}
+		free(keybuf);
 	}
-	if (rc != MDB_NOTFOUND)
-		CHECK_RC(rc, "mdb_cursor_get");
 
 	clock_gettime(CLOCK_MONOTONIC, &end);
+
+	if (pm) {
+		if (mdb_prefix_metrics(txn, pm, 1) != MDB_SUCCESS)
+			memset(pm, 0, sizeof(*pm));
+	}
 
 	mdb_cursor_close(cursor);
 	mdb_txn_abort(txn);
@@ -961,6 +1032,31 @@ print_timing(const char *label, const bench_timing *timing, const char *unit)
 	    unit, timing->ops, unit, plural);
 }
 
+static bool
+prefix_metrics_has_data(const MDB_prefix_metrics *pm)
+{
+	if (!pm)
+		return false;
+	return pm->leaf_decode_calls || pm->leaf_decode_cache_hits ||
+	    pm->leaf_decode_cache_misses || pm->leaf_cache_pages ||
+	    pm->leaf_decode_fastpath;
+}
+
+static void
+print_prefix_metrics_line(const char *label, const MDB_prefix_metrics *pm)
+{
+	if (!prefix_metrics_has_data(pm))
+		return;
+	printf("  %-24s decode=%" PRIu64 " (fast=%" PRIu64 ") hit=%" PRIu64
+	    " miss=%" PRIu64 " cached_pages=%" PRIu64 "\n",
+	    label,
+	    pm->leaf_decode_calls,
+	    pm->leaf_decode_fastpath,
+	    pm->leaf_decode_cache_hits,
+	    pm->leaf_decode_cache_misses,
+	    pm->leaf_cache_pages);
+}
+
 static void
 print_metrics(const bench_variant *variant)
 {
@@ -984,10 +1080,27 @@ print_metrics(const bench_variant *variant)
 	print_timing("Random Read (warm)", &m->read_warm, "op");
 	print_timing("Range Scan (cold)", &m->scan_cold, "key");
 	print_timing("Range Scan (warm)", &m->scan_warm, "key");
+	if (variant->use_prefix) {
+		bool any = prefix_metrics_has_data(&m->prefix_read_cold) ||
+		    prefix_metrics_has_data(&m->prefix_read_warm) ||
+		    prefix_metrics_has_data(&m->prefix_scan_cold) ||
+		    prefix_metrics_has_data(&m->prefix_scan_warm);
+		if (any) {
+			printf("Prefix metrics:\n");
+			print_prefix_metrics_line("Random Read (cold)",
+			    &m->prefix_read_cold);
+			print_prefix_metrics_line("Random Read (warm)",
+			    &m->prefix_read_warm);
+			print_prefix_metrics_line("Range Scan (cold)",
+			    &m->prefix_scan_cold);
+			print_prefix_metrics_line("Range Scan (warm)",
+			    &m->prefix_scan_warm);
+		}
+	}
 	if (m->repack.ops) {
 		printf("Repack output: %s%s\n",
-		    format_bytes((double)m->repack_file_bytes, buf_repack, sizeof(buf_repack)),
-		    m->repack_retained ? "" : " (discarded)");
+ 		    format_bytes((double)m->repack_file_bytes, buf_repack, sizeof(buf_repack)),
+ 		    m->repack_retained ? "" : " (discarded)");
 		if (m->repack_retained)
 			printf("Repack directory: %s_repack\n", variant->dir);
 	}
