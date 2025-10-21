@@ -32,6 +32,10 @@
 #define PF_VALUE_MAX_LEN 512
 #define PF_MAX_ENTRIES   2048
 
+/* Dupsort fuzz limits */
+#define DF_MAX_KEYS   256
+#define DF_MAX_DUPS   512
+
 typedef struct {
 	size_t key_len;
 	char key[PF_KEY_MAX_LEN];
@@ -39,12 +43,39 @@ typedef struct {
 	unsigned char value[PF_VALUE_MAX_LEN];
 } PFEntry;
 
+typedef struct {
+	size_t len;
+	unsigned char value[PF_VALUE_MAX_LEN];
+} DFDuplicate;
+
+typedef struct {
+	size_t key_len;
+	char key[PF_KEY_MAX_LEN];
+	size_t dup_count;
+	DFDuplicate dups[DF_MAX_DUPS];
+} DFEntry;
+
 static PFEntry pf_entries[PF_MAX_ENTRIES];
 static size_t pf_entry_count;
 static uint64_t pf_rng_state = UINT64_C(0x9e3779b97f4a7c15);
 static uint64_t pf_key_nonce;
 static size_t pf_op_index;
 static int pf_trace_ops_enabled = -1;
+
+static DFEntry df_entries[DF_MAX_KEYS];
+static size_t df_entry_count;
+static uint64_t df_rng_state = UINT64_C(0xd2b74407b1ce6e93);
+static uint64_t df_key_nonce;
+static size_t df_op_index;
+
+static void df_model_reset(void);
+static uint64_t df_rng_next(void);
+static size_t df_make_value(unsigned char *buf, size_t max_len);
+static void df_model_insert(const char *key, size_t key_len,
+    const unsigned char *value, size_t val_len);
+static void df_verify_model(MDB_env *env, MDB_dbi dbi);
+static void df_do_insert(MDB_env *env, MDB_dbi dbi);
+static void df_do_delete(MDB_env *env, MDB_dbi dbi);
 
 static int
 pf_trace_ops(void)
@@ -1100,6 +1131,74 @@ test_prefix_dupsort_smoke(void)
 	mdb_env_close(env);
 }
 
+static void
+test_prefix_dupsort_fuzz(void)
+{
+	static const char *dir = "testdb_prefix_dupsort_fuzz";
+	static const char *dbname = "dupfuzz";
+	MDB_env *env = create_env(dir);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+	unsigned int flags = MDB_PREFIX_COMPRESSION | MDB_DUPSORT;
+
+	const char *seed_env = getenv("PF_SEED");
+	uint64_t seed = UINT64_C(0x9e3779b97f4a7c15);
+	if (seed_env && *seed_env) {
+		char *end = NULL;
+		uint64_t parsed = strtoull(seed_env, &end, 0);
+		if (end && *end == '\0')
+			seed = parsed;
+	}
+	df_rng_state = seed ^ UINT64_C(0x517cc1b727220a95);
+	df_model_reset();
+	df_op_index = 0;
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, dbname, MDB_CREATE | flags, &dbi));
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	const size_t operations = 1500;
+	for (size_t op = 0; op < operations; ++op) {
+		df_op_index = op;
+		int do_insert = (df_entry_count == 0) || (df_rng_next() & 1);
+		if (do_insert)
+			df_do_insert(env, dbi);
+		else
+			df_do_delete(env, dbi);
+		df_verify_model(env, dbi);
+	}
+
+	/* Force a large inline duplicate set to promote into a sub-DB. */
+	const char *promo_key = "prefix-longer-gamma-promo-anchor";
+	size_t promo_len = strlen(promo_key);
+	for (size_t i = 0; i < 320; ++i) {
+		df_op_index = operations + i;
+		unsigned char valbuf[PF_VALUE_MAX_LEN];
+		size_t val_len = df_make_value(valbuf, sizeof(valbuf));
+		CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+		MDB_val key = { promo_len, (void *)promo_key };
+		MDB_val data = { val_len, valbuf };
+		int rc = mdb_put(txn, dbi, &key, &data, 0);
+		if (rc != MDB_SUCCESS) {
+			fprintf(stderr, "dupsort fuzz: promo insert failed (%s)\n",
+			    mdb_strerror(rc));
+			mdb_txn_abort(txn);
+			exit(EXIT_FAILURE);
+		}
+		CHECK_CALL(mdb_txn_commit(txn));
+		df_model_insert(promo_key, promo_len, valbuf, val_len);
+		df_verify_model(env, dbi);
+	}
+
+	/* Drain the database to confirm delete paths behave. */
+	while (df_entry_count > 0) {
+		df_op_index++;
+		df_do_delete(env, dbi);
+		df_verify_model(env, dbi);
+	}
+
+	mdb_env_close(env);
+}
 
 static uint64_t
 pf_rng_next(void)
@@ -1194,6 +1293,356 @@ pf_entry_delete_at(size_t idx)
 	for (size_t i = idx; i + 1 < pf_entry_count; ++i)
 		pf_entries[i] = pf_entries[i + 1];
 	pf_entry_count--;
+}
+
+static void
+df_model_reset(void)
+{
+	df_entry_count = 0;
+	df_key_nonce = 0;
+}
+
+static uint64_t
+df_rng_next(void)
+{
+	uint64_t x = df_rng_state;
+	x ^= x >> 12;
+	x ^= x << 25;
+	x ^= x >> 27;
+	df_rng_state = x;
+	return x * UINT64_C(2685821657736338717);
+}
+
+static size_t
+df_rng_range(size_t min, size_t max)
+{
+	if (max <= min)
+		return min;
+	uint64_t span = (uint64_t)(max - min + 1);
+	return min + (size_t)(df_rng_next() % span);
+}
+
+static int
+df_entry_search(const char *key, size_t key_len, int *found)
+{
+	size_t lo = 0;
+	size_t hi = df_entry_count;
+	while (lo < hi) {
+		size_t mid = lo + ((hi - lo) >> 1);
+		int cmp = pf_key_compare(key, key_len,
+		    df_entries[mid].key, df_entries[mid].key_len);
+		if (cmp == 0) {
+			*found = 1;
+			return (int)mid;
+		}
+		if (cmp < 0)
+			hi = mid;
+		else
+			lo = mid + 1;
+	}
+	*found = 0;
+	return (int)lo;
+}
+
+static size_t
+df_make_key(char *out, size_t max_len)
+{
+	static const char *prefixes[] = {
+		"shared-alpha",
+		"shared-beta",
+		"shared-gamma",
+		"prefix-longer-alpha",
+		"prefix-longer-beta",
+		"prefix-longer-gamma"
+	};
+	size_t which = (size_t)(df_rng_next() % (sizeof(prefixes) / sizeof(prefixes[0])));
+	const char *prefix = prefixes[which];
+	size_t prefix_len = strlen(prefix);
+	if (prefix_len + 1 >= max_len)
+		prefix_len = max_len > 1 ? max_len - 1 : 0;
+	memcpy(out, prefix, prefix_len);
+	out[prefix_len++] = '-';
+
+	uint64_t nonce = df_key_nonce++;
+	int written = snprintf(out + prefix_len, max_len - prefix_len, "%016" PRIx64, nonce);
+	if (written < 0) {
+		fprintf(stderr, "dupsort fuzz: snprintf failed while formatting key\n");
+		exit(EXIT_FAILURE);
+	}
+	size_t len = prefix_len + (size_t)written;
+	if (len >= max_len)
+		len = max_len - 1;
+
+	size_t extra = df_rng_range(0, 6);
+	for (size_t i = 0; i < extra && len + 1 < max_len; ++i)
+		out[len++] = (char)('a' + (df_rng_next() % 26));
+
+	out[len] = '\0';
+	return len;
+}
+
+static size_t
+df_make_value(unsigned char *buf, size_t max_len)
+{
+	size_t len = df_rng_range(12, max_len > 192 ? 192 : max_len);
+	for (size_t i = 0; i < len; ++i)
+		buf[i] = (unsigned char)('A' + (df_rng_next() % 26));
+	return len;
+}
+
+static void
+df_model_insert(const char *key, size_t key_len,
+    const unsigned char *value, size_t val_len)
+{
+	int found = 0;
+	int idx = df_entry_search(key, key_len, &found);
+	DFEntry *entry = NULL;
+	if (!found) {
+		if (df_entry_count >= DF_MAX_KEYS) {
+			fprintf(stderr, "dupsort fuzz: key capacity exceeded\n");
+			exit(EXIT_FAILURE);
+		}
+		for (size_t i = df_entry_count; i > (size_t)idx; --i)
+		{
+			df_entries[i] = df_entries[i - 1];
+		}
+		entry = &df_entries[idx];
+		entry->key_len = key_len;
+		memcpy(entry->key, key, key_len);
+		entry->key[key_len] = '\0';
+		entry->dup_count = 0;
+		df_entry_count++;
+	} else {
+		entry = &df_entries[idx];
+	}
+
+	if (entry->dup_count >= DF_MAX_DUPS) {
+		fprintf(stderr, "dupsort fuzz: duplicate capacity exceeded for key %.*s\n",
+		    (int)entry->key_len, entry->key);
+		exit(EXIT_FAILURE);
+	}
+
+	size_t pos = entry->dup_count;
+	while (pos > 0) {
+		size_t prev = pos - 1;
+		int cmp = pf_key_compare((const char *)entry->dups[prev].value,
+		    entry->dups[prev].len, (const char *)value, val_len);
+		if (cmp <= 0)
+			break;
+		entry->dups[pos] = entry->dups[prev];
+		pos = prev;
+	}
+	entry->dups[pos].len = val_len;
+	memcpy(entry->dups[pos].value, value, val_len);
+	entry->dup_count++;
+}
+
+static void
+df_model_delete(const char *key, size_t key_len,
+    const unsigned char *value, size_t val_len)
+{
+	int found = 0;
+	int idx = df_entry_search(key, key_len, &found);
+	if (!found) {
+		fprintf(stderr, "dupsort fuzz: attempted to delete missing key %.*s\n",
+		    (int)key_len, key);
+		exit(EXIT_FAILURE);
+	}
+	DFEntry *entry = &df_entries[idx];
+	size_t pos = SIZE_MAX;
+	for (size_t i = 0; i < entry->dup_count; ++i) {
+		if (entry->dups[i].len == val_len &&
+		    memcmp(entry->dups[i].value, value, val_len) == 0) {
+			pos = i;
+			break;
+		}
+	}
+	if (pos == SIZE_MAX) {
+		fprintf(stderr, "dupsort fuzz: value not found for delete on key %.*s\n",
+		    (int)entry->key_len, entry->key);
+		exit(EXIT_FAILURE);
+	}
+	for (size_t i = pos; i + 1 < entry->dup_count; ++i)
+		entry->dups[i] = entry->dups[i + 1];
+	entry->dup_count--;
+	if (entry->dup_count == 0) {
+		for (size_t i = (size_t)idx; i + 1 < df_entry_count; ++i)
+			df_entries[i] = df_entries[i + 1];
+		df_entry_count--;
+	}
+}
+
+static void
+df_verify_model(MDB_env *env, MDB_dbi dbi)
+{
+	MDB_txn *txn = NULL;
+	MDB_cursor *cur = NULL;
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+
+	MDB_val key = {0, NULL};
+	MDB_val data = {0, NULL};
+	int rc = mdb_cursor_get(cur, &key, &data, MDB_FIRST);
+	size_t key_index = 0;
+
+	while (rc == MDB_SUCCESS) {
+		if (key_index >= df_entry_count) {
+			fprintf(stderr, "dupsort fuzz: database has unexpected extra key\n");
+			exit(EXIT_FAILURE);
+		}
+		DFEntry *entry = &df_entries[key_index];
+		if (key.mv_size != entry->key_len ||
+		    memcmp(key.mv_data, entry->key, key.mv_size) != 0) {
+			fprintf(stderr, "dupsort fuzz: key mismatch at index %zu\n", key_index);
+			exit(EXIT_FAILURE);
+		}
+		mdb_size_t dupcount = 0;
+		CHECK_CALL(mdb_cursor_count(cur, &dupcount));
+		if (dupcount != entry->dup_count) {
+			fprintf(stderr, "dupsort fuzz: duplicate count mismatch for key %.*s "
+			    "(expected %zu, got %" PRIuPTR ")\n",
+			    (int)entry->key_len, entry->key, entry->dup_count,
+			    (uintptr_t)dupcount);
+			exit(EXIT_FAILURE);
+		}
+		for (size_t dup = 0; dup < entry->dup_count; ++dup) {
+			if (data.mv_size != entry->dups[dup].len ||
+			    memcmp(data.mv_data, entry->dups[dup].value, data.mv_size) != 0) {
+				fprintf(stderr,
+				    "dupsort fuzz: duplicate mismatch after op%zu at key %.*s idx %zu "
+				    "(cursor dupcount=%" PRIuPTR ")\n",
+				    df_op_index, (int)entry->key_len, entry->key, dup,
+				    (uintptr_t)dupcount);
+				fprintf(stderr, "  expected (%zu bytes):", entry->dups[dup].len);
+				for (size_t j = 0; j < entry->dups[dup].len; ++j)
+					fprintf(stderr, " %02x", entry->dups[dup].value[j]);
+				fprintf(stderr, "\n  actual (%zu bytes):", data.mv_size);
+				const unsigned char *raw = (const unsigned char *)data.mv_data;
+				for (size_t j = 0; j < data.mv_size; ++j)
+					fprintf(stderr, " %02x", raw[j]);
+				fprintf(stderr, "\n");
+				exit(EXIT_FAILURE);
+			}
+			if (dup + 1 < entry->dup_count) {
+				int drc = mdb_cursor_get(cur, &key, &data, MDB_NEXT_DUP);
+				if (drc != MDB_SUCCESS) {
+					fprintf(stderr, "dupsort fuzz: MDB_NEXT_DUP failed (%s)\n",
+					    mdb_strerror(drc));
+					exit(EXIT_FAILURE);
+				}
+			}
+		}
+		rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT_NODUP);
+		key_index++;
+	}
+	if (rc != MDB_NOTFOUND)
+		CHECK(rc, "mdb_cursor_get");
+	if (key_index != df_entry_count) {
+		fprintf(stderr, "dupsort fuzz: database returned %zu keys, expected %zu\n",
+		    key_index, df_entry_count);
+		exit(EXIT_FAILURE);
+	}
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+}
+
+static void
+df_do_insert(MDB_env *env, MDB_dbi dbi)
+{
+	char keybuf[PF_KEY_MAX_LEN];
+	size_t key_len = 0;
+	int picked_new_key = 0;
+
+	if (df_entry_count == 0 ||
+	    (df_entry_count < DF_MAX_KEYS && (df_rng_next() & 7) == 0)) {
+		do {
+			key_len = df_make_key(keybuf, sizeof(keybuf));
+			int found = 0;
+			df_entry_search(keybuf, key_len, &found);
+			if (!found) {
+				picked_new_key = 1;
+				break;
+			}
+		} while (1);
+	} else {
+		DFEntry *entry = NULL;
+		for (int attempt = 0; attempt < 8; ++attempt) {
+			size_t idx = (size_t)(df_rng_next() % df_entry_count);
+			if (df_entries[idx].dup_count < DF_MAX_DUPS) {
+				entry = &df_entries[idx];
+				memcpy(keybuf, entry->key, entry->key_len);
+				key_len = entry->key_len;
+				break;
+			}
+		}
+		if (!entry) {
+			do {
+				key_len = df_make_key(keybuf, sizeof(keybuf));
+				int found = 0;
+				df_entry_search(keybuf, key_len, &found);
+				if (!found) {
+					picked_new_key = 1;
+					break;
+				}
+			} while (1);
+		}
+	}
+
+	unsigned char valbuf[PF_VALUE_MAX_LEN];
+	size_t val_len = df_make_value(valbuf, sizeof(valbuf));
+
+	if (pf_trace_ops()) {
+		fprintf(stderr, "dfuzz op%zu: insert key=%.*s len=%zu%s\n",
+		    df_op_index, (int)key_len, keybuf, val_len,
+		    picked_new_key ? " (new)" : "");
+	}
+
+	MDB_txn *txn = NULL;
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	MDB_val key = { key_len, keybuf };
+	MDB_val data = { val_len, valbuf };
+	int rc = mdb_put(txn, dbi, &key, &data, 0);
+	if (rc != MDB_SUCCESS) {
+		fprintf(stderr, "dupsort fuzz: mdb_put failed (%s)\n", mdb_strerror(rc));
+		mdb_txn_abort(txn);
+		exit(EXIT_FAILURE);
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+	df_model_insert(keybuf, key_len, valbuf, val_len);
+}
+
+static void
+df_do_delete(MDB_env *env, MDB_dbi dbi)
+{
+	if (df_entry_count == 0)
+		return;
+
+	size_t key_idx = (size_t)(df_rng_next() % df_entry_count);
+	DFEntry snapshot = df_entries[key_idx]; /* copy header for safe use after model update */
+	if (snapshot.dup_count == 0)
+		return;
+	size_t dup_idx = (size_t)(df_rng_next() % snapshot.dup_count);
+
+	unsigned char value_copy[PF_VALUE_MAX_LEN];
+	memcpy(value_copy, snapshot.dups[dup_idx].value, snapshot.dups[dup_idx].len);
+
+	if (pf_trace_ops()) {
+		fprintf(stderr, "dfuzz op%zu: delete key=%.*s dup_len=%zu\n",
+		    df_op_index, (int)snapshot.key_len, snapshot.key, snapshot.dups[dup_idx].len);
+	}
+
+	MDB_txn *txn = NULL;
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	MDB_val key = { snapshot.key_len, snapshot.key };
+	MDB_val data = { snapshot.dups[dup_idx].len, snapshot.dups[dup_idx].value };
+	int rc = mdb_del(txn, dbi, &key, &data);
+	if (rc != MDB_SUCCESS) {
+		fprintf(stderr, "dupsort fuzz: mdb_del failed (%s)\n", mdb_strerror(rc));
+		mdb_txn_abort(txn);
+		exit(EXIT_FAILURE);
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+	df_model_delete(snapshot.key, snapshot.key_len, value_copy, snapshot.dups[dup_idx].len);
 }
 
 static size_t
@@ -1479,14 +1928,15 @@ main(void)
     test_mixed_pattern_and_unicode();
     test_cursor_buffer_sharing();
     test_prefix_dupsort_transitions();
-    test_prefix_dupsort_cursor_walk();
-    test_prefix_dupsort_get_both_range();
-    test_prefix_leaf_splits();
-    test_prefix_alternating_prefixes();
-    test_prefix_update_reinsert();
-    test_prefix_dupsort_smoke();
-    test_nested_txn_rollback();
-    test_prefix_fuzz();
-    printf("mtest_prefix: all tests passed\n");
-    return 0;
+	test_prefix_dupsort_cursor_walk();
+	test_prefix_dupsort_get_both_range();
+	test_prefix_leaf_splits();
+	test_prefix_alternating_prefixes();
+	test_prefix_update_reinsert();
+	test_prefix_dupsort_smoke();
+	test_prefix_dupsort_fuzz();
+	test_nested_txn_rollback();
+	test_prefix_fuzz();
+	printf("mtest_prefix: all tests passed\n");
+	return 0;
 }

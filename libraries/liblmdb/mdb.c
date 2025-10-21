@@ -10175,12 +10175,18 @@ mdb_node_add(MDB_cursor *mc, indx_t indx,
 	}
 	if (prefix_enabled && IS_LEAF(mp) && !IS_LEAF2(mp) && indx == 0 && NUMKEYS(mp) > 0) {
 		MDB_node *old = NODEPTR(mp, 0);
-		if (old->mn_ksize > MDB_KEYBUF_MAX)
-			return MDB_BAD_VALSIZE;
-		old_trunk.mv_size = old->mn_ksize;
-		old_trunk.mv_data = old_trunk_buf;
-		memcpy(old_trunk_buf, NODEKEY(mp, old), old_trunk.mv_size);
-		need_reencode = 1;
+		MDB_val current_trunk = { old->mn_ksize, NODEKEY(mp, old) };
+
+		if (key == NULL ||
+		    current_trunk.mv_size != key->mv_size ||
+		    memcmp(current_trunk.mv_data, key->mv_data, current_trunk.mv_size) != 0) {
+			if (old->mn_ksize > MDB_KEYBUF_MAX)
+				return MDB_BAD_VALSIZE;
+			old_trunk.mv_size = old->mn_ksize;
+			old_trunk.mv_data = old_trunk_buf;
+			memcpy(old_trunk_buf, NODEKEY(mp, old), old_trunk.mv_size);
+			need_reencode = 1;
+		}
 	}
 	if (IS_LEAF(mp)) {
 		mdb_cassert(mc, key && data);
