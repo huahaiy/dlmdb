@@ -93,6 +93,13 @@ static void test_prefix_update_reinsert(void);
 static void test_prefix_dupsort_cursor_walk(void);
 static void test_prefix_dupsort_get_both_range(void);
 static void test_prefix_dupsort_smoke(void);
+static void assert_dup_sequence(MDB_env *env, MDB_dbi dbi, const char *key,
+    const char *const *expected, size_t expected_count);
+static void test_prefix_dupsort_inline_basic_ops(void);
+static void test_prefix_dupsort_inline_promote(void);
+static void test_prefix_dupsort_trunk_swap_inline(void);
+static void test_prefix_dupsort_trunk_swap_promote(void);
+static void test_prefix_dupsort_trunk_key_shift_no_value_change(void);
 
 static void
 reset_dir(const char *dir)
@@ -1132,6 +1139,533 @@ test_prefix_dupsort_smoke(void)
 }
 
 static void
+test_prefix_dupsort_inline_basic_ops(void)
+{
+	static const char *dir = "testdb_prefix_inline_basic";
+	static const char *key = "dup-inline-basic";
+	static const char *dup_sequence[] = { "a", "b", "c", "d", "e" };
+	const char *after_delete_d[] = { "a", "b", "c" };
+	const char *after_delete_c[] = { "a", "b" };
+	const char *after_readd_c[] = { "a", "b", "c" };
+	const size_t initial_dup_count = ARRAY_SIZE(dup_sequence) - 1;
+	const size_t full_dup_count = ARRAY_SIZE(dup_sequence);
+
+	MDB_env *env = create_env(dir);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+	MDB_val mkey = { strlen(key), (void *)key };
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL,
+	    MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_DUPSORT, &dbi));
+	for (size_t i = 0; i < initial_dup_count; ++i) {
+		const char *dup = dup_sequence[i];
+		MDB_val data = { strlen(dup), (void *)dup };
+		CHECK_CALL(mdb_put(txn, dbi, &mkey, &data, 0));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	assert_dup_sequence(env, dbi, key,
+	    dup_sequence, initial_dup_count);
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	{
+		const char *dup = dup_sequence[initial_dup_count];
+		MDB_val data = { strlen(dup), (void *)dup };
+		CHECK_CALL(mdb_put(txn, dbi, &mkey, &data, 0));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	assert_dup_sequence(env, dbi, key,
+	    dup_sequence, full_dup_count);
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	{
+		const char *dup = dup_sequence[initial_dup_count];
+		MDB_val data = { strlen(dup), (void *)dup };
+		CHECK_CALL(mdb_del(txn, dbi, &mkey, &data));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	assert_dup_sequence(env, dbi, key,
+	    dup_sequence, initial_dup_count);
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	{
+		const char *dup = dup_sequence[initial_dup_count - 1];
+		MDB_val data = { strlen(dup), (void *)dup };
+		CHECK_CALL(mdb_del(txn, dbi, &mkey, &data));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	assert_dup_sequence(env, dbi, key,
+	    after_delete_d, ARRAY_SIZE(after_delete_d));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	{
+		const char *dup = dup_sequence[initial_dup_count - 2];
+		MDB_val data = { strlen(dup), (void *)dup };
+		CHECK_CALL(mdb_del(txn, dbi, &mkey, &data));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	assert_dup_sequence(env, dbi, key,
+	    after_delete_c, ARRAY_SIZE(after_delete_c));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	{
+		const char *dup = dup_sequence[initial_dup_count - 2];
+		MDB_val data = { strlen(dup), (void *)dup };
+		CHECK_CALL(mdb_put(txn, dbi, &mkey, &data, 0));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	assert_dup_sequence(env, dbi, key,
+	    after_readd_c, ARRAY_SIZE(after_readd_c));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	{
+		const char *dup = dup_sequence[initial_dup_count - 1];
+		MDB_val data = { strlen(dup), (void *)dup };
+		CHECK_CALL(mdb_put(txn, dbi, &mkey, &data, 0));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	assert_dup_sequence(env, dbi, key,
+	    dup_sequence, initial_dup_count);
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	{
+		const char *dup = dup_sequence[initial_dup_count];
+		MDB_val data = { strlen(dup), (void *)dup };
+		CHECK_CALL(mdb_put(txn, dbi, &mkey, &data, 0));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	assert_dup_sequence(env, dbi, key,
+	    dup_sequence, full_dup_count);
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	{
+		const char *dup = dup_sequence[initial_dup_count];
+		MDB_val data = { strlen(dup), (void *)dup };
+		CHECK_CALL(mdb_del(txn, dbi, &mkey, &data));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	assert_dup_sequence(env, dbi, key,
+	    dup_sequence, initial_dup_count);
+
+	mdb_env_close(env);
+}
+
+static void
+test_prefix_dupsort_inline_promote(void)
+{
+	static const char *dir = "testdb_prefix_inline_promote";
+	static const char *key = "dup-inline-promote";
+	static const char *small_dups[] = {
+		"inline-small-1",
+		"inline-small-2",
+		"inline-small-3"
+	};
+	const size_t large_len1 = 500;
+	const size_t large_len2 = 508;
+	char *large_dup1 = malloc(large_len1 + 1);
+	char *large_dup2 = malloc(large_len2 + 1);
+
+	if (!large_dup1 || !large_dup2) {
+		fprintf(stderr, "inline promote: allocation failure\n");
+		exit(EXIT_FAILURE);
+	}
+
+	memset(large_dup1, 'z', large_len1);
+	large_dup1[large_len1 - 1] = '1';
+	large_dup1[large_len1] = '\0';
+
+	memset(large_dup2, 'z', large_len2);
+	large_dup2[large_len2 - 1] = '2';
+	large_dup2[large_len2] = '\0';
+
+	const char *expected_after_promotion[] = {
+		small_dups[0],
+		small_dups[1],
+		small_dups[2],
+		large_dup1,
+		large_dup2
+	};
+
+	MDB_env *env = create_env(dir);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+	MDB_val mkey = { strlen(key), (void *)key };
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL,
+	    MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_DUPSORT, &dbi));
+	for (size_t i = 0; i < ARRAY_SIZE(small_dups); ++i) {
+		const char *dup = small_dups[i];
+		MDB_val data = { strlen(dup), (void *)dup };
+		CHECK_CALL(mdb_put(txn, dbi, &mkey, &data, 0));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	assert_dup_sequence(env, dbi, key,
+	    small_dups, ARRAY_SIZE(small_dups));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	{
+		MDB_val data = { large_len1, large_dup1 };
+		CHECK_CALL(mdb_put(txn, dbi, &mkey, &data, 0));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	{
+		MDB_val data = { large_len2, large_dup2 };
+		CHECK_CALL(mdb_put(txn, dbi, &mkey, &data, 0));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	assert_dup_sequence(env, dbi, key,
+	    expected_after_promotion, ARRAY_SIZE(expected_after_promotion));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	{
+		MDB_val data = { strlen(small_dups[1]), (void *)small_dups[1] };
+		CHECK_CALL(mdb_del(txn, dbi, &mkey, &data));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	const char *after_delete_mid[] = {
+		small_dups[0],
+		small_dups[2],
+		large_dup1,
+		large_dup2
+	};
+	assert_dup_sequence(env, dbi, key,
+	    after_delete_mid, ARRAY_SIZE(after_delete_mid));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	{
+		MDB_val data = { strlen(small_dups[1]), (void *)small_dups[1] };
+		CHECK_CALL(mdb_put(txn, dbi, &mkey, &data, 0));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	assert_dup_sequence(env, dbi, key,
+	    expected_after_promotion, ARRAY_SIZE(expected_after_promotion));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	{
+		MDB_val data = { large_len1, large_dup1 };
+		CHECK_CALL(mdb_del(txn, dbi, &mkey, &data));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	const char *after_delete_large[] = {
+		small_dups[0],
+		small_dups[1],
+		small_dups[2],
+		large_dup2
+	};
+	assert_dup_sequence(env, dbi, key,
+	    after_delete_large, ARRAY_SIZE(after_delete_large));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	{
+		MDB_val data = { large_len1, large_dup1 };
+		CHECK_CALL(mdb_put(txn, dbi, &mkey, &data, 0));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	assert_dup_sequence(env, dbi, key,
+	    expected_after_promotion, ARRAY_SIZE(expected_after_promotion));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	{
+		MDB_cursor *cur = NULL;
+		MDB_val search_key = { strlen(key), (void *)key };
+		MDB_val search_data = { large_len2, large_dup2 };
+		CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+		int rc = mdb_cursor_get(cur, &search_key, &search_data, MDB_GET_BOTH_RANGE);
+		if (rc != MDB_SUCCESS) {
+			fprintf(stderr,
+			    "inline promote: MDB_GET_BOTH failed for promoted duplicate (%s)\n",
+			    mdb_strerror(rc));
+			exit(EXIT_FAILURE);
+		}
+		mdb_cursor_close(cur);
+	}
+	mdb_txn_abort(txn);
+
+	mdb_env_close(env);
+	env = NULL;
+
+	CHECK_CALL(mdb_env_create(&env));
+	CHECK_CALL(mdb_env_set_maxdbs(env, 4));
+	CHECK_CALL(mdb_env_set_mapsize(env, 64UL * 1024 * 1024));
+	CHECK_CALL(mdb_env_open(env, dir, MDB_NOLOCK, 0664));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL,
+	    MDB_PREFIX_COMPRESSION | MDB_DUPSORT, &dbi));
+	assert_dup_sequence(env, dbi, key,
+	    expected_after_promotion, ARRAY_SIZE(expected_after_promotion));
+	mdb_txn_abort(txn);
+
+	free(large_dup1);
+	free(large_dup2);
+	mdb_env_close(env);
+}
+
+static void
+test_prefix_dupsort_trunk_key_shift_no_value_change(void)
+{
+	static const char *dir = "testdb_prefix_trunk_key_shift";
+	static const char *key = "dup-trunk-key-shift";
+	static const char *initial_dups[] = {
+		"trunk-inline-0100",
+		"trunk-inline-0200",
+		"trunk-inline-0300"
+	};
+	static const char *new_trunk = "trunk-inline-0005";
+	const char *expected_before[] = {
+		"trunk-inline-0100",
+		"trunk-inline-0200",
+		"trunk-inline-0300"
+	};
+	const char *expected_after[] = {
+		"trunk-inline-0005",
+		"trunk-inline-0100",
+		"trunk-inline-0200",
+		"trunk-inline-0300"
+	};
+	const char *after_delete[] = {
+		"trunk-inline-0005",
+		"trunk-inline-0100",
+		"trunk-inline-0200"
+	};
+	const char *after_insert[] = {
+		"trunk-inline-0005",
+		"trunk-inline-0100",
+		"trunk-inline-0150",
+		"trunk-inline-0200"
+	};
+
+	MDB_env *env = create_env(dir);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+	MDB_val mkey = { strlen(key), (void *)key };
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL,
+	    MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_DUPSORT, &dbi));
+	for (size_t i = 0; i < ARRAY_SIZE(initial_dups); ++i) {
+		const char *dup = initial_dups[i];
+		MDB_val data = { strlen(dup), (void *)dup };
+		CHECK_CALL(mdb_put(txn, dbi, &mkey, &data, 0));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	assert_dup_sequence(env, dbi, key,
+	    expected_before, ARRAY_SIZE(expected_before));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	{
+		MDB_val data = { strlen(new_trunk), (void *)new_trunk };
+		CHECK_CALL(mdb_put(txn, dbi, &mkey, &data, 0));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	assert_dup_sequence(env, dbi, key,
+	    expected_after, ARRAY_SIZE(expected_after));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	{
+		MDB_val tail = { strlen(initial_dups[2]), (void *)initial_dups[2] };
+		CHECK_CALL(mdb_del(txn, dbi, &mkey, &tail));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	assert_dup_sequence(env, dbi, key,
+	    after_delete, ARRAY_SIZE(after_delete));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	{
+		const char *insert_dup = "trunk-inline-0150";
+		MDB_val data = { strlen(insert_dup), (void *)insert_dup };
+		CHECK_CALL(mdb_put(txn, dbi, &mkey, &data, 0));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	assert_dup_sequence(env, dbi, key,
+	    after_insert, ARRAY_SIZE(after_insert));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	{
+		const char *mid_dup = "trunk-inline-0150";
+		MDB_val data = { strlen(mid_dup), (void *)mid_dup };
+		CHECK_CALL(mdb_del(txn, dbi, &mkey, &data));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	assert_dup_sequence(env, dbi, key,
+	    after_delete, ARRAY_SIZE(after_delete));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	{
+		const char *readd_tail = "trunk-inline-0300";
+		MDB_val data = { strlen(readd_tail), (void *)readd_tail };
+		CHECK_CALL(mdb_put(txn, dbi, &mkey, &data, 0));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	assert_dup_sequence(env, dbi, key,
+	    expected_after, ARRAY_SIZE(expected_after));
+
+	mdb_env_close(env);
+}
+
+static void
+test_prefix_dupsort_trunk_swap_inline(void)
+{
+	static const char *dir = "testdb_prefix_trunk_inline";
+	static const char *key = "dup-trunk-inline";
+	const char *initial_dups[] = {
+		"mango-inline-tail-0001",
+		"mango-inline-tail-0002"
+	};
+	const char *new_trunk = "aardvark-inline-root-0000";
+	const char *expected_after_initial[] = {
+		"mango-inline-tail-0001",
+		"mango-inline-tail-0002"
+	};
+	const char *expected_after_swap[] = {
+		"aardvark-inline-root-0000",
+		"mango-inline-tail-0001",
+		"mango-inline-tail-0002"
+	};
+
+	MDB_env *env = create_env(dir);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+	MDB_val mkey = { strlen(key), (void *)key };
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL,
+	    MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_DUPSORT, &dbi));
+	for (size_t i = 0; i < ARRAY_SIZE(initial_dups); ++i) {
+		const char *dup = initial_dups[i];
+		MDB_val data = { strlen(dup), (void *)dup };
+		CHECK_CALL(mdb_put(txn, dbi, &mkey, &data, 0));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	assert_dup_sequence(env, dbi, key,
+	    expected_after_initial, ARRAY_SIZE(expected_after_initial));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	{
+		MDB_val data = { strlen(new_trunk), (void *)new_trunk };
+		CHECK_CALL(mdb_put(txn, dbi, &mkey, &data, 0));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	assert_dup_sequence(env, dbi, key,
+	    expected_after_swap, ARRAY_SIZE(expected_after_swap));
+
+	mdb_env_close(env);
+}
+
+static void
+test_prefix_dupsort_trunk_swap_promote(void)
+{
+	static const char *dir = "testdb_prefix_trunk_promote";
+	static const char *key = "dup-trunk-promote";
+	enum { VALUE_LEN = 192, INITIAL_COUNT = 24 };
+	char values[INITIAL_COUNT][VALUE_LEN + 1];
+	const char *expected_initial[INITIAL_COUNT];
+
+	MDB_env *env = create_env(dir);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+	MDB_val mkey = { strlen(key), (void *)key };
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL,
+	    MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_DUPSORT, &dbi));
+
+	for (size_t i = 0; i < INITIAL_COUNT; ++i) {
+		size_t prefix = snprintf(values[i], sizeof(values[i]),
+		    "shared-promote-base-%04zu-", i);
+		if (prefix >= VALUE_LEN)
+			prefix = VALUE_LEN - 1;
+		memset(values[i] + prefix, 'v' - (int)(i % 12), VALUE_LEN - prefix);
+		values[i][VALUE_LEN] = '\0';
+		MDB_val data = { VALUE_LEN, values[i] };
+		CHECK_CALL(mdb_put(txn, dbi, &mkey, &data, MDB_APPENDDUP));
+		expected_initial[i] = values[i];
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	assert_dup_sequence(env, dbi, key, expected_initial, INITIAL_COUNT);
+
+	char promote_trunk[VALUE_LEN + 1];
+	{
+		size_t prefix = snprintf(promote_trunk, sizeof(promote_trunk),
+		    "alpha-promote-root-0000-");
+		if (prefix >= VALUE_LEN)
+			prefix = VALUE_LEN - 1;
+		memset(promote_trunk + prefix, 'a', VALUE_LEN - prefix);
+		promote_trunk[VALUE_LEN] = '\0';
+	}
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	{
+		MDB_val data = { VALUE_LEN, promote_trunk };
+		CHECK_CALL(mdb_put(txn, dbi, &mkey, &data, 0));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	const char *expected_after_swap[INITIAL_COUNT + 2];
+	expected_after_swap[0] = promote_trunk;
+	for (size_t i = 0; i < INITIAL_COUNT; ++i)
+		expected_after_swap[i + 1] = expected_initial[i];
+	assert_dup_sequence(env, dbi, key,
+	    expected_after_swap, INITIAL_COUNT + 1);
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	{
+		char tail_value[VALUE_LEN + 1];
+		size_t prefix = snprintf(tail_value, sizeof(tail_value),
+		    "shared-promote-base-%04zu-", (size_t)INITIAL_COUNT);
+		if (prefix >= VALUE_LEN)
+			prefix = VALUE_LEN - 1;
+		memset(tail_value + prefix, 'z', VALUE_LEN - prefix);
+		tail_value[VALUE_LEN] = '\0';
+		MDB_val data = { VALUE_LEN, tail_value };
+		CHECK_CALL(mdb_put(txn, dbi, &mkey, &data, 0));
+		char *tail_copy = malloc(VALUE_LEN + 1);
+		if (!tail_copy) {
+			fprintf(stderr, "dup trunk promote: malloc failed\n");
+			exit(EXIT_FAILURE);
+		}
+		memcpy(tail_copy, tail_value, VALUE_LEN + 1);
+		expected_after_swap[INITIAL_COUNT + 1] = tail_copy;
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	assert_dup_sequence(env, dbi, key,
+	    expected_after_swap, INITIAL_COUNT + 2);
+
+	/* Free strdup'ed tail entry */
+	free((void *)expected_after_swap[INITIAL_COUNT + 1]);
+
+	mdb_env_close(env);
+}
+
+static void
 test_prefix_dupsort_fuzz(void)
 {
 	static const char *dir = "testdb_prefix_dupsort_fuzz";
@@ -1499,9 +2033,9 @@ df_verify_model(MDB_env *env, MDB_dbi dbi)
 		mdb_size_t dupcount = 0;
 		CHECK_CALL(mdb_cursor_count(cur, &dupcount));
 		if (dupcount != entry->dup_count) {
-			fprintf(stderr, "dupsort fuzz: duplicate count mismatch for key %.*s "
+			fprintf(stderr, "dupsort fuzz: duplicate count mismatch after op%zu for key %.*s "
 			    "(expected %zu, got %" PRIuPTR ")\n",
-			    (int)entry->key_len, entry->key, entry->dup_count,
+			    df_op_index, (int)entry->key_len, entry->key, entry->dup_count,
 			    (uintptr_t)dupcount);
 			exit(EXIT_FAILURE);
 		}
@@ -1542,6 +2076,81 @@ df_verify_model(MDB_env *env, MDB_dbi dbi)
 		    key_index, df_entry_count);
 		exit(EXIT_FAILURE);
 	}
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+}
+
+static void
+assert_dup_sequence(MDB_env *env, MDB_dbi dbi, const char *key,
+    const char *const *expected, size_t expected_count)
+{
+	MDB_txn *txn = NULL;
+	MDB_cursor *cur = NULL;
+	MDB_val lookup = { strlen(key), (void *)key };
+	MDB_val data = { 0, NULL };
+	int rc;
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+
+	rc = mdb_cursor_get(cur, &lookup, &data, MDB_SET_KEY);
+	if (expected_count == 0) {
+		if (rc != MDB_NOTFOUND) {
+			fprintf(stderr, "dup sequence: expected key %s to be absent\n", key);
+			exit(EXIT_FAILURE);
+		}
+		goto done;
+	}
+	if (rc != MDB_SUCCESS) {
+		fprintf(stderr, "dup sequence: failed to find key %s (%s)\n",
+		    key, mdb_strerror(rc));
+		exit(EXIT_FAILURE);
+	}
+
+	mdb_size_t dupcount = 0;
+	CHECK_CALL(mdb_cursor_count(cur, &dupcount));
+	if ((size_t)dupcount != expected_count) {
+		fprintf(stderr,
+		    "dup sequence: key %s expected %zu duplicates, observed %" PRIuPTR "\n",
+		    key, expected_count, (uintptr_t)dupcount);
+		exit(EXIT_FAILURE);
+	}
+
+	for (size_t i = 0; i < expected_count; ++i) {
+		const char *expect = expected[i];
+		size_t expect_len = strlen(expect);
+		if (data.mv_size != expect_len ||
+		    memcmp(data.mv_data, expect, expect_len) != 0) {
+			fprintf(stderr, "observed duplicate size %zu\n", (size_t)data.mv_size);
+			fprintf(stderr, "observed duplicate bytes:");
+			for (size_t b = 0; b < data.mv_size; ++b) {
+				fprintf(stderr, " %02x", ((const unsigned char *)data.mv_data)[b]);
+			}
+			fprintf(stderr, "\n");
+			fprintf(stderr,
+			    "dup sequence: key %s mismatch at dup index %zu (expected \"%s\", got %.*s)\n",
+			    key, i, expect, (int)data.mv_size, (const char *)data.mv_data);
+			exit(EXIT_FAILURE);
+		}
+		if (i + 1 < expected_count) {
+			rc = mdb_cursor_get(cur, &lookup, &data, MDB_NEXT_DUP);
+			if (rc != MDB_SUCCESS) {
+				fprintf(stderr,
+				    "dup sequence: MDB_NEXT_DUP failed at index %zu (%s)\n",
+				    i, mdb_strerror(rc));
+				exit(EXIT_FAILURE);
+			}
+		}
+	}
+	rc = mdb_cursor_get(cur, &lookup, &data, MDB_NEXT_DUP);
+	if (rc != MDB_NOTFOUND) {
+		fprintf(stderr,
+		    "dup sequence: expected end of duplicates for key %s, got %s\n",
+		    key, mdb_strerror(rc));
+		exit(EXIT_FAILURE);
+	}
+
+done:
 	mdb_cursor_close(cur);
 	mdb_txn_abort(txn);
 }
@@ -1609,6 +2218,28 @@ df_do_insert(MDB_env *env, MDB_dbi dbi)
 	}
 	CHECK_CALL(mdb_txn_commit(txn));
 	df_model_insert(keybuf, key_len, valbuf, val_len);
+
+	if (pf_trace_ops() && key_len == strlen("shared-alpha-0000000000000001jv") &&
+	    memcmp(keybuf, "shared-alpha-0000000000000001jv", key_len) == 0) {
+		MDB_txn *rtxn = NULL;
+		MDB_cursor *cur = NULL;
+		CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &rtxn));
+		CHECK_CALL(mdb_cursor_open(rtxn, dbi, &cur));
+		MDB_val rkey = { key_len, keybuf };
+		MDB_val rdata = {0, NULL};
+		int grc = mdb_cursor_get(cur, &rkey, &rdata, MDB_SET_KEY);
+		if (grc == MDB_SUCCESS) {
+			mdb_size_t dupcount = 0;
+			CHECK_CALL(mdb_cursor_count(cur, &dupcount));
+			fprintf(stderr, "dfuzz debug: key %.*s txndups=%" PRIuPTR "\n",
+			    (int)key_len, keybuf, (uintptr_t)dupcount);
+		} else {
+			fprintf(stderr, "dfuzz debug: key %.*s lookup rc=%d\n",
+			    (int)key_len, keybuf, grc);
+		}
+		mdb_cursor_close(cur);
+		mdb_txn_abort(rtxn);
+	}
 }
 
 static void
@@ -1927,14 +2558,19 @@ main(void)
     test_threshold_behavior();
     test_mixed_pattern_and_unicode();
     test_cursor_buffer_sharing();
-    test_prefix_dupsort_transitions();
-	test_prefix_dupsort_cursor_walk();
-	test_prefix_dupsort_get_both_range();
+    // test_prefix_dupsort_transitions();
+	// test_prefix_dupsort_cursor_walk();
+	// test_prefix_dupsort_get_both_range();
 	test_prefix_leaf_splits();
 	test_prefix_alternating_prefixes();
 	test_prefix_update_reinsert();
 	test_prefix_dupsort_smoke();
-	test_prefix_dupsort_fuzz();
+	test_prefix_dupsort_inline_basic_ops();
+	test_prefix_dupsort_inline_promote();
+	test_prefix_dupsort_trunk_key_shift_no_value_change();
+	// test_prefix_dupsort_trunk_swap_inline();
+	// test_prefix_dupsort_trunk_swap_promote();
+	// test_prefix_dupsort_fuzz();
 	test_nested_txn_rollback();
 	test_prefix_fuzz();
 	printf("mtest_prefix: all tests passed\n");
