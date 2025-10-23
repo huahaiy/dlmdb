@@ -2455,11 +2455,9 @@ mdb_prefix_page_capacity(MDB_cursor *mc, MDB_page *mp)
 	if (!IS_SUBP(mp))
 		return env->me_psize;
 
-	{
-		MDB_xcursor *mx = mdb_cursor_container(mc);
-		if (mx && mx->mx_inline_bytes)
-			return mx->mx_inline_bytes;
-	}
+  MDB_xcursor *mx = mdb_cursor_container(mc);
+  if (mx && mx->mx_inline_bytes)
+    return mx->mx_inline_bytes;
 
 	if (!(mc->mc_flags & C_SUB) && mc->mc_top >= 0) {
 		MDB_node *node = NODEPTR(mc->mc_pg[mc->mc_top], mc->mc_ki[mc->mc_top]);
@@ -2506,7 +2504,7 @@ mdb_leaf_rebuild_after_trunk_delete(MDB_cursor *mc, MDB_page *mp, indx_t removed
 	rc = mdb_prefix_ensure_snapshot(txn, env->me_psize, &snapshot);
 	if (rc != MDB_SUCCESS)
 		return rc;
-	memcpy(snapshot, mp, env->me_psize);
+	memcpy(snapshot, mp, capacity);
 
 	if (remain == 0) {
 		rc = mdb_leaf_rebuild_apply(mc, mp, NULL, 0, capacity);
@@ -2776,7 +2774,7 @@ mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp,
 	rc = mdb_prefix_ensure_snapshot(txn, env->me_psize, &snapshot);
 	if (rc != MDB_SUCCESS)
 		return rc;
-	memcpy(snapshot, mp, env->me_psize);
+	memcpy(snapshot, mp, capacity);
 
 	rc = mdb_prefix_ensure_entries(txn, new_total, &entries);
 	if (rc != MDB_SUCCESS)
@@ -9690,11 +9688,11 @@ _mdb_cursor_put(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 	if (mc == NULL || key == NULL)
 		return EINVAL;
 
-	if (trace_sub) {
+		if (trace_sub) {
 		fprintf(stderr, "mdb_put sub: top=%u ki=%u key_sz=%zu data_sz=%zu flags=0x%x\n",
 		    mc->mc_top, mc->mc_top < mc->mc_snum ? mc->mc_ki[mc->mc_top] : 0,
 		    key->mv_size, data ? data->mv_size : 0, flags);
-	}
+		}
 
 	env = mc->mc_txn->mt_env;
 
