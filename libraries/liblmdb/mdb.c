@@ -3053,7 +3053,7 @@ mdb_leaf_refresh_xcursor(MDB_cursor *mc, MDB_page *mp, indx_t idx)
 
 	if (mc == NULL)
 		return;
-	if (!(mc->mc_db->md_flags & MDB_DUPSORT))
+	if (!(mc->mc_txn->mt_dbs[mc->mc_dbi].md_flags & MDB_DUPSORT))
 		return;
 
 	mx = mc->mc_xcursor;
@@ -9708,6 +9708,10 @@ _mdb_cursor_put(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 			return MDB_INCOMPATIBLE;
 	}
 
+	fprintf(stderr, "_mdb_cursor_put: c_sub=%d db_flags=0x%x key_sz=%zu data_sz=%zu flags=0x%x\n",
+	    !!(mc->mc_flags & C_SUB), mc->mc_db->md_flags, key->mv_size,
+	    data ? data->mv_size : 0, flags);
+
 	nospill = flags & MDB_NOSPILL;
 	flags &= ~MDB_NOSPILL;
 
@@ -9859,6 +9863,7 @@ more:
 		olddata.mv_size = NODEDSZ(leaf);
 		olddata.mv_data = NODEDATA(leaf);
 
+		fprintf(stderr, "leaf flags pre-dup branch: 0x%x\n", leaf->mn_flags);
 		if (F_ISSET(leaf->mn_flags, F_DUPDATA|F_SUBDATA))
 			flags |= leaf->mn_flags & (F_DUPDATA|F_SUBDATA);
 
@@ -9871,12 +9876,16 @@ more:
 			 */
 			unsigned	i, offset = 0;
 			int force_subdb = 0;
+			MDB_val zerodata = {0, NULL};
+			uint16_t parent_flags = mc->mc_txn->mt_dbs[mc->mc_dbi].md_flags;
+			int parent_prefix = (parent_flags & MDB_PREFIX_COMPRESSION) != 0;
 			mp = fp = xdata.mv_data = env->me_pbuf;
 			mp->mp_pgno = mc->mc_pg[mc->mc_top]->mp_pgno;
 
 			/* Was a single item before, must convert now */
 			if (!F_ISSET(leaf->mn_flags, F_DUPDATA)) {
 				MDB_cmp_func *dcmp;
+				int cmp;
 				/* Just overwrite the current item */
 				if (flags == MDB_CURRENT)
 					goto current;
@@ -9884,7 +9893,8 @@ more:
 				if (NEED_CMP_CLONG(dcmp, olddata.mv_size))
 					dcmp = mdb_cmp_clong;
 				/* does data match? */
-				if (!dcmp(data, &olddata)) {
+				cmp = dcmp(data, &olddata);
+				if (!cmp) {
 					if (flags & (MDB_NODUPDATA|MDB_APPENDDUP))
 						return MDB_KEYEXIST;
 					/* overwrite it */
@@ -9909,15 +9919,37 @@ more:
 				}
 				MP_UPPER(fp) = xdata.mv_size - PAGEBASE;
 				olddata.mv_size = xdata.mv_size; /* pretend olddata is fp */
+				if (parent_prefix && cmp < 0) {
+					size_t required = 0;
+					size_t base_size = olddata.mv_size;
+					rc2 = mdb_prefix_inline_measure_after_insert(mc, fp,
+					    base_size, 0, data, &zerodata, 0, &required);
+					fprintf(stderr, "convert measurement: base=%zu required=%zu rc=%d\n",
+					    base_size, required, rc2);
+					if (rc2 != MDB_SUCCESS && rc2 != MDB_PAGE_FULL)
+						return rc2;
+					if (rc2 == MDB_PAGE_FULL || required > env->me_psize) {
+						force_subdb = 1;
+					} else if (required > base_size) {
+						size_t target = EVEN(required);
+						if (target > env->me_psize) {
+							force_subdb = 1;
+						} else if (target > base_size) {
+							size_t extra = target - base_size;
+							xdata.mv_size += extra;
+							olddata.mv_size += extra;
+							MP_UPPER(fp) = (indx_t)(xdata.mv_size - PAGEBASE);
+						}
+					}
+				}
 			} else if (leaf->mn_flags & F_SUBDATA) {
 				/* Data is on sub-DB, just store it */
 				flags |= F_DUPDATA|F_SUBDATA;
 				goto put_sub;
 			} else {
 				/* Data is on sub-page */
-				int prefix_enabled = (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) != 0;
+				int prefix_enabled = parent_prefix;
 				MDB_cursor *mx;
-				MDB_val zerodata = {0, NULL};
 				size_t free_bytes, need, grow = 0;
 				unsigned int dup_index = 0;
 				int exact = 0;
@@ -9964,6 +9996,8 @@ more:
 					free_bytes = SIZELEFT(fp);
 					if (need > free_bytes)
 						grow = need - free_bytes;
+					fprintf(stderr, "inline dup: flags=0x%x prefix=%d idx=%u exact=%d total=%u\n",
+					    parent_flags, prefix_enabled, dup_index, exact, NUMKEYS(fp));
 					if (prefix_enabled && dup_index == 0 && !exact) {
 						size_t required = 0;
 						rc2 = mdb_prefix_inline_measure_after_insert(mc, fp,
@@ -10590,6 +10624,11 @@ mdb_node_add(MDB_cursor *mc, indx_t indx,
 	MDB_val	old_trunk = {0, NULL};
 	int	need_reencode = 0;
 	int	prefix_enabled = (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) != 0;
+
+	if (mc->mc_flags & C_SUB) {
+		fprintf(stderr, "node_add: prefix_enabled=%d indx=%u total=%u\n",
+		    prefix_enabled, indx, NUMKEYS(mp));
+	}
 
 	mdb_cassert(mc, MP_UPPER(mp) >= MP_LOWER(mp));
 
