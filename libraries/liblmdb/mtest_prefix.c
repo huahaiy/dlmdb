@@ -2233,6 +2233,19 @@ df_do_insert(MDB_env *env, MDB_dbi dbi)
 			CHECK_CALL(mdb_cursor_count(cur, &dupcount));
 			fprintf(stderr, "dfuzz debug: key %.*s txndups=%" PRIuPTR "\n",
 			    (int)key_len, keybuf, (uintptr_t)dupcount);
+			int step = 0;
+			int nrc = mdb_cursor_get(cur, &rkey, &rdata, MDB_GET_CURRENT);
+			while (nrc == MDB_SUCCESS) {
+				fprintf(stderr, "  dup[%d] len=%zu first=\"", step, rdata.mv_size);
+				size_t peek = rdata.mv_size < 8 ? rdata.mv_size : 8;
+				for (size_t j = 0; j < peek; ++j)
+					fputc(((char *)rdata.mv_data)[j], stderr);
+				fprintf(stderr, "\"\n");
+				step++;
+				nrc = mdb_cursor_get(cur, &rkey, &rdata, MDB_NEXT_DUP);
+			}
+			if (nrc != MDB_NOTFOUND)
+				fprintf(stderr, "  dup scan stop rc=%s\n", mdb_strerror(nrc));
 		} else {
 			fprintf(stderr, "dfuzz debug: key %.*s lookup rc=%d\n",
 			    (int)key_len, keybuf, grc);
@@ -2558,9 +2571,9 @@ main(void)
     test_threshold_behavior();
     test_mixed_pattern_and_unicode();
     test_cursor_buffer_sharing();
-    // test_prefix_dupsort_transitions();
-	// test_prefix_dupsort_cursor_walk();
-	// test_prefix_dupsort_get_both_range();
+    test_prefix_dupsort_transitions();
+	test_prefix_dupsort_cursor_walk();
+	test_prefix_dupsort_get_both_range();
 	test_prefix_leaf_splits();
 	test_prefix_alternating_prefixes();
 	test_prefix_update_reinsert();
@@ -2568,9 +2581,9 @@ main(void)
 	test_prefix_dupsort_inline_basic_ops();
 	test_prefix_dupsort_inline_promote();
 	test_prefix_dupsort_trunk_key_shift_no_value_change();
-	// test_prefix_dupsort_trunk_swap_inline();
-	// test_prefix_dupsort_trunk_swap_promote();
-	// test_prefix_dupsort_fuzz();
+	test_prefix_dupsort_trunk_swap_inline();
+	test_prefix_dupsort_trunk_swap_promote();
+	test_prefix_dupsort_fuzz();
 	test_nested_txn_rollback();
 	test_prefix_fuzz();
 	printf("mtest_prefix: all tests passed\n");
