@@ -10628,6 +10628,51 @@ mdb_node_add(MDB_cursor *mc, indx_t indx,
 	node_size = EVEN(node_size);
 	if (prefix_enabled && need_reencode) {
 		int rc;
+		MDB_env *env = mc->mc_txn->mt_env;
+		MDB_node *replaced = NULL;
+
+		/* Stage inline subpage into scratch so rebuild reads stable bytes. */
+		if (F_ISSET(flags, MDB_SPLIT_REPLACE) &&
+		    F_ISSET(flags, F_DUPDATA) && !F_ISSET(flags, F_SUBDATA) &&
+		    !F_ISSET(flags, F_BIGDATA) && data && data->mv_size) {
+			MDB_page *scratch = env->me_pbuf;
+			mdb_cassert(mc, scratch != NULL);
+			mdb_cassert(mc, data->mv_size <= env->me_psize);
+			if (data->mv_data != scratch)
+				memcpy(scratch, data->mv_data, data->mv_size);
+			COPY_PGNO(MP_PGNO(scratch), mp->mp_pgno);
+			MP_FLAGS(scratch) |= P_DIRTY;
+			data->mv_data = scratch;
+		}
+
+		if (F_ISSET(flags, MDB_SPLIT_REPLACE) && indx < NUMKEYS(mp)) {
+			size_t node_bytes;
+			replaced = NODEPTR(mp, indx);
+			/* Remove the old node so rebuild treats this as a fresh insert. */
+			if (F_ISSET(replaced->mn_flags, F_BIGDATA)) {
+				MDB_page *omp;
+				pgno_t pg;
+				memcpy(&pg, NODEDATA(replaced), sizeof(pg));
+				rc = mdb_page_get(mc, pg, &omp, NULL);
+				if (rc != MDB_SUCCESS)
+					return rc;
+				rc = mdb_ovpage_free(mc, omp);
+				if (rc != MDB_SUCCESS)
+					return rc;
+			}
+			node_bytes = NODESIZE + replaced->mn_ksize;
+			if (IS_BRANCH(mp) && IS_COUNTED(mp))
+				node_bytes += sizeof(uint64_t);
+			if (IS_LEAF(mp)) {
+				if (F_ISSET(replaced->mn_flags, F_BIGDATA))
+					node_bytes += sizeof(pgno_t);
+				else
+					node_bytes += NODEDSZ(replaced);
+			}
+			node_bytes = EVEN(node_bytes);
+			mdb_page_remove_slot(mc, mp, indx, node_bytes);
+			mc->mc_ki[mc->mc_top] = indx;
+		}
 
 		if (ofp != NULL) {
 			unsigned char *odata = METADATA(ofp);
