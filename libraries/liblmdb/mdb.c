@@ -3105,6 +3105,8 @@ mdb_leaf_refresh_xcursor(MDB_cursor *mc, MDB_page *mp, indx_t idx)
 {
 	MDB_xcursor *mx;
 	unsigned int numkeys;
+	MDB_page *parent;
+	MDB_cursor *sub;
 
 	if (mc == NULL)
 		return;
@@ -3113,6 +3115,42 @@ mdb_leaf_refresh_xcursor(MDB_cursor *mc, MDB_page *mp, indx_t idx)
 
 	mx = mc->mc_xcursor;
 	if (mx == NULL)
+		return;
+
+	if (mc->mc_top >= mc->mc_snum)
+		return;
+
+	parent = mc->mc_pg[mc->mc_top];
+	if (IS_SUBP(mp)) {
+		if (!parent || !IS_LEAF(parent))
+			return;
+		if (mc->mc_ki[mc->mc_top] >= NUMKEYS(parent))
+			return;
+		{
+			MDB_node *node = NODEPTR(parent, mc->mc_ki[mc->mc_top]);
+			if (!F_ISSET(node->mn_flags, F_DUPDATA))
+				return;
+			mdb_xcursor_init1(mc, node);
+		}
+		sub = &mx->mx_cursor;
+		numkeys = NUMKEYS(mp);
+		if (numkeys == 0) {
+			sub->mc_flags &= ~(C_INITIALIZED|C_EOF);
+			return;
+		}
+		if (idx >= numkeys)
+			idx = numkeys - 1;
+		sub->mc_pg[0] = mp;
+		sub->mc_snum = 1;
+		sub->mc_top = 0;
+		sub->mc_ki[0] = idx;
+		sub->mc_flags |= C_INITIALIZED;
+		sub->mc_flags &= ~C_EOF;
+		mx->mx_db.md_entries = numkeys;
+		return;
+	}
+
+	if (mp != parent)
 		return;
 
 	if (!IS_LEAF(mp) || IS_LEAF2(mp)) {
