@@ -9330,15 +9330,19 @@ mdb_cursor_next(MDB_cursor *mc, MDB_val *key, MDB_val *data, MDB_cursor_op op)
 				if (op == MDB_NEXT || op == MDB_NEXT_DUP) {
 					rc = mdb_cursor_next(&mc->mc_xcursor->mx_cursor, data, NULL, MDB_NEXT);
 					if (op != MDB_NEXT || rc != MDB_NOTFOUND) {
-						if (rc == MDB_SUCCESS && key) {
+						if (rc == MDB_SUCCESS) {
+							MDB_val *target = key ? key : &mc->mc_key;
 							if (mc->mc_key_pgno == mp->mp_pgno &&
 							    mc->mc_key_last == mc->mc_ki[mc->mc_top]) {
-								*key = mc->mc_key;
+								if (key)
+									*key = mc->mc_key;
 							} else {
-								int krc = mdb_cursor_read_key_at(mc, mp, mc->mc_ki[mc->mc_top], key);
+								int krc = mdb_cursor_read_key_at(mc, mp, mc->mc_ki[mc->mc_top], target);
 								if (krc != MDB_SUCCESS)
 									return krc;
 							}
+							mc->mc_seq_pgno = mp->mp_pgno;
+							mc->mc_seq_idx = mc->mc_ki[mc->mc_top];
 						}
 						return rc;
 					}
