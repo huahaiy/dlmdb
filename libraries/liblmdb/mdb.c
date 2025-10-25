@@ -1688,6 +1688,10 @@ struct MDB_cursor {
 	pgno_t		mc_seq_cached_pgno;	/**< page number associated with cached shared prefix */
 	unsigned int	mc_seq_cache_valid;	/**< cached shared prefix metadata valid flag */
 	unsigned int	mc_seq_keybuf_valid;	/**< mc_keybuf currently holds decoded key bytes */
+	const void	*mc_seq_cmp_keyptr;	/**< cached search key pointer for prefix compare skip */
+	size_t		mc_seq_cmp_keysize;	/**< cached search key size for prefix compare skip */
+	size_t		mc_seq_cmp_prefix;	/**< cached shared prefix between search key and trunk */
+	pgno_t		mc_seq_cmp_pgno;	/**< leaf page the compare cache applies to */
 	MDB_cursor_leaf_cache mc_leaf_cache; /**< cursor-local decoded leaf cache */
 };
 
@@ -1705,6 +1709,10 @@ mdb_cursor_seq_invalidate(MDB_cursor *mc)
 	mc->mc_seq_cached_pgno = P_INVALID;
 	mc->mc_seq_cache_valid = 0;
 	mc->mc_seq_keybuf_valid = 0;
+	mc->mc_seq_cmp_keyptr = NULL;
+	mc->mc_seq_cmp_keysize = 0;
+	mc->mc_seq_cmp_prefix = 0;
+	mc->mc_seq_cmp_pgno = P_INVALID;
 }
 
 	/** Context for sorted-dup records.
@@ -1735,6 +1743,10 @@ static void mdb_cursor_leaf_cache_clear(MDB_cursor_leaf_cache *cache);
 static int mdb_cursor_leaf_cache_ensure_prefix(MDB_txn *txn,
 	MDB_cursor_leaf_cache *cache, unsigned int count, uint64_t **out);
 static int mdb_cursor_leaf_cache_prepare(MDB_cursor *mc, MDB_page *mp);
+static size_t mdb_cursor_seq_cmp_refresh(MDB_cursor *mc, MDB_page *mp,
+	const MDB_val *search_key);
+static int mdb_cmp_memn_with_skip(const MDB_val *a, const MDB_val *b,
+	size_t skip);
 
 static int
 mdb_cursor_try_seq_fastpath(MDB_cursor *mc, MDB_page *mp, MDB_node *node,
@@ -1821,6 +1833,67 @@ mdb_cursor_try_seq_fastpath(MDB_cursor *mc, MDB_page *mp, MDB_node *node,
 	return 1;
 }
 
+static int
+mdb_cmp_memn_with_skip(const MDB_val *a, const MDB_val *b, size_t skip)
+{
+	const unsigned char *adata = (const unsigned char *)a->mv_data;
+	const unsigned char *bdata = (const unsigned char *)b->mv_data;
+	size_t alen = a->mv_size;
+	size_t blen = b->mv_size;
+	size_t minlen = alen < blen ? alen : blen;
+
+	if (skip >= minlen) {
+		if (alen == blen)
+			return 0;
+		return (alen < blen) ? -1 : 1;
+	}
+
+	size_t cmp_len = minlen - skip;
+	int diff = memcmp(adata + skip, bdata + skip, cmp_len);
+	if (diff)
+		return diff;
+	if (alen == blen)
+		return 0;
+	return (alen < blen) ? -1 : 1;
+}
+
+static size_t
+mdb_cursor_seq_cmp_refresh(MDB_cursor *mc, MDB_page *mp, const MDB_val *search_key)
+{
+	if (!mc || !mp || !search_key || !search_key->mv_data) {
+		mc->mc_seq_cmp_pgno = P_INVALID;
+		mc->mc_seq_cmp_keyptr = NULL;
+		mc->mc_seq_cmp_keysize = 0;
+		mc->mc_seq_cmp_prefix = 0;
+		return 0;
+	}
+
+	if (!(mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) ||
+	    !IS_LEAF(mp) || NUMKEYS(mp) == 0) {
+		mc->mc_seq_cmp_pgno = P_INVALID;
+		mc->mc_seq_cmp_keyptr = NULL;
+		mc->mc_seq_cmp_keysize = 0;
+		mc->mc_seq_cmp_prefix = 0;
+		return 0;
+	}
+
+	MDB_node *trunk = NODEPTR(mp, 0);
+	const unsigned char *trunk_bytes = NODEKEY(mp, trunk);
+	size_t trunk_len = trunk->mn_ksize;
+	const unsigned char *key_bytes = (const unsigned char *)search_key->mv_data;
+	size_t limit = trunk_len < search_key->mv_size ? trunk_len : search_key->mv_size;
+	size_t prefix = 0;
+
+	while (prefix < limit && trunk_bytes[prefix] == key_bytes[prefix])
+		++prefix;
+
+	mc->mc_seq_cmp_pgno = mp->mp_pgno;
+	mc->mc_seq_cmp_keyptr = search_key->mv_data;
+	mc->mc_seq_cmp_keysize = search_key->mv_size;
+	mc->mc_seq_cmp_prefix = prefix;
+	return prefix;
+}
+
 	/** Check if there is an inited xcursor */
 #define XCURSOR_INITED(mc) \
 	((mc)->mc_xcursor && ((mc)->mc_xcursor->mx_cursor.mc_flags & C_INITIALIZED))
@@ -1881,6 +1954,18 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 		    mdb_cursor_try_seq_fastpath(mc, mp, node, idx, &trunk, out, scratch))
 			return MDB_SUCCESS;
 
+		size_t shared_hint = 0;
+		if (idx > 0 && prefix_enabled && node->mn_ksize > 0) {
+			uint64_t shared64 = 0;
+			size_t used = 0;
+			int shrc = mdb_prefix_decode_shared(encoded, node->mn_ksize, &shared64, &used);
+			if (shrc == MDB_SUCCESS) {
+				if (shared64 > trunk.mv_size)
+					shared64 = trunk.mv_size;
+				shared_hint = (size_t)shared64;
+			}
+		}
+
 		if (!IS_SUBP(mp) &&
 		    (mc->mc_txn->mt_flags & MDB_TXN_RDONLY) &&
 		    (mc->mc_flags & C_LEAFCACHE) &&
@@ -1908,6 +1993,7 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 					scratch->metrics.leaf_decode_cache_hits++;
 				}
 				*out = cache->decoded_vals[idx];
+				mc->mc_seq_shared = shared_hint;
 				return MDB_SUCCESS;
 			}
 		}
@@ -1921,7 +2007,7 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 
 		mc->mc_key_pgno = mp->mp_pgno;
 		mc->mc_key_last = idx;
-		mc->mc_seq_shared = 0;
+		mc->mc_seq_shared = shared_hint;
 		mc->mc_seq_keybuf_valid = 1;
 		mc->mc_seq_cache_valid = 0;
 		mc->mc_seq_cached_pgno = P_INVALID;
@@ -8301,6 +8387,7 @@ mdb_node_search(MDB_cursor *mc, MDB_val *key, int *exactp)
 	low = IS_LEAF(mp) ? 0 : 1;
 	high = nkeys - 1;
 	cmp = mc->mc_dbx->md_cmp;
+	int prefix_enabled = (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) != 0;
 
 	/* Branch pages have no data, so if using integer keys,
 	 * alignment is guaranteed. Use faster mdb_cmp_int.
@@ -8342,7 +8429,17 @@ mdb_node_search(MDB_cursor *mc, MDB_val *key, int *exactp)
 				nodekey.mv_data = NODEKEY(mp, node);
 			}
 
-			cmp_res = cmp(key, &nodekey);
+			if (cmp == mdb_cmp_memn && prefix_enabled && key && key->mv_data && IS_LEAF(mp)) {
+				size_t prefix = mdb_cursor_seq_cmp_refresh(mc, mp, key);
+				size_t shared = mc->mc_seq_shared;
+				size_t skip = shared < prefix ? shared : prefix;
+				if (skip)
+					cmp_res = mdb_cmp_memn_with_skip(key, &nodekey, skip);
+				else
+					cmp_res = cmp(key, &nodekey);
+			} else {
+				cmp_res = cmp(key, &nodekey);
+			}
 #if MDB_DEBUG
 			if (IS_LEAF(mp))
 				DPRINTF(("found leaf index %u [%s], rc = %i",
@@ -12430,6 +12527,10 @@ mdb_cursor_copy(const MDB_cursor *csrc, MDB_cursor *cdst)
 	cdst->mc_seq_cache_valid = csrc->mc_seq_cache_valid;
 	cdst->mc_seq_keybuf_valid = 0;
 	mdb_cursor_leaf_cache_reset(&cdst->mc_leaf_cache);
+	cdst->mc_seq_cmp_keyptr = NULL;
+	cdst->mc_seq_cmp_keysize = 0;
+	cdst->mc_seq_cmp_prefix = 0;
+	cdst->mc_seq_cmp_pgno = P_INVALID;
 	if (csrc->mc_key.mv_size && csrc->mc_key.mv_size <= MDB_KEYBUF_MAX) {
 		memcpy(cdst->mc_keybuf, csrc->mc_keybuf, csrc->mc_key.mv_size);
 		cdst->mc_key.mv_size = csrc->mc_key.mv_size;
