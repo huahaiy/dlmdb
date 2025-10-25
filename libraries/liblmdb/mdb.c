@@ -10412,12 +10412,13 @@ finish_put:
 						MDB_node *dup = NODEPTR(inline_pg, i);
 						fprintf(stderr,
 						    "  inline slot[%u]: flags=0x%x ksize=%u dsize=%u\n",
-						    i, dup->mn_flags, dup->mn_ksize, NODEDSZ(dup));
+					    i, dup->mn_flags, dup->mn_ksize, NODEDSZ(dup));
 					}
 				}
 			}
 			mdb_xcursor_init1(mc, leaf);
-			insert_data = 1;
+			if (mc->mc_db->md_flags & MDB_DUPSORT)
+				insert_data = 1;
 			{
 				MDB_cursor *m2;
 				unsigned i = mc->mc_top;
@@ -11508,7 +11509,7 @@ int
 mdb_cursor_open(MDB_txn *txn, MDB_dbi dbi, MDB_cursor **ret)
 {
 	MDB_cursor	*mc;
-	size_t size = sizeof(MDB_cursor);
+	size_t size = sizeof(MDB_cursor) + sizeof(MDB_xcursor);
 
 	if (!ret || !TXN_DBI_EXIST(txn, dbi, DB_VALID))
 		return EINVAL;
@@ -11518,9 +11519,6 @@ mdb_cursor_open(MDB_txn *txn, MDB_dbi dbi, MDB_cursor **ret)
 
 	if (dbi == FREE_DBI && !F_ISSET(txn->mt_flags, MDB_TXN_RDONLY))
 		return EINVAL;
-
-	if (txn->mt_dbs[dbi].md_flags & MDB_DUPSORT)
-		size += sizeof(MDB_xcursor);
 
 	if ((mc = calloc(1, size)) != NULL) {
 		mdb_cursor_init(mc, txn, dbi, (MDB_xcursor *)(mc + 1));
@@ -11566,6 +11564,9 @@ mdb_cursor_count(MDB_cursor *mc, mdb_size_t *countp)
 		return EINVAL;
 
 	if (mc->mc_xcursor == NULL)
+		return MDB_INCOMPATIBLE;
+
+	if (!(mc->mc_db->md_flags & MDB_DUPSORT))
 		return MDB_INCOMPATIBLE;
 
 	if (mc->mc_txn->mt_flags & MDB_TXN_BLOCKED)

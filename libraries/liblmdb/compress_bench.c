@@ -794,12 +794,6 @@ bench_do_updates(const bench_config *cfg, const bench_variant *variant,
 	if (cfg->update_ops == 0)
 		return;
 
-	if (variant->use_dupsort) {
-		fprintf(stderr, "[%s] updates start (ops=%zu)\n",
-		    variant->label, cfg->update_ops);
-		fflush(stderr);
-	}
-
 	MDB_txn *txn = NULL;
 	CHECK_RC(mdb_txn_begin(env, NULL, 0, &txn), "mdb_txn_begin(update)");
 
@@ -871,12 +865,6 @@ bench_do_updates(const bench_config *cfg, const bench_variant *variant,
 			CHECK_RC(mdb_put(txn, dbi, &key, &val, 0),
 			    "mdb_put(update)");
 		}
-		if (variant->use_dupsort &&
-		    ((i + 1) % 25000 == 0 || i + 1 == cfg->update_ops)) {
-			fprintf(stderr, "[%s] updates progress %zu/%zu\n",
-			    variant->label, i + 1, cfg->update_ops);
-			fflush(stderr);
-		}
 	}
 
 	clock_gettime(CLOCK_MONOTONIC, &end);
@@ -890,11 +878,7 @@ bench_do_updates(const bench_config *cfg, const bench_variant *variant,
 		free(valbuf);
 	free(keybuf);
 
-	bench_record_timing(&m->updates, cfg->update_ops, &start, &end);
-	if (variant->use_dupsort) {
-		fprintf(stderr, "[%s] updates done\n", variant->label);
-		fflush(stderr);
-	}
+    bench_record_timing(&m->updates, cfg->update_ops, &start, &end);
 }
 
 static size_t
@@ -906,12 +890,6 @@ bench_do_deletes(const bench_config *cfg, const bench_variant *variant,
 		if (out_indices)
 			*out_indices = NULL;
 		return 0;
-	}
-
-	if (variant->use_dupsort) {
-		fprintf(stderr, "[%s] deletes start (ops=%zu)\n",
-		    variant->label, cfg->delete_ops);
-		fflush(stderr);
 	}
 
 	size_t actual = cfg->delete_ops;
@@ -1014,16 +992,12 @@ bench_do_deletes(const bench_config *cfg, const bench_variant *variant,
 		free(valbuf);
 	free(keybuf);
 
-	bench_record_timing(&m->deletes, actual, &start, &end);
-		if (out_indices)
-			*out_indices = indices;
-		else
-			free(indices);
-	if (variant->use_dupsort) {
-		fprintf(stderr, "[%s] deletes done\n", variant->label);
-		fflush(stderr);
-	}
-	return actual;
+    bench_record_timing(&m->deletes, actual, &start, &end);
+    if (out_indices)
+        *out_indices = indices;
+    else
+        free(indices);
+    return actual;
 }
 
 static void
@@ -1033,12 +1007,6 @@ bench_do_reinserts(const bench_config *cfg, const bench_variant *variant,
 {
 	if (!indices || count == 0)
 		return;
-
-	if (variant->use_dupsort) {
-		fprintf(stderr, "[%s] reinserts start (count=%zu)\n",
-		    variant->label, count);
-		fflush(stderr);
-	}
 
 	MDB_txn *txn = NULL;
 	CHECK_RC(mdb_txn_begin(env, NULL, 0, &txn), "mdb_txn_begin(reinsert)");
@@ -1069,12 +1037,6 @@ bench_do_reinserts(const bench_config *cfg, const bench_variant *variant,
 		CHECK_RC(mdb_put(txn, dbi, &key, &val, 0), "mdb_put(reinsert)");
 		if (versions)
 			versions[idx] = 0;
-		if (variant->use_dupsort &&
-		    ((i + 1) % 25000 == 0 || i + 1 == count)) {
-			fprintf(stderr, "[%s] reinserts progress %zu/%zu\n",
-			    variant->label, i + 1, count);
-			fflush(stderr);
-		}
 	}
 
 	clock_gettime(CLOCK_MONOTONIC, &end);
@@ -1085,10 +1047,6 @@ bench_do_reinserts(const bench_config *cfg, const bench_variant *variant,
 	free(keybuf);
 
 	bench_record_timing(&m->reinserts, count, &start, &end);
-	if (variant->use_dupsort) {
-		fprintf(stderr, "[%s] reinserts done\n", variant->label);
-		fflush(stderr);
-	}
 }
 
 static void
@@ -1127,14 +1085,6 @@ bench_do_reads(const bench_config *cfg, const bench_variant *variant,
 {
 	if (!timing || cfg->read_ops == 0)
 		return;
-
-	if (variant->use_dupsort) {
-		const char *phase = (timing == &variant->metrics.read_cold)
-		    ? "cold" : "warm";
-		fprintf(stderr, "[%s] %s reads start (ops=%zu)\n",
-		    variant->label, phase, cfg->read_ops);
-		fflush(stderr);
-	}
 
 	MDB_txn *txn = NULL;
 	CHECK_RC(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn),
@@ -1207,10 +1157,6 @@ bench_do_reads(const bench_config *cfg, const bench_variant *variant,
 	free(keybuf);
 
 	bench_record_timing(timing, cfg->read_ops, &start, &end);
-	if (variant->use_dupsort) {
-		fprintf(stderr, "[%s] reads done\n", variant->label);
-		fflush(stderr);
-	}
 }
 
 static void
@@ -1223,13 +1169,6 @@ bench_do_scan(const bench_config *cfg, const bench_variant *variant,
 {
 	if (!timing)
 		return;
-
-	if (variant->use_dupsort) {
-		const char *phase =
-		    (timing == &variant->metrics.scan_cold) ? "cold" : "warm";
-		fprintf(stderr, "[%s] %s scan start\n", variant->label, phase);
-		fflush(stderr);
-	}
 
 	MDB_txn *txn = NULL;
 	CHECK_RC(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn),
@@ -1312,11 +1251,7 @@ bench_do_scan(const bench_config *cfg, const bench_variant *variant,
 	mdb_cursor_close(cursor);
 	mdb_txn_abort(txn);
 
-	bench_record_timing(timing, count, &start, &end);
-	if (variant->use_dupsort) {
-		fprintf(stderr, "[%s] scan done\n", variant->label);
-		fflush(stderr);
-	}
+    bench_record_timing(timing, count, &start, &end);
 }
 
 static void
