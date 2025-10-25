@@ -2341,6 +2341,29 @@ mdb_prefix_ensure_snapshot(MDB_txn *txn, size_t size, MDB_page **out)
 	return MDB_SUCCESS;
 }
 
+static void
+mdb_prefix_snapshot_capture(MDB_page *dst, MDB_page *src, size_t capacity)
+{
+	unsigned char *dst_bytes = (unsigned char *)dst;
+	const unsigned char *src_bytes = (const unsigned char *)src;
+	size_t header_bytes = PAGEHDRSZ;
+
+	if (capacity < header_bytes)
+		header_bytes = capacity;
+	memcpy(dst_bytes, src_bytes, header_bytes);
+
+	unsigned int keys = NUMKEYS(src);
+	if (keys) {
+		memcpy(MP_PTRS(dst), MP_PTRS(src), keys * sizeof(indx_t));
+	}
+
+	indx_t upper = MP_UPPER(src);
+	if ((size_t)upper < capacity) {
+		size_t tail = capacity - (size_t)upper;
+		memcpy(dst_bytes + upper, src_bytes + upper, tail);
+	}
+}
+
 static int
 mdb_prefix_ensure_entries(MDB_txn *txn, unsigned int count, MDB_prefix_rebuild_entry **out)
 {
@@ -2842,7 +2865,7 @@ mdb_leaf_rebuild_after_trunk_delete(MDB_cursor *mc, MDB_page *mp, indx_t removed
 	rc = mdb_prefix_ensure_snapshot(txn, env->me_psize, &snapshot);
 	if (rc != MDB_SUCCESS)
 		return rc;
-	memcpy(snapshot, mp, capacity);
+	mdb_prefix_snapshot_capture(snapshot, mp, capacity);
 
 	if (remain == 0) {
 		rc = mdb_leaf_rebuild_apply(mc, mp, NULL, 0, capacity);
@@ -2958,7 +2981,7 @@ mdb_prefix_inline_measure_after_insert(MDB_cursor *mc, MDB_page *mp,
 		return rc;
 
 	memset(snapshot, 0, env->me_psize);
-	memcpy(snapshot, mp, current_capacity);
+	mdb_prefix_snapshot_capture(snapshot, mp, current_capacity);
 
 	rc = mdb_prefix_ensure_entries(txn, new_total, &entries);
 	if (rc != MDB_SUCCESS)
@@ -3176,7 +3199,7 @@ mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp,
 	rc = mdb_prefix_ensure_snapshot(txn, env->me_psize, &snapshot);
 	if (rc != MDB_SUCCESS)
 		return rc;
-	memcpy(snapshot, mp, capacity);
+	mdb_prefix_snapshot_capture(snapshot, mp, capacity);
 
 	rc = mdb_prefix_ensure_entries(txn, new_total, &entries);
 	if (rc != MDB_SUCCESS)
