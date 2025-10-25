@@ -1797,18 +1797,18 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 		MDB_prefix_scratch *scratch = &mc->mc_txn->mt_prefix;
 		const unsigned char *encoded = NODEKEY(mp, node);
 
-		if (!prefix_enabled || idx == 0) {
-			if (prefix_enabled && idx == 0) {
-				scratch->metrics.leaf_decode_cache_hits++;
-				mc->mc_key_pgno = mp->mp_pgno;
-				mc->mc_key_last = idx;
-				mc->mc_key.mv_size = node->mn_ksize;
-				mc->mc_key.mv_data = encoded;
+			if (!prefix_enabled || idx == 0) {
+				if (prefix_enabled && idx == 0) {
+					scratch->metrics.leaf_decode_cache_hits++;
+					mc->mc_key_pgno = mp->mp_pgno;
+					mc->mc_key_last = idx;
+					mc->mc_key.mv_size = node->mn_ksize;
+					mc->mc_key.mv_data = (void *)encoded;
+				}
+				out->mv_size = node->mn_ksize;
+				out->mv_data = (void *)encoded;
+				return MDB_SUCCESS;
 			}
-			out->mv_size = node->mn_ksize;
-			out->mv_data = encoded;
-			return MDB_SUCCESS;
-		}
 
 		MDB_node *trunk_node = NODEPTR(mp, 0);
 		MDB_val trunk = { trunk_node->mn_ksize, NODEKEY(mp, trunk_node) };
@@ -2097,6 +2097,28 @@ mdb_prefix_leaf_maxdecoded(const MDB_page *mp)
 	return max_len ? max_len : trunk_len;
 }
 
+static size_t
+mdb_prefix_prealloc_size(MDB_txn *txn)
+{
+	MDB_env *env = txn->mt_env;
+	size_t limit = mdb_prefix_maxkey(env);
+
+	if (!limit) {
+		if (env->me_nodemax)
+			limit = env->me_nodemax;
+		else if (env->me_psize)
+			limit = env->me_psize;
+	}
+
+	size_t prealloc = limit;
+	if (!prealloc || prealloc < 4096)
+		prealloc = 4096;
+	else if (prealloc <= (SIZE_MAX >> 1))
+		prealloc <<= 1;
+
+	return prealloc;
+}
+
 typedef struct MDB_prefix_rebuild_entry {
 	MDB_val key;
 	const unsigned char *data_ptr;
@@ -2110,13 +2132,34 @@ static int
 mdb_prefix_ensure_snapshot(MDB_txn *txn, size_t size, MDB_page **out)
 {
 	MDB_prefix_scratch *scratch = &txn->mt_prefix;
+	size_t baseline = mdb_prefix_prealloc_size(txn);
+	size_t required = size;
 
-	if (scratch->snapshot_size < size) {
-		void *ptr = realloc(scratch->snapshot, size);
+	if (required < baseline)
+		required = baseline;
+
+	if (scratch->snapshot_size < required) {
+		size_t newsize = scratch->snapshot_size;
+
+		if (!newsize || newsize < baseline)
+			newsize = baseline;
+
+		if (!newsize)
+			newsize = required;
+
+		while (newsize < required) {
+			if (newsize > (SIZE_MAX >> 1)) {
+				newsize = required;
+				break;
+			}
+			newsize <<= 1;
+		}
+
+		void *ptr = realloc(scratch->snapshot, newsize);
 		if (!ptr)
 			return ENOMEM;
 		scratch->snapshot = ptr;
-		scratch->snapshot_size = size;
+		scratch->snapshot_size = newsize;
 	}
 	if (out)
 		*out = (MDB_page *)scratch->snapshot;
@@ -2127,19 +2170,43 @@ static int
 mdb_prefix_ensure_entries(MDB_txn *txn, unsigned int count, MDB_prefix_rebuild_entry **out)
 {
 	MDB_prefix_scratch *scratch = &txn->mt_prefix;
+	size_t baseline_bytes = mdb_prefix_prealloc_size(txn);
+	unsigned int baseline = 0;
 
 	if (count == 0) {
 		if (out)
 			*out = NULL;
 		return MDB_SUCCESS;
 	}
-	if (scratch->entries_cap < count) {
+
+	if (baseline_bytes >= sizeof(MDB_prefix_rebuild_entry))
+		baseline = (unsigned int)(baseline_bytes / sizeof(MDB_prefix_rebuild_entry));
+	if (!baseline)
+		baseline = 32;
+	unsigned int target = count;
+	if (target < baseline)
+		target = baseline;
+
+	if (scratch->entries_cap < target) {
+		unsigned int newcap = scratch->entries_cap;
+
+		if (!newcap || newcap < baseline)
+			newcap = baseline;
+
+		while (newcap < target) {
+			if (newcap > (UINT_MAX >> 1)) {
+				newcap = target;
+				break;
+			}
+			newcap <<= 1;
+		}
+
 		MDB_prefix_rebuild_entry *ptr = realloc(scratch->entries,
-		    sizeof(MDB_prefix_rebuild_entry) * count);
+		    sizeof(MDB_prefix_rebuild_entry) * newcap);
 		if (!ptr)
 			return ENOMEM;
 		scratch->entries = ptr;
-		scratch->entries_cap = count;
+		scratch->entries_cap = newcap;
 	}
 	if (out)
 		*out = scratch->entries;
@@ -2150,15 +2217,35 @@ static int
 mdb_prefix_ensure_keybuf(MDB_txn *txn, size_t size, unsigned char **out)
 {
 	MDB_prefix_scratch *scratch = &txn->mt_prefix;
+	size_t baseline = mdb_prefix_prealloc_size(txn);
+	size_t required = size;
 
 	if (size == 0)
-		size = 1;
-	if (scratch->keybuf_size < size) {
-		unsigned char *ptr = realloc(scratch->keybuf, size);
+		required = 1;
+	if (required < baseline)
+		required = baseline;
+
+	if (scratch->keybuf_size < required) {
+		size_t newsize = scratch->keybuf_size;
+
+		if (!newsize || newsize < baseline)
+			newsize = baseline;
+		if (!newsize)
+			newsize = required;
+
+		while (newsize < required) {
+			if (newsize > (SIZE_MAX >> 1)) {
+				newsize = required;
+				break;
+			}
+			newsize <<= 1;
+		}
+
+		unsigned char *ptr = realloc(scratch->keybuf, newsize);
 		if (!ptr)
 			return ENOMEM;
 		scratch->keybuf = ptr;
-		scratch->keybuf_size = size;
+		scratch->keybuf_size = newsize;
 	}
 	if (out)
 		*out = scratch->keybuf;
@@ -2280,12 +2367,27 @@ mdb_prefix_ensure_prefix(MDB_txn *txn, unsigned int count, uint64_t **out)
 	if (count == 0)
 		count = 1;
 	if (scratch->decoded_prefix_cap < count) {
-		unsigned int newcap = scratch->decoded_prefix_cap ? scratch->decoded_prefix_cap : 16;
-		while (newcap < count) {
-			if (newcap > (UINT_MAX / 2))
-				newcap = count;
-			else
-				newcap *= 2;
+		size_t baseline_bytes = mdb_prefix_prealloc_size(txn);
+		unsigned int baseline = 0;
+		unsigned int target = count;
+
+		if (baseline_bytes >= sizeof(uint64_t))
+			baseline = (unsigned int)(baseline_bytes / sizeof(uint64_t));
+		if (!baseline)
+			baseline = 32;
+		if (target < baseline)
+			target = baseline;
+
+		unsigned int newcap = scratch->decoded_prefix_cap;
+		if (!newcap || newcap < baseline)
+			newcap = baseline;
+
+		while (newcap < target) {
+			if (newcap > (UINT_MAX >> 1)) {
+				newcap = target;
+				break;
+			}
+			newcap <<= 1;
 		}
 		uint64_t *vals = realloc(scratch->decoded_prefix, sizeof(uint64_t) * newcap);
 		if (!vals)
