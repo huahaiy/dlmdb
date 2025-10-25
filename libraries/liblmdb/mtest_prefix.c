@@ -97,6 +97,7 @@ static void assert_dup_sequence(MDB_env *env, MDB_dbi dbi, const char *key,
     const char *const *expected, size_t expected_count);
 static void test_prefix_dupsort_inline_basic_ops(void);
 static void test_prefix_dupsort_inline_promote(void);
+static void test_prefix_dupsort_inline_cmp_negative(void);
 static void test_prefix_dupsort_trunk_swap_inline(void);
 static void test_prefix_dupsort_trunk_swap_promote(void);
 static void test_prefix_dupsort_trunk_key_shift_no_value_change(void);
@@ -1524,6 +1525,48 @@ test_prefix_dupsort_trunk_key_shift_no_value_change(void)
 	assert_dup_sequence(env, dbi, key,
 	    expected_after, ARRAY_SIZE(expected_after));
 
+mdb_env_close(env);
+}
+
+static void
+test_prefix_dupsort_inline_cmp_negative(void)
+{
+	static const char *dir = "testdb_prefix_inline_cmp_negative";
+	static const char *key = "dup-inline-cmp-negative";
+	const size_t old_len = 145;
+	const size_t new_len = 146;
+	char old_dup[old_len + 1];
+	char new_dup[new_len + 1];
+	const char *expected[] = { NULL, NULL };
+
+	memset(old_dup, 'Z', old_len);
+	old_dup[old_len] = '\0';
+	memset(new_dup, 'A', new_len);
+	new_dup[new_len] = '\0';
+	expected[0] = new_dup;
+	expected[1] = old_dup;
+
+	MDB_env *env = create_env(dir);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+	MDB_val mkey = { strlen(key), (void *)key };
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL,
+	    MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_DUPSORT, &dbi));
+	MDB_val data = { old_len, old_dup };
+	CHECK_CALL(mdb_put(txn, dbi, &mkey, &data, 0));
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	data.mv_size = new_len;
+	data.mv_data = new_dup;
+	CHECK_CALL(mdb_put(txn, dbi, &mkey, &data, 0));
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	assert_dup_sequence(env, dbi, key,
+	    expected, ARRAY_SIZE(expected));
+
 	mdb_env_close(env);
 }
 
@@ -2580,6 +2623,7 @@ main(void)
 	test_prefix_dupsort_smoke();
 	test_prefix_dupsort_inline_basic_ops();
 	test_prefix_dupsort_inline_promote();
+	test_prefix_dupsort_inline_cmp_negative();
 	test_prefix_dupsort_trunk_key_shift_no_value_change();
 	test_prefix_dupsort_trunk_swap_inline();
 	test_prefix_dupsort_trunk_swap_promote();
