@@ -1710,6 +1710,60 @@ static void mdb_cursor_leaf_cache_reset(MDB_cursor_leaf_cache *cache);
 static void mdb_cursor_leaf_cache_clear(MDB_cursor_leaf_cache *cache);
 static int mdb_cursor_leaf_cache_prepare(MDB_cursor *mc, MDB_page *mp);
 
+static int
+mdb_cursor_try_seq_fastpath(MDB_cursor *mc, MDB_page *mp, MDB_node *node,
+	indx_t idx, const MDB_val *trunk, MDB_val *out,
+	MDB_prefix_scratch *scratch)
+{
+	const unsigned char *encoded = NODEKEY(mp, node);
+	size_t encoded_len = node->mn_ksize;
+	size_t used = 0;
+	size_t shared = 0;
+
+	if (!encoded_len)
+		return 0;
+
+	unsigned char first = encoded[0];
+	if ((first & 0x80) == 0) {
+		shared = first;
+		used = 1;
+	} else {
+		uint64_t shared64 = 0;
+		int vrc = mdb_varint_decode(encoded, encoded_len, &shared64, &used);
+		if (vrc != MDB_SUCCESS)
+			return 0;
+		shared = (size_t)shared64;
+	}
+
+	if (used > encoded_len)
+		return 0;
+
+	size_t trunk_len = trunk->mv_size;
+	if (shared > trunk_len)
+		shared = trunk_len;
+
+	size_t suffix_len = encoded_len - used;
+	size_t needed = shared + suffix_len;
+
+	if (needed > MDB_KEYBUF_MAX)
+		return 0;
+
+	unsigned char *dst = mc->mc_keybuf;
+
+	if (shared)
+		memcpy(dst, trunk->mv_data, shared);
+	if (suffix_len)
+		memcpy(dst + shared, encoded + used, suffix_len);
+
+	mc->mc_key.mv_data = dst;
+	mc->mc_key.mv_size = needed;
+	mc->mc_key_pgno = mp->mp_pgno;
+	mc->mc_key_last = idx;
+	scratch->metrics.leaf_decode_cache_hits++;
+	*out = mc->mc_key;
+	return 1;
+}
+
 	/** Check if there is an inited xcursor */
 #define XCURSOR_INITED(mc) \
 	((mc)->mc_xcursor && ((mc)->mc_xcursor->mx_cursor.mc_flags & C_INITIALIZED))
@@ -1741,6 +1795,7 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 	if (IS_LEAF(mp)) {
 		int prefix_enabled = (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) != 0;
 		MDB_prefix_scratch *scratch = &mc->mc_txn->mt_prefix;
+		const unsigned char *encoded = NODEKEY(mp, node);
 
 		if (!prefix_enabled || idx == 0) {
 			if (prefix_enabled && idx == 0) {
@@ -1748,17 +1803,24 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 				mc->mc_key_pgno = mp->mp_pgno;
 				mc->mc_key_last = idx;
 				mc->mc_key.mv_size = node->mn_ksize;
-				mc->mc_key.mv_data = NODEKEY(mp, node);
+				mc->mc_key.mv_data = encoded;
 			}
 			out->mv_size = node->mn_ksize;
-			out->mv_data = NODEKEY(mp, node);
+			out->mv_data = encoded;
 			return MDB_SUCCESS;
 		}
 
-	if (prefix_enabled && !IS_SUBP(mp) &&
-	    (mc->mc_txn->mt_flags & MDB_TXN_RDONLY) &&
-	    (mc->mc_flags & C_LEAFCACHE) &&
-	    !(mc->mc_flags & C_SEQEXPECT)) {
+		MDB_node *trunk_node = NODEPTR(mp, 0);
+		MDB_val trunk = { trunk_node->mn_ksize, NODEKEY(mp, trunk_node) };
+
+		if ((mc->mc_flags & C_SEQEXPECT) &&
+		    mdb_cursor_try_seq_fastpath(mc, mp, node, idx, &trunk, out, scratch))
+			return MDB_SUCCESS;
+
+		if (!IS_SUBP(mp) &&
+		    (mc->mc_txn->mt_flags & MDB_TXN_RDONLY) &&
+		    (mc->mc_flags & C_LEAFCACHE) &&
+		    !(mc->mc_flags & C_SEQEXPECT)) {
 			int prc = mdb_cursor_leaf_cache_prepare(mc, mp);
 			if (prc != MDB_SUCCESS)
 				return prc;
@@ -1767,10 +1829,9 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 			    cache->decoded_pgno == mp->mp_pgno) {
 				if (!cache->decoded_ready[idx]) {
 					MDB_val *slot = &cache->decoded_vals[idx];
-					const unsigned char *encoded = NODEKEY(mp, node);
 					int fast_path = node->mn_ksize > 0 && (encoded[0] & 0x80) == 0;
 					int drc = mdb_leaf_decode_key(&cache->decoded_vals[0],
-					    NODEKEY(mp, node), node->mn_ksize,
+					    encoded, node->mn_ksize,
 					    slot, slot->mv_data, cache->decoded_stride, 0);
 					if (drc != MDB_SUCCESS)
 						return drc;
@@ -1789,63 +1850,7 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 
 		mc->mc_key.mv_data = mc->mc_keybuf;
 
-	if (prefix_enabled && idx > 0 && (mc->mc_flags & C_SEQEXPECT)) {
-		const unsigned char *encoded = NODEKEY(mp, node);
-		size_t encoded_len = node->mn_ksize;
-
-		if (encoded_len > 0) {
-			size_t used = 0;
-			size_t shared = 0;
-			unsigned char first = encoded[0];
-
-			if ((first & 0x80) == 0) {
-				shared = first;
-				used = 1;
-			} else {
-				uint64_t shared64 = 0;
-				int vrc = mdb_varint_decode(encoded, encoded_len,
-				    &shared64, &used);
-				if (vrc == MDB_SUCCESS)
-					shared = (size_t)shared64;
-				else
-					used = encoded_len + 1; /* force fallback */
-			}
-
-			if (used <= encoded_len) {
-				MDB_node *trunk_node = NODEPTR(mp, 0);
-				const unsigned char *trunk_key = NODEKEY(mp, trunk_node);
-				size_t trunk_len = trunk_node->mn_ksize;
-				const unsigned char *suffix = encoded + used;
-				size_t suffix_len = encoded_len - used;
-				size_t needed;
-
-				if (shared > trunk_len)
-					shared = trunk_len;
-				needed = shared + suffix_len;
-
-				if (needed <= MDB_KEYBUF_MAX) {
-					unsigned char *dst = mc->mc_keybuf;
-
-					if (shared)
-						memcpy(dst, trunk_key, shared);
-					if (suffix_len)
-						memcpy(dst + shared, suffix, suffix_len);
-
-					mc->mc_key.mv_data = dst;
-					mc->mc_key.mv_size = needed;
-					mc->mc_key_pgno = mp->mp_pgno;
-					mc->mc_key_last = idx;
-					scratch->metrics.leaf_decode_cache_hits++;
-					*out = mc->mc_key;
-					return MDB_SUCCESS;
-				}
-			}
-		}
-	}
-
-		MDB_node *trunk_node = NODEPTR(mp, 0);
-		MDB_val trunk = { trunk_node->mn_ksize, NODEKEY(mp, trunk_node) };
-		int rc = mdb_leaf_decode_key(&trunk, NODEKEY(mp, node), node->mn_ksize,
+		int rc = mdb_leaf_decode_key(&trunk, encoded, node->mn_ksize,
 		    &mc->mc_key, mc->mc_keybuf, MDB_KEYBUF_MAX, 0);
 		if (rc != MDB_SUCCESS)
 			return rc;
@@ -1853,8 +1858,7 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 		mc->mc_key_pgno = mp->mp_pgno;
 		mc->mc_key_last = idx;
 		if (prefix_enabled) {
-			const unsigned char *encoded = NODEKEY(mp, node);
-			int fast_path = (encoded[0] & 0x80) == 0;
+			int fast_path = node->mn_ksize > 0 && (encoded[0] & 0x80) == 0;
 			scratch->metrics.leaf_decode_calls++;
 			scratch->metrics.leaf_decode_cache_misses++;
 			if (fast_path)
