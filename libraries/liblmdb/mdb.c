@@ -2279,6 +2279,10 @@ typedef struct MDB_prefix_rebuild_entry {
 	size_t data_size;
 	unsigned short encoded_ksize;
 	unsigned short flags;
+	const unsigned char *encoded_key;	/**< source encoded key bytes */
+	unsigned short encoded_len;		/**< length of encoded_key */
+	unsigned short encoded_used;		/**< prefix header bytes consumed during decode */
+	unsigned short shared_prefix;		/**< decoded shared prefix length; UINT16_MAX when raw */
 } MDB_prefix_rebuild_entry;
 
 static int
@@ -2911,9 +2915,7 @@ mdb_prefix_inline_measure_after_insert(MDB_cursor *mc, MDB_page *mp,
 	MDB_prefix_rebuild_entry *entries;
 	unsigned char *key_storage;
 	unsigned char *key_cursor;
-	unsigned char keybuf[MDB_KEYBUF_MAX];
 	unsigned char old_trunk_buf[MDB_KEYBUF_MAX];
-	MDB_val decoded = {0, keybuf};
 	MDB_val old_trunk = {0, NULL};
 	size_t total_key_bytes = 0;
 	unsigned int i;
@@ -2947,7 +2949,9 @@ mdb_prefix_inline_measure_after_insert(MDB_cursor *mc, MDB_page *mp,
 		memcpy(old_trunk_buf, NODEKEY(snapshot, first), old_trunk.mv_size);
 	}
 
-	int have_old_trunk = old_trunk.mv_data != NULL && old_trunk.mv_size > 0;
+	int have_old_trunk = old_trunk.mv_data != NULL;
+	const unsigned char *trunk_bytes = have_old_trunk ? (const unsigned char *)old_trunk.mv_data : NULL;
+	size_t trunk_len = have_old_trunk ? old_trunk.mv_size : 0;
 
 	for (i = 0; i < new_total; ++i) {
 		if (i == insert) {
@@ -2965,6 +2969,10 @@ mdb_prefix_inline_measure_after_insert(MDB_cursor *mc, MDB_page *mp,
 				entries[i].data_ptr = new_data->mv_data;
 			entries[i].key.mv_size = new_key->mv_size;
 			entries[i].encoded_ksize = 0;
+			entries[i].encoded_key = NULL;
+			entries[i].encoded_len = 0;
+			entries[i].encoded_used = 0;
+			entries[i].shared_prefix = UINT16_MAX;
 			total_key_bytes += entries[i].key.mv_size;
 			continue;
 		}
@@ -2980,6 +2988,10 @@ mdb_prefix_inline_measure_after_insert(MDB_cursor *mc, MDB_page *mp,
 			entries[i].data_payload = entries[i].data_size;
 		entries[i].data_ptr = NODEDATA(src);
 		entries[i].encoded_ksize = 0;
+		entries[i].encoded_key = NODEKEY(snapshot, src);
+		entries[i].encoded_len = src->mn_ksize;
+		entries[i].encoded_used = 0;
+		entries[i].shared_prefix = UINT16_MAX;
 
 		if (src_idx == 0) {
 			if (have_old_trunk &&
@@ -2987,22 +2999,32 @@ mdb_prefix_inline_measure_after_insert(MDB_cursor *mc, MDB_page *mp,
 			    memcmp(NODEKEY(snapshot, src), old_trunk.mv_data, src->mn_ksize) == 0) {
 				entries[i].key.mv_size = old_trunk.mv_size;
 			} else {
-				rc = mdb_leaf_decode_key(&old_trunk, NODEKEY(snapshot, src),
-				    src->mn_ksize, &decoded, keybuf, MDB_KEYBUF_MAX, 0);
-				if (rc != MDB_SUCCESS)
-					return rc;
-				entries[i].key.mv_size = decoded.mv_size;
+				entries[i].key.mv_size = src->mn_ksize;
 			}
 		} else if (have_old_trunk &&
 		    src->mn_ksize == old_trunk.mv_size &&
 		    memcmp(NODEKEY(snapshot, src), old_trunk.mv_data, src->mn_ksize) == 0) {
 			entries[i].key.mv_size = old_trunk.mv_size;
 		} else {
-			rc = mdb_leaf_decode_key(&old_trunk, NODEKEY(snapshot, src),
-			    src->mn_ksize, &decoded, keybuf, MDB_KEYBUF_MAX, 0);
-			if (rc != MDB_SUCCESS)
-				return rc;
-			entries[i].key.mv_size = decoded.mv_size;
+			if (trunk_bytes && src->mn_ksize > 0) {
+				size_t used = 0;
+				uint64_t shared64 = 0;
+				int vrc = mdb_prefix_decode_shared(entries[i].encoded_key,
+				    entries[i].encoded_len, &shared64, &used);
+				if (vrc == MDB_SUCCESS && used <= entries[i].encoded_len &&
+				    shared64 <= trunk_len) {
+					size_t suffix_len = entries[i].encoded_len - used;
+					entries[i].shared_prefix = (unsigned short)shared64;
+					entries[i].encoded_used = (unsigned short)used;
+					entries[i].key.mv_size = (size_t)shared64 + suffix_len;
+				} else {
+					entries[i].shared_prefix = UINT16_MAX;
+					entries[i].encoded_used = 0;
+					entries[i].key.mv_size = entries[i].encoded_len;
+				}
+			} else {
+				entries[i].key.mv_size = entries[i].encoded_len;
+			}
 		}
 		total_key_bytes += entries[i].key.mv_size;
 	}
@@ -3019,32 +3041,24 @@ mdb_prefix_inline_measure_after_insert(MDB_cursor *mc, MDB_page *mp,
 			memcpy(key_cursor, new_key->mv_data, entries[i].key.mv_size);
 			entries[i].key.mv_data = key_cursor;
 		} else {
-			unsigned int src_idx = (i < insert) ? i : i - 1;
-			MDB_node *src = NODEPTR(snapshot, src_idx);
-
-			if (src_idx == 0) {
-				if (have_old_trunk &&
-				    entries[i].key.mv_size == old_trunk.mv_size &&
-				    src->mn_ksize == old_trunk.mv_size &&
-				    memcmp(NODEKEY(snapshot, src), old_trunk.mv_data, src->mn_ksize) == 0) {
-					memcpy(key_cursor, old_trunk.mv_data, old_trunk.mv_size);
-				} else {
-					MDB_val full = { entries[i].key.mv_size, key_cursor };
-					rc = mdb_leaf_decode_key(&old_trunk, NODEKEY(snapshot, src),
-					    src->mn_ksize, &full, key_cursor, entries[i].key.mv_size, 0);
-					if (rc != MDB_SUCCESS)
-						return rc;
-				}
-			} else if (have_old_trunk &&
-			    src->mn_ksize == old_trunk.mv_size &&
-			    memcmp(NODEKEY(snapshot, src), old_trunk.mv_data, src->mn_ksize) == 0) {
-				memcpy(key_cursor, old_trunk.mv_data, old_trunk.mv_size);
-			} else {
-				MDB_val full = { entries[i].key.mv_size, key_cursor };
-				rc = mdb_leaf_decode_key(&old_trunk, NODEKEY(snapshot, src),
-				    src->mn_ksize, &full, key_cursor, entries[i].key.mv_size, 0);
-				if (rc != MDB_SUCCESS)
-					return rc;
+			if (entries[i].encoded_key && entries[i].shared_prefix != UINT16_MAX &&
+			    trunk_bytes && entries[i].encoded_used <= entries[i].encoded_len &&
+			    entries[i].shared_prefix <= trunk_len) {
+				size_t shared = entries[i].shared_prefix;
+				size_t suffix_len = entries[i].encoded_len - entries[i].encoded_used;
+				if (shared)
+					memcpy(key_cursor, trunk_bytes, shared);
+				if (suffix_len)
+					memcpy(key_cursor + shared,
+					    entries[i].encoded_key + entries[i].encoded_used,
+					    suffix_len);
+			} else if (entries[i].encoded_key && entries[i].encoded_len) {
+				size_t copy_len = entries[i].encoded_len;
+				if (copy_len > entries[i].key.mv_size)
+					copy_len = entries[i].key.mv_size;
+				memcpy(key_cursor, entries[i].encoded_key, copy_len);
+				if (entries[i].key.mv_size > copy_len)
+					memset(key_cursor + copy_len, 0, entries[i].key.mv_size - copy_len);
 			}
 			entries[i].key.mv_data = key_cursor;
 		}
@@ -3091,8 +3105,6 @@ mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp,
 	MDB_prefix_rebuild_entry *entries;
 	unsigned char *key_storage;
 	unsigned char *key_cursor;
-	unsigned char keybuf[MDB_KEYBUF_MAX];
-	MDB_val decoded = {0, keybuf};
 	size_t total_key_bytes = 0;
 	unsigned int i;
 	int rc = MDB_SUCCESS;
@@ -3127,7 +3139,17 @@ mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp,
 	if (rc != MDB_SUCCESS)
 		return rc;
 
-	int have_old_trunk = old_trunk && old_trunk->mv_data && old_trunk->mv_size > 0;
+	int have_old_trunk = old_trunk && old_trunk->mv_data;
+	const MDB_node *snapshot_trunk = (total > 0) ? NODEPTR(snapshot, 0) : NULL;
+	MDB_val trunk_ref = {0, NULL};
+	if (have_old_trunk) {
+		trunk_ref = *old_trunk;
+	} else if (snapshot_trunk) {
+		trunk_ref.mv_size = snapshot_trunk->mn_ksize;
+		trunk_ref.mv_data = NODEKEY(snapshot, snapshot_trunk);
+	}
+	const unsigned char *trunk_bytes = (const unsigned char *)trunk_ref.mv_data;
+	size_t trunk_len = trunk_ref.mv_size;
 
 	for (i = 0; i < new_total; ++i) {
 		if (i == insert) {
@@ -3148,6 +3170,10 @@ mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp,
 			}
 			entries[i].key.mv_size = new_key->mv_size;
 			entries[i].encoded_ksize = 0;
+			entries[i].encoded_key = NULL;
+			entries[i].encoded_len = 0;
+			entries[i].encoded_used = 0;
+			entries[i].shared_prefix = UINT16_MAX;
 			total_key_bytes += entries[i].key.mv_size;
 			continue;
 		}
@@ -3163,6 +3189,10 @@ mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp,
 			entries[i].data_payload = entries[i].data_size;
 		entries[i].data_ptr = NODEDATA(src);
 		entries[i].encoded_ksize = 0;
+		entries[i].encoded_key = NODEKEY(snapshot, src);
+		entries[i].encoded_len = src->mn_ksize;
+		entries[i].encoded_used = 0;
+		entries[i].shared_prefix = UINT16_MAX;
 
 		if (src_idx == 0) {
 			if (have_old_trunk &&
@@ -3170,22 +3200,32 @@ mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp,
 			    memcmp(NODEKEY(snapshot, src), old_trunk->mv_data, src->mn_ksize) == 0) {
 				entries[i].key.mv_size = old_trunk->mv_size;
 			} else {
-				rc = mdb_leaf_decode_key(old_trunk, NODEKEY(snapshot, src),
-				    src->mn_ksize, &decoded, keybuf, MDB_KEYBUF_MAX, 0);
-				if (rc != MDB_SUCCESS)
-					return rc;
-				entries[i].key.mv_size = decoded.mv_size;
+				entries[i].key.mv_size = src->mn_ksize;
 			}
 		} else if (have_old_trunk &&
 		    src->mn_ksize == old_trunk->mv_size &&
 		    memcmp(NODEKEY(snapshot, src), old_trunk->mv_data, src->mn_ksize) == 0) {
 			entries[i].key.mv_size = old_trunk->mv_size;
 		} else {
-			rc = mdb_leaf_decode_key(old_trunk, NODEKEY(snapshot, src),
-			    src->mn_ksize, &decoded, keybuf, MDB_KEYBUF_MAX, 0);
-			if (rc != MDB_SUCCESS)
-				return rc;
-			entries[i].key.mv_size = decoded.mv_size;
+			if (trunk_bytes && src->mn_ksize > 0) {
+				size_t used = 0;
+				uint64_t shared64 = 0;
+				int vrc = mdb_prefix_decode_shared(entries[i].encoded_key,
+				    entries[i].encoded_len, &shared64, &used);
+				if (vrc == MDB_SUCCESS && used <= entries[i].encoded_len &&
+				    shared64 <= trunk_len) {
+					size_t suffix_len = entries[i].encoded_len - used;
+					entries[i].shared_prefix = (unsigned short)shared64;
+					entries[i].encoded_used = (unsigned short)used;
+					entries[i].key.mv_size = (size_t)shared64 + suffix_len;
+				} else {
+					entries[i].shared_prefix = UINT16_MAX;
+					entries[i].encoded_used = 0;
+					entries[i].key.mv_size = entries[i].encoded_len;
+				}
+			} else {
+				entries[i].key.mv_size = entries[i].encoded_len;
+			}
 		}
 		total_key_bytes += entries[i].key.mv_size;
 	}
@@ -3200,33 +3240,24 @@ mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp,
 			if (entries[i].key.mv_size)
 				memcpy(key_cursor, new_key->mv_data, entries[i].key.mv_size);
 		} else {
-			unsigned int src_idx = (i < insert) ? i : i - 1;
-			MDB_node *src = NODEPTR(snapshot, src_idx);
-
-			if (src_idx == 0) {
-				if (have_old_trunk &&
-				    entries[i].key.mv_size == old_trunk->mv_size &&
-				    src->mn_ksize == old_trunk->mv_size &&
-				    memcmp(NODEKEY(snapshot, src), old_trunk->mv_data, src->mn_ksize) == 0) {
-					memcpy(key_cursor, old_trunk->mv_data, old_trunk->mv_size);
-				} else {
-					MDB_val full = { entries[i].key.mv_size, key_cursor };
-					rc = mdb_leaf_decode_key(old_trunk, NODEKEY(snapshot, src),
-					    src->mn_ksize, &full, key_cursor, entries[i].key.mv_size, 0);
-					if (rc != MDB_SUCCESS)
-						return rc;
-				}
-			} else if (have_old_trunk &&
-			    entries[i].key.mv_size == old_trunk->mv_size &&
-			    src->mn_ksize == old_trunk->mv_size &&
-			    memcmp(NODEKEY(snapshot, src), old_trunk->mv_data, src->mn_ksize) == 0) {
-				memcpy(key_cursor, old_trunk->mv_data, old_trunk->mv_size);
-			} else {
-				MDB_val full = { entries[i].key.mv_size, key_cursor };
-				rc = mdb_leaf_decode_key(old_trunk, NODEKEY(snapshot, src),
-				    src->mn_ksize, &full, key_cursor, entries[i].key.mv_size, 0);
-				if (rc != MDB_SUCCESS)
-					return rc;
+			if (entries[i].encoded_key && entries[i].shared_prefix != UINT16_MAX &&
+			    trunk_bytes && entries[i].encoded_used <= entries[i].encoded_len &&
+			    entries[i].shared_prefix <= trunk_len) {
+				size_t shared = entries[i].shared_prefix;
+				size_t suffix_len = entries[i].encoded_len - entries[i].encoded_used;
+				if (shared)
+					memcpy(key_cursor, trunk_bytes, shared);
+				if (suffix_len)
+					memcpy(key_cursor + shared,
+					    entries[i].encoded_key + entries[i].encoded_used,
+					    suffix_len);
+			} else if (entries[i].encoded_key && entries[i].encoded_len) {
+				size_t copy_len = entries[i].encoded_len;
+				if (copy_len > entries[i].key.mv_size)
+					copy_len = entries[i].key.mv_size;
+				memcpy(key_cursor, entries[i].encoded_key, copy_len);
+				if (entries[i].key.mv_size > copy_len)
+					memset(key_cursor + copy_len, 0, entries[i].key.mv_size - copy_len);
 			}
 		}
 		entries[i].key.mv_data = key_cursor;
