@@ -1,23 +1,31 @@
 # DLMDB
 
-This is the key value (KV) storage engine of
-[Datalevin](https://github.com/juji-io/datalevin) database. Based on a fork of
+This is the backing key value (KV) storage engine of
+[Datalevin](https://github.com/juji-io/datalevin) database, a simple, fast and
+versatile Datalog database. Based on a fork of the esteemed
 [LMDB](https://www.symas.com/mdb), this KV engine supports these additional
 features:
 
 * Order statistics.
-  - Efficient range count: `mdb_count_range`, `mdb_count_all`, `mdb_range_count_values`.
-  - Random access by rank, i.e. getting ith item: `mdb_get_rank`
-  - Rank lookup for existing keys (and specific duplicates): `mdb_get_key_rank`, `mdb_cursor_get_rank`, `mdb_cursor_key_rank`
+  - Random access by rank, i.e. getting ith item efficiently.
+  - Rank lookup for existing keys (and specific duplicates).
+  - Efficient range count.
 * Prefix compression.
 
-## Order-statistics API overview
+These features are critical for Datalevin's high performance: the order
+statistics facilitate query planning, while prefix compression couples
+well with triplet storage.
+
+## Order-statistics API
+
+DLMDB extends LMDB's B+tree with optional per-branch cardinalities when a
+database is opened using `MDB_COUNTED` flag. Once enabled, the following
+functions are supported and they all run in O(log n) time:
 
 ### Getting the element at a rank
 
-`mdb_get_rank` and `mdb_cursor_get_rank` : open database with the
-`MDB_COUNTED` flag, then pass a zero-based rank to position the cursor or to copy
-the key/data pair out of place.
+`mdb_get_rank` and `mdb_cursor_get_rank` : pass a zero-based rank to position
+the cursor or to copy the key/data pair out of place.
 
 ```c
 MDB_val key = {0}, data = {0};
@@ -26,18 +34,18 @@ if (rc == MDB_SUCCESS) {
     /* key/data point to the ith entry in sorted order */
 }
 ```
-
 ### Finding the rank of an existing key
 
 `mdb_get_key_rank` and `mdb_cursor_key_rank` provide the inverse operation. They
-also require `MDB_COUNTED` and return the zero-based rank of a key/value pair.
+return the zero-based rank of a key/value pair.
 
 ```c
 MDB_val key = {strlen("alpha"), "alpha"};
 uint64_t rank = 0;
-/* Plain database: data parameter may be NULL */
-int rc = mdb_get_key_rank(txn, plain_counted_dbi, &key, NULL, &rank);
+/* Plain database: `data` parameter may be NULL */
+int rc = mdb_get_key_rank(txn, plain_counted_dbi, &key, NULL, &rank**;
 
+/* DUPSORT database: */
 MDB_val dup = {strlen("payload-005"), "payload-005"};
 rc = mdb_get_key_rank(txn, dupsort_counted_dbi, &key, &dup, &rank);
 /* rank now includes all duplicates that precede payload-005 */
@@ -46,33 +54,11 @@ rc = mdb_get_key_rank(txn, dupsort_counted_dbi, &key, &dup, &rank);
 `mdb_cursor_key_rank` mirrors the cursor-oriented routines for callers that do
 not want to leave the cursor's current position.
 
-## Implementation notes
+## Range Counting API
 
-Datalevin extends LMDB's B+tree with optional per-branch cardinalities when a
-database is opened using `MDB_COUNTED`. Those counts are already consumed by
-`mdb_count_range` and `mdb_get_rank`; the new rank-lookup APIs reuse the same
-metadata from the read path:
-
-1. The helper validates that the key (and, in dupsort mode, the individual
-   duplicate) exists by using the cursor stack. This guarantees the rank is only
-   reported for confirmed entries.
-2. Once positioned, the helper calls into the existing prefix-count machinery
-   (`mdb_prefix_pair_leq`) to aggregate the number of elements that precede the
-   target. This walks the branch counts and, for dupsort pages, performs a local
-   traversal of the duplicate sub-tree.
-3. Prefix-compressed leaves are handled transparently, because the same decode
-   cache and contribution helpers are shared across both directions of the rank
-   API.
-
-The result is an inverse-rank query that runs in O(log n) time with the same
-performance characteristics as the forward `mdb_get_rank`, without maintaining
-any additional on-disk metadata.
-
-## Range counting helpers
-
-Counting records without walking the entire tree is often more useful than
-materialising the data. DLMDB exposes three helpers that are backed by the same
-counted-branch metadata used for the rank APIs:
+Counting records without walking the entire tree is more efficient than counting
+while materializing the data. DLMDB exposes three helpers that are backed by the
+same counted-branch metadata used for the rank APIs:
 
 * `mdb_count_all(txn, dbi, flags, &total)` – Returns the total number of
   key/value pairs in a counted database. Works for both plain and dupsort DBIs.
@@ -84,8 +70,7 @@ counted-branch metadata used for the rank APIs:
 
 All three execute in logarithmic time by traversing the B+tree once to the
 relevant boundary nodes and aggregating the precomputed subtree counts stored on
-each branch page. Prefix-compressed leaves and duplicate subtrees are handled
-transparently.
+each branch page.
 
 ```c
 MDB_val low = {strlen("acct-0500"), "acct-0500"};
@@ -94,7 +79,7 @@ uint64_t total = 0;
 int rc = mdb_count_range(txn, dbi, &low, &high, MDB_RANGE_INCLUDE_LOWER, &total);
 ```
 
-### Range counting performance
+## Counted DB Benchmark
 
 `count_bench` exercises both naive cursor scans and the counted APIs. With
 50,000 entries, 100 sampled queries, a span of 5,000 keys, and 100 duplicates
@@ -138,19 +123,10 @@ two to three orders of magnitude acceleration for range counts and rank lookups.
 
 ## Prefix compression
 
-Enabling `MDB_PREFIX_COMPRESSION` on a database stores keys using shared
-prefixes within each leaf page, reducing page fan-out and disk footprint. DLMDB
-further augments the classic prefix compression schema in two ways:
-
-1. **Cached decoding per transaction.** A lightweight cache (`MDB_prefix_scratch`)
-   holds decoded keys so repeated cursor walks do not rehydrate byte prefixes.
-   This benefit is observable via `mdb_prefix_metrics`, which reports decode and
-   cache hit counters.
-2. **Cursor-safe navigation.** The unit tests under `mtest_prefix` cover dupsort
-   scenarios where multiple cursors iterate forward and backward, mix
-   `MDB_NEXT_DUP` / `MDB_PREV_DUP`, and issue `MDB_GET_BOTH[_RANGE]`. The cache
-   and rank logic cooperate to ensure prefix-compressed keys behave identically
-   to their uncompressed counterparts.
+Enabling `MDB_PREFIX_COMPRESSION` flag on a database stores keys using shared
+prefixes within each leaf page, reducing page fan-out and disk footprint. For
+DUPSORT databases, a higher ratio of compression can be achieved because values
+are also compressed.
 
 To use prefix compression:
 
@@ -208,6 +184,7 @@ Range scan (warm): 0.908x
 Data size / map usage / leaf pages: ~0.22x
 ```
 
-Prefix compression therefore shrinks on-disk footprint by ~35 % and improves
+Prefix compression therefore shrinks on-disk footprint by ~35 % for regular
+database, ~75% for DUPSORT database, and improves
 cache-friendly workloads (warm random reads) while keeping write throughput on
 par with the uncompressed baseline.
