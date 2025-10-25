@@ -1681,8 +1681,31 @@ struct MDB_cursor {
 	indx_t		mc_key_last;		/**< index last decoded into mc_key */
 	pgno_t		mc_seq_pgno;		/**< leaf page of last user-visible key */
 	indx_t		mc_seq_idx;		/**< leaf index of last user-visible key */
+	size_t		mc_seq_shared;		/**< cached shared bytes currently materialized in mc_keybuf */
+	size_t		mc_seq_cached_shared;	/**< cached shared prefix for repeated reads */
+	size_t		mc_seq_cached_used;	/**< cached header byte count for repeated reads */
+	indx_t		mc_seq_cached_idx;	/**< leaf index associated with cached shared prefix */
+	pgno_t		mc_seq_cached_pgno;	/**< page number associated with cached shared prefix */
+	unsigned int	mc_seq_cache_valid;	/**< cached shared prefix metadata valid flag */
+	unsigned int	mc_seq_keybuf_valid;	/**< mc_keybuf currently holds decoded key bytes */
 	MDB_cursor_leaf_cache mc_leaf_cache; /**< cursor-local decoded leaf cache */
 };
+
+static void
+mdb_cursor_seq_invalidate(MDB_cursor *mc)
+{
+	if (!mc)
+		return;
+	mc->mc_seq_pgno = P_INVALID;
+	mc->mc_seq_idx = (indx_t)~0;
+	mc->mc_seq_shared = 0;
+	mc->mc_seq_cached_shared = 0;
+	mc->mc_seq_cached_used = 0;
+	mc->mc_seq_cached_idx = (indx_t)~0;
+	mc->mc_seq_cached_pgno = P_INVALID;
+	mc->mc_seq_cache_valid = 0;
+	mc->mc_seq_keybuf_valid = 0;
+}
 
 	/** Context for sorted-dup records.
 	 *	We could have gone to a fully recursive design, with arbitrarily
@@ -1722,18 +1745,45 @@ mdb_cursor_try_seq_fastpath(MDB_cursor *mc, MDB_page *mp, MDB_node *node,
 	size_t encoded_len = node->mn_ksize;
 	size_t used = 0;
 	size_t shared = 0;
+	size_t prev_shared = 0;
+	int have_prev = 0;
 
 	if (!encoded_len)
 		return 0;
 
-	uint64_t shared64 = 0;
-	int vrc = mdb_prefix_decode_shared(encoded, encoded_len, &shared64, &used);
-	if (vrc != MDB_SUCCESS)
-		return 0;
-	shared = (size_t)shared64;
+	if (mc->mc_seq_keybuf_valid &&
+	    mc->mc_seq_pgno == mp->mp_pgno &&
+	    mc->mc_seq_idx != (indx_t)~0 &&
+	    mc->mc_seq_idx + 1 == idx) {
+		prev_shared = mc->mc_seq_shared;
+		have_prev = 1;
+	}
+
+	unsigned char first = encoded[0];
+	if ((first & 0x80) == 0) {
+		shared = first;
+		used = 1;
+	} else if (mc->mc_seq_cache_valid &&
+		   mc->mc_seq_cached_pgno == mp->mp_pgno &&
+		   mc->mc_seq_cached_idx == idx) {
+		shared = mc->mc_seq_cached_shared;
+		used = mc->mc_seq_cached_used;
+	} else {
+		uint64_t shared64 = 0;
+		int vrc = mdb_varint_decode(encoded, encoded_len, &shared64, &used);
+		if (vrc != MDB_SUCCESS)
+			return 0;
+		shared = (size_t)shared64;
+	}
 
 	if (used > encoded_len)
 		return 0;
+
+	mc->mc_seq_cached_pgno = mp->mp_pgno;
+	mc->mc_seq_cached_idx = idx;
+	mc->mc_seq_cached_shared = shared;
+	mc->mc_seq_cached_used = used;
+	mc->mc_seq_cache_valid = 1;
 
 	size_t trunk_len = trunk->mv_size;
 	if (shared > trunk_len)
@@ -1746,9 +1796,17 @@ mdb_cursor_try_seq_fastpath(MDB_cursor *mc, MDB_page *mp, MDB_node *node,
 		return 0;
 
 	unsigned char *dst = mc->mc_keybuf;
+	const unsigned char *trunk_bytes = (const unsigned char *)trunk->mv_data;
+	size_t reuse = 0;
 
-	if (shared)
-		memcpy(dst, trunk->mv_data, shared);
+	if (have_prev) {
+		reuse = prev_shared < shared ? prev_shared : shared;
+	}
+
+	if (shared > reuse) {
+		memcpy(dst + reuse, trunk_bytes + reuse, shared - reuse);
+	}
+
 	if (suffix_len)
 		memcpy(dst + shared, encoded + used, suffix_len);
 
@@ -1756,6 +1814,8 @@ mdb_cursor_try_seq_fastpath(MDB_cursor *mc, MDB_page *mp, MDB_node *node,
 	mc->mc_key.mv_size = needed;
 	mc->mc_key_pgno = mp->mp_pgno;
 	mc->mc_key_last = idx;
+	mc->mc_seq_shared = shared;
+	mc->mc_seq_keybuf_valid = 1;
 	scratch->metrics.leaf_decode_cache_hits++;
 	*out = mc->mc_key;
 	return 1;
@@ -1802,6 +1862,13 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 					mc->mc_key.mv_size = node->mn_ksize;
 					mc->mc_key.mv_data = (void *)encoded;
 				}
+				mc->mc_seq_shared = 0;
+				mc->mc_seq_keybuf_valid = 0;
+				mc->mc_seq_cache_valid = 0;
+				mc->mc_seq_cached_pgno = P_INVALID;
+				mc->mc_seq_cached_idx = (indx_t)~0;
+				mc->mc_seq_cached_shared = 0;
+				mc->mc_seq_cached_used = 0;
 				out->mv_size = node->mn_ksize;
 				out->mv_data = (void *)encoded;
 				return MDB_SUCCESS;
@@ -1854,6 +1921,13 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 
 		mc->mc_key_pgno = mp->mp_pgno;
 		mc->mc_key_last = idx;
+		mc->mc_seq_shared = 0;
+		mc->mc_seq_keybuf_valid = 1;
+		mc->mc_seq_cache_valid = 0;
+		mc->mc_seq_cached_pgno = P_INVALID;
+		mc->mc_seq_cached_idx = (indx_t)~0;
+		mc->mc_seq_cached_shared = 0;
+		mc->mc_seq_cached_used = 0;
 		if (prefix_enabled) {
 			int fast_path = node->mn_ksize > 0 && (encoded[0] & 0x80) == 0;
 			scratch->metrics.leaf_decode_calls++;
@@ -4323,8 +4397,7 @@ mdb_cursor_unref(MDB_cursor *mc)
 	mc->mc_pg[0] = NULL;
 	mc->mc_key_pgno = P_INVALID;
 	mc->mc_key_last = (indx_t)~0;
-	mc->mc_seq_pgno = P_INVALID;
-	mc->mc_seq_idx = (indx_t)~0;
+	mdb_cursor_seq_invalidate(mc);
 	mdb_cursor_leaf_cache_reset(&mc->mc_leaf_cache);
 	mc->mc_flags &= ~C_INITIALIZED;
 }
@@ -9226,22 +9299,19 @@ skip:
 			mc->mc_seq_idx = mc->mc_ki[mc->mc_top] - 1;
 		} else {
 			mc->mc_flags &= ~C_SEQEXPECT;
-			mc->mc_seq_pgno = P_INVALID;
-			mc->mc_seq_idx = (indx_t)~0;
+			mdb_cursor_seq_invalidate(mc);
 		}
 		rc = mdb_cursor_read_key_at(mc, mp, mc->mc_ki[mc->mc_top], key);
 		mc->mc_flags &= ~C_SEQEXPECT;
 		if (rc != MDB_SUCCESS) {
-			mc->mc_seq_pgno = P_INVALID;
-			mc->mc_seq_idx = (indx_t)~0;
+			mdb_cursor_seq_invalidate(mc);
 			return rc;
 		}
 		mc->mc_seq_pgno = mp->mp_pgno;
 		mc->mc_seq_idx = mc->mc_ki[mc->mc_top];
 	} else {
 		mc->mc_flags &= ~C_SEQEXPECT;
-		mc->mc_seq_pgno = P_INVALID;
-		mc->mc_seq_idx = (indx_t)~0;
+		mdb_cursor_seq_invalidate(mc);
 	}
 	return MDB_SUCCESS;
 }
@@ -11582,8 +11652,7 @@ mdb_cursor_init(MDB_cursor *mc, MDB_txn *txn, MDB_dbi dbi, MDB_xcursor *mx)
 	mc->mc_key.mv_size = 0;
 	mc->mc_key_pgno = P_INVALID;
 	mc->mc_key_last = (indx_t)~0;
-	mc->mc_seq_pgno = P_INVALID;
-	mc->mc_seq_idx = (indx_t)~0;
+	mdb_cursor_seq_invalidate(mc);
 	mdb_cursor_leaf_cache_reset(&mc->mc_leaf_cache);
 	if (txn->mt_dbs[dbi].md_flags & MDB_DUPSORT) {
 		mdb_tassert(txn, mx != NULL);
@@ -12348,10 +12417,19 @@ mdb_cursor_copy(const MDB_cursor *csrc, MDB_cursor *cdst)
 	cdst->mc_key_last = csrc->mc_key_last;
 	cdst->mc_seq_pgno = csrc->mc_seq_pgno;
 	cdst->mc_seq_idx = csrc->mc_seq_idx;
+	cdst->mc_seq_shared = csrc->mc_seq_shared;
+	cdst->mc_seq_cached_shared = csrc->mc_seq_cached_shared;
+	cdst->mc_seq_cached_used = csrc->mc_seq_cached_used;
+	cdst->mc_seq_cached_idx = csrc->mc_seq_cached_idx;
+	cdst->mc_seq_cached_pgno = csrc->mc_seq_cached_pgno;
+	cdst->mc_seq_cache_valid = csrc->mc_seq_cache_valid;
+	cdst->mc_seq_keybuf_valid = 0;
 	mdb_cursor_leaf_cache_reset(&cdst->mc_leaf_cache);
 	if (csrc->mc_key.mv_size && csrc->mc_key.mv_size <= MDB_KEYBUF_MAX) {
 		memcpy(cdst->mc_keybuf, csrc->mc_keybuf, csrc->mc_key.mv_size);
 		cdst->mc_key.mv_size = csrc->mc_key.mv_size;
+		if (csrc->mc_seq_keybuf_valid)
+			cdst->mc_seq_keybuf_valid = 1;
 	}
 	MC_SET_OVPG(cdst, MC_OVPG(csrc));
 
