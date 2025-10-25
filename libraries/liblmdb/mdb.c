@@ -1325,6 +1325,25 @@ mdb_leaf_encode_key(const MDB_val *trunk, const MDB_val *key,
 }
 
 static int
+mdb_prefix_decode_shared(const unsigned char *encoded, size_t encoded_len,
+	uint64_t *shared_out, size_t *used_out)
+{
+	if (!encoded_len)
+		return MDB_CORRUPTED;
+
+	unsigned char first = encoded[0];
+	if ((first & 0x80) == 0) {
+		if (shared_out)
+			*shared_out = first;
+		if (used_out)
+			*used_out = 1;
+		return MDB_SUCCESS;
+	}
+
+	return mdb_varint_decode(encoded, encoded_len, shared_out, used_out);
+}
+
+static int
 mdb_leaf_decode_key(const MDB_val *trunk, const unsigned char *encoded,
 	size_t encoded_len, MDB_val *out, void *buf, size_t buf_size,
 	int allow_trunk_alias)
@@ -1344,17 +1363,9 @@ mdb_leaf_decode_key(const MDB_val *trunk, const unsigned char *encoded,
 
 	size_t used = 0;
 	uint64_t shared = 0;
-	if (encoded_len == 0)
-		return MDB_CORRUPTED;
-	unsigned char first = encoded[0];
-	if ((first & 0x80) == 0) {
-		shared = first;
-		used = 1;
-	} else {
-		int rc = mdb_varint_decode(encoded, encoded_len, &shared, &used);
-		if (rc != MDB_SUCCESS)
-			return rc;
-	}
+	int rc = mdb_prefix_decode_shared(encoded, encoded_len, &shared, &used);
+	if (rc != MDB_SUCCESS)
+		return rc;
 	if (shared > trunk->mv_size || used > encoded_len) {
 		if (!allow_trunk_alias) {
 			if (encoded_len > buf_size)
@@ -1715,17 +1726,11 @@ mdb_cursor_try_seq_fastpath(MDB_cursor *mc, MDB_page *mp, MDB_node *node,
 	if (!encoded_len)
 		return 0;
 
-	unsigned char first = encoded[0];
-	if ((first & 0x80) == 0) {
-		shared = first;
-		used = 1;
-	} else {
-		uint64_t shared64 = 0;
-		int vrc = mdb_varint_decode(encoded, encoded_len, &shared64, &used);
-		if (vrc != MDB_SUCCESS)
-			return 0;
-		shared = (size_t)shared64;
-	}
+	uint64_t shared64 = 0;
+	int vrc = mdb_prefix_decode_shared(encoded, encoded_len, &shared64, &used);
+	if (vrc != MDB_SUCCESS)
+		return 0;
+	shared = (size_t)shared64;
 
 	if (used > encoded_len)
 		return 0;
@@ -2064,18 +2069,12 @@ mdb_prefix_leaf_maxdecoded(const MDB_page *mp)
 		size_t used = 0;
 		size_t shared = 0;
 
-		unsigned char first = encoded[0];
-		if ((first & 0x80) == 0) {
-			shared = first;
-			used = 1;
-		} else {
-			uint64_t decoded = 0;
-			int rc = mdb_varint_decode(encoded, encoded_len, &decoded, &used);
-			if (rc != MDB_SUCCESS || decoded > trunk_len)
-				shared = trunk_len;
-			else
-				shared = (size_t)decoded;
-		}
+		uint64_t decoded = 0;
+		int rc = mdb_prefix_decode_shared(encoded, encoded_len, &decoded, &used);
+		if (rc != MDB_SUCCESS || decoded > trunk_len)
+			shared = trunk_len;
+		else
+			shared = (size_t)decoded;
 
 		if (used > encoded_len)
 			used = encoded_len;
