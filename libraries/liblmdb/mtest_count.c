@@ -203,6 +203,24 @@ struct concurrency_ctx {
     int present_total;
 };
 
+static void
+format_stage(char *buf, size_t buf_size,
+             const char *label, const char *stage)
+{
+    if (buf_size == 0)
+        return;
+    if (label && *label) {
+        if (stage && *stage)
+            snprintf(buf, buf_size, "%s %s", label, stage);
+        else
+            snprintf(buf, buf_size, "%s", label);
+    } else if (stage && *stage) {
+        snprintf(buf, buf_size, "%s", stage);
+    } else {
+        buf[0] = '\0';
+    }
+}
+
 static void *
 count_reader_thread(void *arg)
 {
@@ -1468,35 +1486,41 @@ test_count_all_persistence(void)
 }
 
 static void
-test_fuzz_random(MDB_env *env)
+run_fuzz_random(MDB_env *env, const char *db_name,
+                unsigned int open_flags, const char *key_prefix,
+                unsigned int seed_init, const char *label)
 {
     const int max_keys = 2048;
     const int rounds = 200;
     const int ops_per_round = 24;
-    unsigned int seed = 0x7f4a7u;
+    unsigned int seed = seed_init;
     unsigned char *present;
     int live = 0;
 
     present = calloc((size_t)max_keys, sizeof(unsigned char));
     if (!present) {
-        fprintf(stderr, "failed to allocate fuzz bitmap\n");
+        fprintf(stderr, "%s: failed to allocate fuzz bitmap\n",
+                label ? label : "fuzz");
         exit(EXIT_FAILURE);
     }
 
     MDB_txn *txn;
     MDB_dbi dbi;
-    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "fuzz begin");
-    CHECK(mdb_dbi_open(txn, "edge_fuzz_random", MDB_CREATE | MDB_COUNTED,
-                       &dbi),
-          "fuzz open");
-    CHECK(mdb_txn_commit(txn), "fuzz commit open");
+    char stage_msg[96];
+    format_stage(stage_msg, sizeof(stage_msg), label, "begin");
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), stage_msg);
+    format_stage(stage_msg, sizeof(stage_msg), label, "open");
+    CHECK(mdb_dbi_open(txn, db_name, open_flags, &dbi), stage_msg);
+    format_stage(stage_msg, sizeof(stage_msg), label, "commit open");
+    CHECK(mdb_txn_commit(txn), stage_msg);
 
     for (int round = 0; round < rounds; ++round) {
-        CHECK(mdb_txn_begin(env, NULL, 0, &txn), "fuzz round begin");
+        format_stage(stage_msg, sizeof(stage_msg), label, "round begin");
+        CHECK(mdb_txn_begin(env, NULL, 0, &txn), stage_msg);
         for (int op = 0; op < ops_per_round; ++op) {
             int idx = (int)(next_rand(&seed) % max_keys);
             char keybuf[16];
-            snprintf(keybuf, sizeof(keybuf), "f%05d", idx);
+            snprintf(keybuf, sizeof(keybuf), "%s%05d", key_prefix, idx);
 
             MDB_val key;
             key.mv_size = strlen(keybuf);
@@ -1505,8 +1529,9 @@ test_fuzz_random(MDB_env *env)
             unsigned int action = next_rand(&seed) % 3u;
             if (action == 0) {
                 char valbuf[24];
-                snprintf(valbuf, sizeof(valbuf), "val%05d-%03u",
-                         idx, (unsigned)(next_rand(&seed) & 0x3ffu));
+                snprintf(valbuf, sizeof(valbuf), "%sval%05d-%03u",
+                         key_prefix, idx,
+                         (unsigned)(next_rand(&seed) & 0x3ffu));
                 MDB_val data;
                 data.mv_size = strlen(valbuf);
                 data.mv_data = valbuf;
@@ -1514,11 +1539,15 @@ test_fuzz_random(MDB_env *env)
                 if (rc == MDB_KEYEXIST) {
                     data.mv_size = 12;
                     data.mv_data = NULL;
+                    format_stage(stage_msg, sizeof(stage_msg), label,
+                                 "update reserve");
                     CHECK(mdb_put(txn, dbi, &key, &data, MDB_RESERVE),
-                          "fuzz update reserve");
+                          stage_msg);
                     memset(data.mv_data, 'r', data.mv_size);
                 } else {
-                    CHECK(rc, "fuzz insert");
+                    format_stage(stage_msg, sizeof(stage_msg), label,
+                                 "insert");
+                    CHECK(rc, stage_msg);
                     if (!present[idx]) {
                         present[idx] = 1;
                         live++;
@@ -1531,7 +1560,9 @@ test_fuzz_random(MDB_env *env)
                         present[idx] = 0;
                         live--;
                     } else if (rc != MDB_NOTFOUND) {
-                        CHECK(rc, "fuzz delete");
+                        format_stage(stage_msg, sizeof(stage_msg), label,
+                                     "delete");
+                        CHECK(rc, stage_msg);
                     }
                 }
             } else {
@@ -1539,30 +1570,37 @@ test_fuzz_random(MDB_env *env)
                     MDB_val data;
                     data.mv_size = 16;
                     data.mv_data = NULL;
+                    format_stage(stage_msg, sizeof(stage_msg), label,
+                                 "overwrite reserve");
                     CHECK(mdb_put(txn, dbi, &key, &data, MDB_RESERVE),
-                          "fuzz overwrite reserve");
+                          stage_msg);
                     memset(data.mv_data, 's', data.mv_size);
                 } else {
                     char valbuf[24];
-                    snprintf(valbuf, sizeof(valbuf), "alt%05d", idx);
+                    snprintf(valbuf, sizeof(valbuf), "%salt%05d",
+                             key_prefix, idx);
                     MDB_val data;
                     data.mv_size = strlen(valbuf);
                     data.mv_data = valbuf;
-                    CHECK(mdb_put(txn, dbi, &key, &data, 0),
-                          "fuzz alt insert");
+                    format_stage(stage_msg, sizeof(stage_msg), label,
+                                 "alt insert");
+                    CHECK(mdb_put(txn, dbi, &key, &data, 0), stage_msg);
                     present[idx] = 1;
                     live++;
                 }
             }
         }
 
-        CHECK(mdb_txn_commit(txn), "fuzz round commit");
+        format_stage(stage_msg, sizeof(stage_msg), label, "round commit");
+        CHECK(mdb_txn_commit(txn), stage_msg);
 
-        CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn),
-              "fuzz verify begin");
+        format_stage(stage_msg, sizeof(stage_msg), label, "verify begin");
+        CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), stage_msg);
         uint64_t total;
-        CHECK(mdb_count_all(txn, dbi, 0, &total), "fuzz count_all");
-        expect_eq(total, (uint64_t)live, "fuzz total matches");
+        format_stage(stage_msg, sizeof(stage_msg), label, "count_all");
+        CHECK(mdb_count_all(txn, dbi, 0, &total), stage_msg);
+        format_stage(stage_msg, sizeof(stage_msg), label, "total matches");
+        expect_eq(total, (uint64_t)live, stage_msg);
 
         for (int q = 0; q < 12; ++q) {
             MDB_val low, high;
@@ -1574,7 +1612,8 @@ test_fuzz_random(MDB_env *env)
 
             if (next_rand(&seed) & 1u) {
                 int low_idx = (int)(next_rand(&seed) % max_keys);
-                snprintf(lowbuf, sizeof(lowbuf), "f%05d", low_idx);
+                snprintf(lowbuf, sizeof(lowbuf), "%s%05d",
+                         key_prefix, low_idx);
                 low.mv_size = strlen(lowbuf);
                 low.mv_data = lowbuf;
                 low_ptr = &low;
@@ -1584,7 +1623,8 @@ test_fuzz_random(MDB_env *env)
 
             if (next_rand(&seed) & 1u) {
                 int high_idx = (int)(next_rand(&seed) % max_keys);
-                snprintf(highbuf, sizeof(highbuf), "f%05d", high_idx);
+                snprintf(highbuf, sizeof(highbuf), "%s%05d",
+                         key_prefix, high_idx);
                 high.mv_size = strlen(highbuf);
                 high.mv_data = highbuf;
                 high_ptr = &high;
@@ -1597,26 +1637,50 @@ test_fuzz_random(MDB_env *env)
             uint64_t naive = naive_count(txn, dbi, low_ptr, high_ptr,
                                          lower_incl, upper_incl, cmp_key);
             uint64_t counted = 0;
+            format_stage(stage_msg, sizeof(stage_msg), label, "range");
             CHECK(mdb_count_range(txn, dbi, low_ptr, high_ptr,
                                   flags, &counted),
-                  "fuzz range");
-            expect_eq(counted, naive, "fuzz range matches");
+                  stage_msg);
+            format_stage(stage_msg, sizeof(stage_msg), label, "range matches");
+            expect_eq(counted, naive, stage_msg);
         }
         mdb_txn_abort(txn);
     }
 
-    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "fuzz final begin");
+    format_stage(stage_msg, sizeof(stage_msg), label, "final begin");
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), stage_msg);
     uint64_t final_total;
-    CHECK(mdb_count_all(txn, dbi, 0, &final_total), "fuzz final total");
-    expect_eq(final_total, (uint64_t)live, "fuzz final count");
+    format_stage(stage_msg, sizeof(stage_msg), label, "final total");
+    CHECK(mdb_count_all(txn, dbi, 0, &final_total), stage_msg);
+    format_stage(stage_msg, sizeof(stage_msg), label, "final count");
+    expect_eq(final_total, (uint64_t)live, stage_msg);
     mdb_txn_abort(txn);
 
-    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "fuzz drop begin");
-    CHECK(mdb_drop(txn, dbi, 0), "fuzz drop");
-    CHECK(mdb_txn_commit(txn), "fuzz drop commit");
+    format_stage(stage_msg, sizeof(stage_msg), label, "drop begin");
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), stage_msg);
+    format_stage(stage_msg, sizeof(stage_msg), label, "drop");
+    CHECK(mdb_drop(txn, dbi, 0), stage_msg);
+    format_stage(stage_msg, sizeof(stage_msg), label, "drop commit");
+    CHECK(mdb_txn_commit(txn), stage_msg);
 
     mdb_dbi_close(env, dbi);
     free(present);
+}
+
+static void
+test_fuzz_random(MDB_env *env)
+{
+    run_fuzz_random(env, "edge_fuzz_random",
+                    MDB_CREATE | MDB_COUNTED, "f",
+                    0x7f4a7u, "fuzz");
+}
+
+static void
+test_fuzz_random_prefix(MDB_env *env)
+{
+    run_fuzz_random(env, "edge_fuzz_prefix",
+                    MDB_CREATE | MDB_COUNTED | MDB_PREFIX_COMPRESSION,
+                    "pf", 0x51c0cau, "fuzz prefix");
 }
 
 static void
@@ -2375,6 +2439,7 @@ main(void)
     test_split_merge(env);
     test_nested_transactions(env);
     test_fuzz_random(env);
+    test_fuzz_random_prefix(env);
     test_concurrent_readers();
 
     mdb_env_close(env);
