@@ -1740,6 +1740,8 @@ typedef struct MDB_xcursor {
 static void mdb_cursor_leaf_cache_init(MDB_cursor_leaf_cache *cache);
 static void mdb_cursor_leaf_cache_reset(MDB_cursor_leaf_cache *cache);
 static void mdb_cursor_leaf_cache_clear(MDB_cursor_leaf_cache *cache);
+static int mdb_cursor_leaf_cache_clone(MDB_cursor_leaf_cache *dst,
+	const MDB_cursor_leaf_cache *src, MDB_txn *txn);
 static int mdb_cursor_leaf_cache_ensure_prefix(MDB_txn *txn,
 	MDB_cursor_leaf_cache *cache, unsigned int count, uint64_t **out);
 static int mdb_cursor_leaf_cache_prepare(MDB_cursor *mc, MDB_page *mp);
@@ -2558,6 +2560,56 @@ mdb_cursor_leaf_cache_ensure_prefix(MDB_txn *txn, MDB_cursor_leaf_cache *cache,
 	}
 	if (out)
 		*out = cache->decoded_prefix;
+	return MDB_SUCCESS;
+}
+
+static int
+mdb_cursor_leaf_cache_clone(MDB_cursor_leaf_cache *dst,
+	const MDB_cursor_leaf_cache *src, MDB_txn *txn)
+{
+	if (!dst || !src || !txn)
+		return EINVAL;
+
+	unsigned int count = src->decoded_count;
+	size_t stride = src->decoded_stride;
+	size_t buf_need = stride ? (size_t)count * stride : 0;
+	int rc;
+
+	rc = mdb_cursor_leaf_cache_ensure_vals(dst, count);
+	if (rc != MDB_SUCCESS)
+		return rc;
+	rc = mdb_cursor_leaf_cache_ensure_ready(dst, count);
+	if (rc != MDB_SUCCESS)
+		return rc;
+	rc = mdb_cursor_leaf_cache_reserve_buf(dst, buf_need);
+	if (rc != MDB_SUCCESS)
+		return rc;
+	rc = mdb_cursor_leaf_cache_ensure_prefix(txn, dst,
+		src->decoded_prefix_count, NULL);
+	if (rc != MDB_SUCCESS)
+		return rc;
+
+	if (buf_need && src->decoded_buf && dst->decoded_buf)
+		memcpy(dst->decoded_buf, src->decoded_buf, buf_need);
+
+	for (unsigned int i = 0; i < count; ++i) {
+		dst->decoded_vals[i].mv_data = dst->decoded_buf + (size_t)i * stride;
+		dst->decoded_vals[i].mv_size = src->decoded_vals[i].mv_size;
+	}
+
+	if (count && src->decoded_ready && dst->decoded_ready)
+		memcpy(dst->decoded_ready, src->decoded_ready, count);
+
+	if (src->decoded_prefix_count && src->decoded_prefix && dst->decoded_prefix)
+		memcpy(dst->decoded_prefix, src->decoded_prefix,
+			sizeof(uint64_t) * src->decoded_prefix_count);
+
+	dst->decoded_stride = stride;
+	dst->decoded_count = count;
+	dst->decoded_prefix_count = src->decoded_prefix_count;
+	dst->decoded_pgno = src->decoded_pgno;
+	dst->decoded_gen = src->decoded_gen;
+
 	return MDB_SUCCESS;
 }
 
@@ -11653,8 +11705,24 @@ static void
 mdb_xcursor_init1(MDB_cursor *mc, MDB_node *node)
 {
 	MDB_xcursor *mx = mc->mc_xcursor;
+	MDB_cursor_leaf_cache *cache = &mx->mx_cursor.mc_leaf_cache;
+	int keep_inline_cache = 0;
 
-	mdb_cursor_leaf_cache_reset(&mx->mx_cursor.mc_leaf_cache);
+	if (!(node->mn_flags & F_SUBDATA) &&
+	    (mx->mx_cursor.mc_flags & C_INITIALIZED) &&
+	    mx->mx_cursor.mc_pg[0]) {
+		MDB_page *new_fp = NODEDATA(node);
+		if (mx->mx_cursor.mc_pg[0] == new_fp &&
+		    cache->decoded_pgno == new_fp->mp_pgno &&
+		    cache->decoded_gen == mc->mc_txn->mt_txnid &&
+		    cache->decoded_count == NUMKEYS(new_fp)) {
+			keep_inline_cache = 1;
+		}
+	}
+
+	if (!keep_inline_cache)
+		mdb_cursor_leaf_cache_reset(cache);
+
 	mx->mx_cursor.mc_flags &= C_SUB|C_ORIG_RDONLY|C_WRITEMAP|C_LEAFCACHE;
 	if (node->mn_flags & F_SUBDATA) {
 		memcpy(&mx->mx_db, NODEDATA(node), sizeof(MDB_db));
@@ -11713,8 +11781,20 @@ static void
 mdb_xcursor_init2(MDB_cursor *mc, MDB_xcursor *src_mx, int new_dupdata)
 {
 	MDB_xcursor *mx = mc->mc_xcursor;
+	MDB_cursor_leaf_cache *dst_cache = &mx->mx_cursor.mc_leaf_cache;
+	int clone_ok = 0;
 
-	mdb_cursor_leaf_cache_reset(&mx->mx_cursor.mc_leaf_cache);
+	if (!new_dupdata && src_mx &&
+	    (src_mx->mx_cursor.mc_flags & C_INITIALIZED)) {
+		const MDB_cursor_leaf_cache *src_cache =
+			&src_mx->mx_cursor.mc_leaf_cache;
+		if (mdb_cursor_leaf_cache_clone(dst_cache, src_cache, mc->mc_txn) ==
+		    MDB_SUCCESS)
+			clone_ok = 1;
+	}
+
+	if (!clone_ok)
+		mdb_cursor_leaf_cache_reset(dst_cache);
 	if (new_dupdata) {
 		mx->mx_cursor.mc_snum = 1;
 		mx->mx_cursor.mc_top = 0;
@@ -12530,7 +12610,17 @@ mdb_cursor_copy(const MDB_cursor *csrc, MDB_cursor *cdst)
 	cdst->mc_seq_cached_pgno = csrc->mc_seq_cached_pgno;
 	cdst->mc_seq_cache_valid = csrc->mc_seq_cache_valid;
 	cdst->mc_seq_keybuf_valid = 0;
-	mdb_cursor_leaf_cache_reset(&cdst->mc_leaf_cache);
+	if ((csrc->mc_txn->mt_flags & MDB_TXN_RDONLY) &&
+	    (csrc->mc_flags & C_LEAFCACHE) &&
+	    csrc->mc_leaf_cache.decoded_pgno != P_INVALID &&
+	    mdb_cursor_leaf_cache_clone(&cdst->mc_leaf_cache,
+		    &csrc->mc_leaf_cache, csrc->mc_txn) != MDB_SUCCESS) {
+		mdb_cursor_leaf_cache_reset(&cdst->mc_leaf_cache);
+	} else if (!(csrc->mc_txn->mt_flags & MDB_TXN_RDONLY) ||
+		   !(csrc->mc_flags & C_LEAFCACHE) ||
+		   csrc->mc_leaf_cache.decoded_pgno == P_INVALID) {
+		mdb_cursor_leaf_cache_reset(&cdst->mc_leaf_cache);
+	}
 	cdst->mc_seq_cmp_keyptr = NULL;
 	cdst->mc_seq_cmp_keysize = 0;
 	cdst->mc_seq_cmp_prefix = 0;
