@@ -42,6 +42,7 @@ typedef struct {
 	bool include_prefix;
 	size_t scan_ops;
 	size_t scan_span;
+	size_t dup_per_key;
 } bench_config;
 
 struct variant_spec {
@@ -76,6 +77,8 @@ typedef struct {
 #endif
 	size_t value_size;
 	size_t prefix_len;
+	size_t dup_per_key;
+	uint64_t unique_keys;
 	uint64_t entries;
 	uint64_t data_file_bytes;
 	uint64_t lock_file_bytes;
@@ -89,11 +92,14 @@ typedef struct {
 	uint64_t overflow_pages;
 	unsigned int depth;
 	unsigned int page_size;
+	bool is_dupsort;
 } bench_metrics;
 
 typedef struct {
 	char label[64];
 	bool use_prefix;
+	bool use_dupsort;
+	size_t dup_per_key;
 	char dir[PATH_MAX];
 	bench_metrics metrics;
 } bench_variant;
@@ -111,6 +117,13 @@ static size_t *generate_access_pattern(const bench_config *cfg);
 static size_t *generate_permutation(size_t count, uint64_t seed);
 static void add_variant_spec(bench_config *cfg, const char *arg);
 static unsigned int bench_variant_db_flags(const bench_variant *variant);
+static size_t bench_variant_key_index(const bench_variant *variant,
+    size_t entry_index);
+static uint64_t bench_variant_unique_keys(uint64_t total_entries,
+    const bench_variant *variant);
+static void bench_fill_entry_value(const bench_config *cfg,
+    const bench_variant *variant, size_t entry_index, size_t version,
+    char *buf);
 static MDB_env *bench_open_env(const bench_config *cfg,
     const bench_variant *variant);
 static MDB_dbi bench_open_dbi(MDB_env *env, const bench_variant *variant,
@@ -119,19 +132,26 @@ static void bench_record_timing(bench_timing *timing, uint64_t ops,
     const struct timespec *start, const struct timespec *end);
 static void run_bench_variant(const bench_config *cfg, bench_variant *variant,
     const size_t *read_order);
-static void bench_do_inserts(const bench_config *cfg, MDB_env *env,
-    MDB_dbi dbi, bench_metrics *m);
-static void bench_do_updates(const bench_config *cfg, MDB_env *env,
-    MDB_dbi dbi, bench_metrics *m);
-static size_t bench_do_deletes(const bench_config *cfg, MDB_env *env,
-    MDB_dbi dbi, size_t **out_indices, bench_metrics *m);
-static void bench_do_reinserts(const bench_config *cfg, MDB_env *env,
-    MDB_dbi dbi, const size_t *indices, size_t count, bench_metrics *m);
+static void bench_do_inserts(const bench_config *cfg,
+    const bench_variant *variant, MDB_env *env, MDB_dbi dbi,
+    size_t *versions, bench_metrics *m);
+static void bench_do_updates(const bench_config *cfg,
+    const bench_variant *variant, MDB_env *env, MDB_dbi dbi,
+    size_t *versions, bench_metrics *m);
+static size_t bench_do_deletes(const bench_config *cfg,
+    const bench_variant *variant, MDB_env *env, MDB_dbi dbi,
+    size_t *versions, size_t **out_indices, bench_metrics *m);
+static void bench_do_reinserts(const bench_config *cfg,
+    const bench_variant *variant, MDB_env *env, MDB_dbi dbi,
+    size_t *versions, const size_t *indices, size_t count, bench_metrics *m);
 static void bench_do_repack(const bench_config *cfg,
     const bench_variant *variant, MDB_env *env, bench_metrics *m);
-static void bench_do_reads(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
-    const size_t *read_order, bench_timing *timing, MDB_prefix_metrics *pm);
-static void bench_do_scan(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
+static void bench_do_reads(const bench_config *cfg,
+    const bench_variant *variant, const size_t *versions, MDB_env *env,
+    MDB_dbi dbi, const size_t *read_order, bench_timing *timing,
+    MDB_prefix_metrics *pm);
+static void bench_do_scan(const bench_config *cfg,
+    const bench_variant *variant, MDB_env *env, MDB_dbi dbi,
     bench_timing *timing, MDB_prefix_metrics *pm
 #ifdef MDB_PROFILE_RANGE
     , MDB_profile_stats *profile
@@ -173,6 +193,7 @@ main(int argc, char **argv)
 	.include_prefix = true,
 	.scan_ops = 1000,
 	.scan_span = 256,
+	.dup_per_key = 0,
 };
 
 	parse_args(&cfg, argc, argv);
@@ -200,10 +221,11 @@ main(int argc, char **argv)
 	}
 
 	bool include_default = cfg.include_prefix;
-	size_t total_variants = 1 + cfg.variant_count +
+	size_t base_variants = 1 + cfg.variant_count +
 	    (include_default ? 1 : 0);
-	bench_variant *variants =
-	    calloc(total_variants, sizeof(*variants));
+	size_t dup_variants = (cfg.dup_per_key > 1) ? base_variants : 0;
+	size_t total_variants = base_variants + dup_variants;
+	bench_variant *variants = calloc(total_variants, sizeof(*variants));
 	if (!variants) {
 		fprintf(stderr, "Unable to allocate variant list\n");
 		free(read_order);
@@ -213,12 +235,16 @@ main(int argc, char **argv)
 	size_t vi = 0;
 	snprintf(variants[vi].label, sizeof(variants[vi].label), "plain");
 	variants[vi].use_prefix = false;
+	variants[vi].use_dupsort = false;
+	variants[vi].dup_per_key = 1;
 	++vi;
 
 	if (include_default) {
 		snprintf(variants[vi].label, sizeof(variants[vi].label),
 		    "prefix");
 		variants[vi].use_prefix = true;
+		variants[vi].use_dupsort = false;
+		variants[vi].dup_per_key = 1;
 		++vi;
 	}
 
@@ -226,6 +252,19 @@ main(int argc, char **argv)
 		snprintf(variants[vi].label, sizeof(variants[vi].label), "%s",
 		    cfg.variants[i].label);
 		variants[vi].use_prefix = cfg.variants[i].use_prefix;
+		variants[vi].use_dupsort = false;
+		variants[vi].dup_per_key = 1;
+	}
+
+	if (dup_variants) {
+		for (size_t i = 0; i < base_variants; ++i) {
+			bench_variant *dst = &variants[base_variants + i];
+			snprintf(dst->label, sizeof(dst->label), "%s-dups",
+			    variants[i].label);
+			dst->use_prefix = variants[i].use_prefix;
+			dst->use_dupsort = true;
+			dst->dup_per_key = cfg.dup_per_key;
+		}
 	}
 
 	for (size_t i = 0; i < total_variants; ++i) {
@@ -236,8 +275,22 @@ main(int argc, char **argv)
 
 	for (size_t i = 0; i < total_variants; ++i)
 		print_metrics(&variants[i]);
-	for (size_t i = 1; i < total_variants; ++i)
-		print_comparison(&variants[0], &variants[i]);
+	for (size_t i = 1; i < total_variants; ++i) {
+		const bench_variant *baseline = &variants[0];
+		for (size_t j = 0; j < i; ++j) {
+			if (variants[j].use_dupsort == variants[i].use_dupsort &&
+			    variants[j].dup_per_key == variants[i].dup_per_key &&
+			    !variants[j].use_prefix) {
+				baseline = &variants[j];
+				break;
+			}
+		}
+		if (baseline->use_dupsort != variants[i].use_dupsort ||
+		    baseline->dup_per_key != variants[i].dup_per_key) {
+			continue;
+		}
+		print_comparison(baseline, &variants[i]);
+	}
 
 	if (!cfg.keep) {
 		for (size_t i = 0; i < total_variants; ++i)
@@ -260,14 +313,15 @@ usage(const char *prog)
 	    "  -r <reads>        Number of random read operations (default = entries)\n"
 	"  -v <value-bytes>  Value size in bytes (default 64)\n"
 	"  -p <prefix-len>   Shared key prefix length (default 16)\n"
-	"  -m <MiB>          Map size in mebibytes (default 2048)\n"
-	"  -C <spec>         Additional variant/control; spec=label:mode or mode, where mode=prefix|plain|off\n"
-	"  -U <updates>      Number of random value updates after load (default 0)\n"
-	"  -X <deletes>      Number of deletes to perform before reinserting (default 0)\n"
-	"  -R <ranges>       Number of range scans per timing (default 1000)\n"
-	"  -L <span>         Entries to scan per range (default 256, 0 = full scan)\n"
-	"  -P                Run a compact copy repack after metrics (default off)\n"
-	"  -s <seed>         Seed for random read order (default 1)\n"
+	    "  -m <MiB>          Map size in mebibytes (default 2048)\n"
+	    "  -C <spec>         Additional variant/control; spec=label:mode or mode, where mode=prefix|plain|off\n"
+	    "  -U <updates>      Number of random value updates after load (default 0)\n"
+	    "  -X <deletes>      Number of deletes to perform before reinserting (default 0)\n"
+	    "  -R <ranges>       Number of range scans per timing (default 1000)\n"
+	    "  -L <span>         Entries to scan per range (default 256, 0 = full scan)\n"
+	    "  -D <dups>         Duplicate values per key for dupsort benchmarks (default 0 = disabled)\n"
+	    "  -P                Run a compact copy repack after metrics (default off)\n"
+	    "  -s <seed>         Seed for random read order (default 1)\n"
 	    "  -d <prefix>       Directory prefix for environments (default compress_bench)\n"
 	    "  -k                Keep database files after run\n"
 	    "  -h                Show this help\n",
@@ -278,7 +332,7 @@ static void
 parse_args(bench_config *cfg, int argc, char **argv)
 {
 	int opt;
-	while ((opt = getopt(argc, argv, "n:r:v:p:m:s:d:C:U:X:R:L:Pkh")) != -1) {
+	while ((opt = getopt(argc, argv, "n:r:v:p:m:s:d:C:D:U:X:R:L:Pkh")) != -1) {
 		switch (opt) {
 		case 'n':
 			cfg->entries = strtoull(optarg, NULL, 0);
@@ -304,6 +358,9 @@ parse_args(bench_config *cfg, int argc, char **argv)
 		case 'C':
 			add_variant_spec(cfg, optarg);
 			break;
+	case 'D':
+		cfg->dup_per_key = strtoull(optarg, NULL, 0);
+		break;
 	case 'U':
 		cfg->update_ops = strtoull(optarg, NULL, 0);
 		break;
@@ -435,6 +492,52 @@ generate_permutation(size_t count, uint64_t seed)
 	return order;
 }
 
+static size_t
+bench_variant_key_index(const bench_variant *variant, size_t entry_index)
+{
+	if (!variant->use_dupsort || variant->dup_per_key <= 1)
+		return entry_index;
+	size_t dup = variant->dup_per_key ? variant->dup_per_key : 1;
+	return entry_index / dup;
+}
+
+static uint64_t
+bench_variant_unique_keys(uint64_t total_entries,
+    const bench_variant *variant)
+{
+	if (!variant->use_dupsort || variant->dup_per_key <= 1)
+		return total_entries;
+	uint64_t dup = variant->dup_per_key ? variant->dup_per_key : 1;
+	return (total_entries + dup - 1) / dup;
+}
+
+static void
+bench_fill_entry_value(const bench_config *cfg,
+    const bench_variant *variant, size_t entry_index, size_t version,
+    char *buf)
+{
+	if (!buf || cfg->value_size == 0)
+		return;
+	if (variant && variant->use_dupsort && variant->dup_per_key > 1) {
+		size_t key_index = bench_variant_key_index(variant, entry_index);
+		unsigned char base_byte = (unsigned char)(key_index & 0xFF);
+		memset(buf, (int)base_byte, cfg->value_size);
+		if (cfg->value_size >= 2) {
+			buf[cfg->value_size - 2] =
+			    (char)((unsigned int)version & 0xFF);
+			buf[cfg->value_size - 1] =
+			    (char)((entry_index % variant->dup_per_key) & 0xFF);
+		} else {
+			buf[0] = (char)(((unsigned int)version +
+			    (unsigned int)(entry_index % variant->dup_per_key)) & 0xFF);
+		}
+		return;
+	}
+	uint64_t base = (uint64_t)entry_index +
+	    ((uint64_t)version * (uint64_t)cfg->entries);
+	fill_value(base, cfg->value_size, buf);
+}
+
 static void
 add_variant_spec(bench_config *cfg, const char *arg)
 {
@@ -495,7 +598,12 @@ add_variant_spec(bench_config *cfg, const char *arg)
 static unsigned int
 bench_variant_db_flags(const bench_variant *variant)
 {
-	return variant->use_prefix ? MDB_PREFIX_COMPRESSION : 0;
+	unsigned int flags = 0;
+	if (variant->use_prefix)
+		flags |= MDB_PREFIX_COMPRESSION;
+	if (variant->use_dupsort)
+		flags |= MDB_DUPSORT;
+	return flags;
 }
 
 static MDB_env *
@@ -547,18 +655,33 @@ run_bench_variant(const bench_config *cfg, bench_variant *variant,
 
 	memset(&variant->metrics, 0, sizeof(variant->metrics));
 
+	size_t *versions = NULL;
+	if (variant->use_dupsort && cfg->entries > 0) {
+		versions = calloc(cfg->entries, sizeof(*versions));
+		if (!versions) {
+			fprintf(stderr,
+			    "[%s] Unable to allocate version tracking array\n",
+			    g_current_variant ? g_current_variant : "?");
+			exit(EXIT_FAILURE);
+		}
+	}
+
 	MDB_env *env = bench_open_env(cfg, variant);
 	MDB_dbi dbi =
 	    bench_open_dbi(env, variant, MDB_CREATE, 0);
 
-	bench_do_inserts(cfg, env, dbi, &variant->metrics);
-	bench_do_updates(cfg, env, dbi, &variant->metrics);
+	bench_do_inserts(cfg, variant, env, dbi, versions,
+	    &variant->metrics);
+	bench_do_updates(cfg, variant, env, dbi, versions,
+	    &variant->metrics);
 	size_t *deleted_indices = NULL;
 	size_t deleted_count =
-	    bench_do_deletes(cfg, env, dbi, &deleted_indices, &variant->metrics);
-	if (deleted_count)
-		bench_do_reinserts(cfg, env, dbi, deleted_indices, deleted_count,
-		    &variant->metrics);
+	    bench_do_deletes(cfg, variant, env, dbi, versions,
+	    &deleted_indices, &variant->metrics);
+	if (deleted_count) {
+		bench_do_reinserts(cfg, variant, env, dbi, versions,
+		    deleted_indices, deleted_count, &variant->metrics);
+	}
 	free(deleted_indices);
 
 	CHECK_RC(mdb_env_sync(env, 1), "mdb_env_sync");
@@ -568,22 +691,22 @@ run_bench_variant(const bench_config *cfg, bench_variant *variant,
 
 	env = bench_open_env(cfg, variant);
 	dbi = bench_open_dbi(env, variant, 0, MDB_RDONLY);
-	bench_do_reads(cfg, env, dbi, read_order, &variant->metrics.read_cold,
-	    &variant->metrics.prefix_read_cold);
-	bench_do_reads(cfg, env, dbi, read_order, &variant->metrics.read_warm,
-	    &variant->metrics.prefix_read_warm);
+	bench_do_reads(cfg, variant, versions, env, dbi, read_order,
+	    &variant->metrics.read_cold, &variant->metrics.prefix_read_cold);
+	bench_do_reads(cfg, variant, versions, env, dbi, read_order,
+	    &variant->metrics.read_warm, &variant->metrics.prefix_read_warm);
 	mdb_dbi_close(env, dbi);
 	mdb_env_close(env);
 
 	env = bench_open_env(cfg, variant);
 	dbi = bench_open_dbi(env, variant, 0, MDB_RDONLY);
-	bench_do_scan(cfg, env, dbi, &variant->metrics.scan_cold,
+	bench_do_scan(cfg, variant, env, dbi, &variant->metrics.scan_cold,
 	    &variant->metrics.prefix_scan_cold
 #ifdef MDB_PROFILE_RANGE
 	    , &variant->metrics.profile_scan_cold
 #endif
 	    );
-	bench_do_scan(cfg, env, dbi, &variant->metrics.scan_warm,
+	bench_do_scan(cfg, variant, env, dbi, &variant->metrics.scan_warm,
 	    &variant->metrics.prefix_scan_warm
 #ifdef MDB_PROFILE_RANGE
 	    , &variant->metrics.profile_scan_warm
@@ -595,12 +718,14 @@ run_bench_variant(const bench_config *cfg, bench_variant *variant,
 	mdb_dbi_close(env, dbi);
 	mdb_env_close(env);
 
+	free(versions);
+
 	g_current_variant = prev;
 }
 
 static void
-bench_do_inserts(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
-    bench_metrics *m)
+bench_do_inserts(const bench_config *cfg, const bench_variant *variant,
+    MDB_env *env, MDB_dbi dbi, size_t *versions, bench_metrics *m)
 {
 	MDB_txn *txn = NULL;
 	CHECK_RC(mdb_txn_begin(env, NULL, 0, &txn), "mdb_txn_begin(write)");
@@ -626,11 +751,14 @@ bench_do_inserts(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
 	}
 	for (size_t pos = 0; pos < cfg->entries; ++pos) {
 		size_t idx = order[pos];
-		size_t klen = format_key(idx, cfg->prefix_len, keybuf, key_buflen);
+		size_t key_index = bench_variant_key_index(variant, idx);
+		size_t klen = format_key(key_index, cfg->prefix_len, keybuf,
+		    key_buflen);
 		if (cfg->value_size)
-			fill_value(idx, cfg->value_size, valbuf);
+			bench_fill_entry_value(cfg, variant, idx, 0, valbuf);
 		MDB_val key = {.mv_size = klen, .mv_data = keybuf};
-		MDB_val val = {.mv_size = cfg->value_size, .mv_data = valbuf};
+		MDB_val val = {.mv_size = cfg->value_size,
+		    .mv_data = cfg->value_size ? valbuf : NULL};
 		int rc = mdb_put(txn, dbi, &key, &val, 0);
 		if (rc != MDB_SUCCESS) {
 			fprintf(stderr,
@@ -639,6 +767,8 @@ bench_do_inserts(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
 			    pos, idx, mdb_strerror(rc));
 			exit(EXIT_FAILURE);
 		}
+		if (versions)
+			versions[idx] = 0;
 	}
 
 	clock_gettime(CLOCK_MONOTONIC, &end);
@@ -652,15 +782,23 @@ bench_do_inserts(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
 	m->entries = cfg->entries;
 	m->value_size = cfg->value_size;
 	m->prefix_len = cfg->prefix_len;
+	m->dup_per_key = variant->dup_per_key;
+	m->is_dupsort = variant->use_dupsort;
 	bench_record_timing(&m->insert, cfg->entries, &start, &end);
 }
 
 static void
-bench_do_updates(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
-    bench_metrics *m)
+bench_do_updates(const bench_config *cfg, const bench_variant *variant,
+    MDB_env *env, MDB_dbi dbi, size_t *versions, bench_metrics *m)
 {
 	if (cfg->update_ops == 0)
 		return;
+
+	if (variant->use_dupsort) {
+		fprintf(stderr, "[%s] updates start (ops=%zu)\n",
+		    variant->label, cfg->update_ops);
+		fflush(stderr);
+	}
 
 	MDB_txn *txn = NULL;
 	CHECK_RC(mdb_txn_begin(env, NULL, 0, &txn), "mdb_txn_begin(update)");
@@ -670,10 +808,18 @@ bench_do_updates(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
 		key_buflen = 32;
 	char *keybuf = malloc(key_buflen);
 	char *valbuf = cfg->value_size ? malloc(cfg->value_size) : NULL;
-	if (!keybuf || (cfg->value_size && !valbuf)) {
+	char *oldbuf = (variant->use_dupsort && cfg->value_size) ?
+	    malloc(cfg->value_size) : NULL;
+	if (!keybuf ||
+	    (cfg->value_size && !valbuf) ||
+	    (variant->use_dupsort && cfg->value_size && !oldbuf)) {
 		fprintf(stderr, "bench_do_updates: allocation failure\n");
 		exit(EXIT_FAILURE);
 	}
+
+	MDB_cursor *cursor = NULL;
+	if (variant->use_dupsort)
+		CHECK_RC(mdb_cursor_open(txn, dbi, &cursor), "mdb_cursor_open(update)");
 
 	struct timespec start, end;
 	clock_gettime(CLOCK_MONOTONIC, &start);
@@ -682,32 +828,90 @@ bench_do_updates(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
 				    : 0xD1B54A32D192ED03ULL;
 	for (size_t i = 0; i < cfg->update_ops; ++i) {
 		size_t idx = (size_t)(prng_next(&state) % cfg->entries);
-		size_t klen = format_key(idx, cfg->prefix_len, keybuf, key_buflen);
-		if (cfg->value_size)
-			fill_value(idx + cfg->entries, cfg->value_size, valbuf);
+		size_t key_index = bench_variant_key_index(variant, idx);
+		size_t klen = format_key(key_index, cfg->prefix_len, keybuf,
+		    key_buflen);
 		MDB_val key = {.mv_size = klen, .mv_data = keybuf};
-		MDB_val val = {.mv_size = cfg->value_size, .mv_data = valbuf};
-		CHECK_RC(mdb_put(txn, dbi, &key, &val, 0), "mdb_put(update)");
+
+			if (variant->use_dupsort) {
+				if (!versions) {
+					fprintf(stderr,
+					    "bench_do_updates: missing version table for dupsort variant\n");
+					exit(EXIT_FAILURE);
+				}
+				size_t current_version = versions[idx];
+				MDB_val data = {.mv_size = cfg->value_size,
+				    .mv_data = cfg->value_size ? oldbuf : NULL};
+				if (cfg->value_size)
+					bench_fill_entry_value(cfg, variant, idx, current_version,
+					    oldbuf);
+				int rc = mdb_cursor_get(cursor, &key, &data, MDB_GET_BOTH);
+				if (rc != MDB_SUCCESS) {
+					fprintf(stderr,
+					    "[%s] mdb_cursor_get(update) failed for idx=%zu (%s)\n",
+					    g_current_variant ? g_current_variant : "?",
+					    idx, mdb_strerror(rc));
+					exit(EXIT_FAILURE);
+				}
+				CHECK_RC(mdb_cursor_del(cursor, 0),
+				    "mdb_cursor_del(update)");
+				MDB_val newdata = {.mv_size = cfg->value_size,
+				    .mv_data = cfg->value_size ? valbuf : NULL};
+			if (cfg->value_size)
+				bench_fill_entry_value(cfg, variant, idx,
+				    current_version + 1, valbuf);
+			CHECK_RC(mdb_put(txn, dbi, &key, &newdata, 0),
+			    "mdb_put(update dup)");
+			versions[idx] = current_version + 1;
+		} else {
+			MDB_val val = {.mv_size = cfg->value_size,
+			    .mv_data = cfg->value_size ? valbuf : NULL};
+			if (cfg->value_size)
+				bench_fill_entry_value(cfg, variant, idx, 1, valbuf);
+			CHECK_RC(mdb_put(txn, dbi, &key, &val, 0),
+			    "mdb_put(update)");
+		}
+		if (variant->use_dupsort &&
+		    ((i + 1) % 25000 == 0 || i + 1 == cfg->update_ops)) {
+			fprintf(stderr, "[%s] updates progress %zu/%zu\n",
+			    variant->label, i + 1, cfg->update_ops);
+			fflush(stderr);
+		}
 	}
 
 	clock_gettime(CLOCK_MONOTONIC, &end);
+	if (cursor)
+		mdb_cursor_close(cursor);
 	CHECK_RC(mdb_txn_commit(txn), "mdb_txn_commit(update)");
 
+	if (variant->use_dupsort && cfg->value_size)
+		free(oldbuf);
 	if (cfg->value_size)
 		free(valbuf);
 	free(keybuf);
 
 	bench_record_timing(&m->updates, cfg->update_ops, &start, &end);
+	if (variant->use_dupsort) {
+		fprintf(stderr, "[%s] updates done\n", variant->label);
+		fflush(stderr);
+	}
 }
 
 static size_t
-bench_do_deletes(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
-    size_t **out_indices, bench_metrics *m)
+bench_do_deletes(const bench_config *cfg, const bench_variant *variant,
+    MDB_env *env, MDB_dbi dbi, size_t *versions, size_t **out_indices,
+    bench_metrics *m)
 {
 	if (cfg->delete_ops == 0) {
 		if (out_indices)
 			*out_indices = NULL;
 		return 0;
+	}
+
+	if (variant->use_dupsort) {
+		fprintf(stderr, "[%s] deletes start (ops=%zu)\n",
+		    variant->label, cfg->delete_ops);
+		fflush(stderr);
 	}
 
 	size_t actual = cfg->delete_ops;
@@ -729,9 +933,14 @@ bench_do_deletes(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
 	if (key_buflen < 32)
 		key_buflen = 32;
 	char *keybuf = malloc(key_buflen);
-	if (!keybuf) {
+	char *valbuf = (variant->use_dupsort && cfg->value_size) ?
+	    malloc(cfg->value_size) : NULL;
+	if (!keybuf || (variant->use_dupsort && cfg->value_size && !valbuf)) {
 		fprintf(stderr, "bench_do_deletes: allocation failure\n");
 		free(indices);
+		free(keybuf);
+		if (valbuf)
+			free(valbuf);
 		exit(EXIT_FAILURE);
 	}
 
@@ -747,21 +956,53 @@ bench_do_deletes(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
 		fprintf(stderr, "bench_do_deletes: permutation allocation failure\n");
 		free(indices);
 		free(keybuf);
+		if (valbuf)
+			free(valbuf);
 		exit(EXIT_FAILURE);
 	}
 
 	for (size_t i = 0; i < actual; ++i) {
 		size_t idx = order[i];
 		indices[i] = idx;
-		size_t klen = format_key(idx, cfg->prefix_len, keybuf, key_buflen);
+		size_t key_index = bench_variant_key_index(variant, idx);
+		size_t klen = format_key(key_index, cfg->prefix_len, keybuf,
+		    key_buflen);
 		MDB_val key = {.mv_size = klen, .mv_data = keybuf};
-		int rc = mdb_del(txn, dbi, &key, NULL);
-		if (rc != MDB_SUCCESS) {
-			fprintf(stderr,
-			    "bench_do_deletes: mdb_del(%.*s) rc=%s (idx=%" PRIu64 ")\n",
-			    (int)key.mv_size, (char *)key.mv_data,
-			    mdb_strerror(rc), (uint64_t)idx);
-			exit(EXIT_FAILURE);
+		int rc;
+		if (variant->use_dupsort) {
+			if (!versions) {
+				fprintf(stderr,
+				    "bench_do_deletes: missing version table for dupsort variant\n");
+				exit(EXIT_FAILURE);
+			}
+			size_t current_version = versions[idx];
+			MDB_val data = {.mv_size = cfg->value_size,
+			    .mv_data = cfg->value_size ? valbuf : NULL};
+			if (cfg->value_size)
+				bench_fill_entry_value(cfg, variant, idx, current_version,
+				    valbuf);
+			rc = mdb_del(txn, dbi, &key, &data);
+			if (rc == MDB_NOTFOUND) {
+				fprintf(stderr,
+				    "bench_do_deletes: duplicate not found idx=%zu key=%.*s\n",
+				    idx, (int)key.mv_size, (char *)key.mv_data);
+				exit(EXIT_FAILURE);
+			}
+			if (rc != MDB_SUCCESS) {
+				fprintf(stderr,
+				    "bench_do_deletes: mdb_del dup rc=%s idx=%zu\n",
+				    mdb_strerror(rc), idx);
+				exit(EXIT_FAILURE);
+			}
+			versions[idx] = 0;
+		} else {
+			rc = mdb_del(txn, dbi, &key, NULL);
+			if (rc != MDB_SUCCESS) {
+				fprintf(stderr,
+				    "bench_do_deletes: mdb_del key rc=%s idx=%zu\n",
+				    mdb_strerror(rc), idx);
+				exit(EXIT_FAILURE);
+			}
 		}
 	}
 
@@ -769,22 +1010,35 @@ bench_do_deletes(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
 	CHECK_RC(mdb_txn_commit(txn), "mdb_txn_commit(delete)");
 
 	free(order);
+	if (valbuf)
+		free(valbuf);
 	free(keybuf);
 
 	bench_record_timing(&m->deletes, actual, &start, &end);
-	if (out_indices)
-		*out_indices = indices;
-	else
-		free(indices);
+		if (out_indices)
+			*out_indices = indices;
+		else
+			free(indices);
+	if (variant->use_dupsort) {
+		fprintf(stderr, "[%s] deletes done\n", variant->label);
+		fflush(stderr);
+	}
 	return actual;
 }
 
 static void
-bench_do_reinserts(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
-    const size_t *indices, size_t count, bench_metrics *m)
+bench_do_reinserts(const bench_config *cfg, const bench_variant *variant,
+    MDB_env *env, MDB_dbi dbi, size_t *versions, const size_t *indices,
+    size_t count, bench_metrics *m)
 {
 	if (!indices || count == 0)
 		return;
+
+	if (variant->use_dupsort) {
+		fprintf(stderr, "[%s] reinserts start (count=%zu)\n",
+		    variant->label, count);
+		fflush(stderr);
+	}
 
 	MDB_txn *txn = NULL;
 	CHECK_RC(mdb_txn_begin(env, NULL, 0, &txn), "mdb_txn_begin(reinsert)");
@@ -804,12 +1058,23 @@ bench_do_reinserts(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
 
 	for (size_t i = 0; i < count; ++i) {
 		size_t idx = indices[i];
-		size_t klen = format_key(idx, cfg->prefix_len, keybuf, key_buflen);
+		size_t key_index = bench_variant_key_index(variant, idx);
+		size_t klen = format_key(key_index, cfg->prefix_len, keybuf,
+		    key_buflen);
 		if (cfg->value_size)
-			fill_value(idx, cfg->value_size, valbuf);
+			bench_fill_entry_value(cfg, variant, idx, 0, valbuf);
 		MDB_val key = {.mv_size = klen, .mv_data = keybuf};
-		MDB_val val = {.mv_size = cfg->value_size, .mv_data = valbuf};
+		MDB_val val = {.mv_size = cfg->value_size,
+		    .mv_data = cfg->value_size ? valbuf : NULL};
 		CHECK_RC(mdb_put(txn, dbi, &key, &val, 0), "mdb_put(reinsert)");
+		if (versions)
+			versions[idx] = 0;
+		if (variant->use_dupsort &&
+		    ((i + 1) % 25000 == 0 || i + 1 == count)) {
+			fprintf(stderr, "[%s] reinserts progress %zu/%zu\n",
+			    variant->label, i + 1, count);
+			fflush(stderr);
+		}
 	}
 
 	clock_gettime(CLOCK_MONOTONIC, &end);
@@ -820,6 +1085,10 @@ bench_do_reinserts(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
 	free(keybuf);
 
 	bench_record_timing(&m->reinserts, count, &start, &end);
+	if (variant->use_dupsort) {
+		fprintf(stderr, "[%s] reinserts done\n", variant->label);
+		fflush(stderr);
+	}
 }
 
 static void
@@ -852,22 +1121,40 @@ bench_do_repack(const bench_config *cfg, const bench_variant *variant,
 }
 
 static void
-bench_do_reads(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
+bench_do_reads(const bench_config *cfg, const bench_variant *variant,
+    const size_t *versions, MDB_env *env, MDB_dbi dbi,
     const size_t *read_order, bench_timing *timing, MDB_prefix_metrics *pm)
 {
 	if (!timing || cfg->read_ops == 0)
 		return;
 
+	if (variant->use_dupsort) {
+		const char *phase = (timing == &variant->metrics.read_cold)
+		    ? "cold" : "warm";
+		fprintf(stderr, "[%s] %s reads start (ops=%zu)\n",
+		    variant->label, phase, cfg->read_ops);
+		fflush(stderr);
+	}
+
 	MDB_txn *txn = NULL;
 	CHECK_RC(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn),
 	    "mdb_txn_begin(read)");
+
+	MDB_cursor *cursor = NULL;
+	if (variant->use_dupsort)
+		CHECK_RC(mdb_cursor_open(txn, dbi, &cursor), "mdb_cursor_open(read)");
 
 	size_t key_buflen = cfg->prefix_len + 32;
 	if (key_buflen < 32)
 		key_buflen = 32;
 	char *keybuf = malloc(key_buflen);
-	if (!keybuf) {
+	char *valbuf = (variant->use_dupsort && cfg->value_size) ?
+	    malloc(cfg->value_size) : NULL;
+	if (!keybuf || (variant->use_dupsort && cfg->value_size && !valbuf)) {
 		fprintf(stderr, "bench_do_reads: allocation failure\n");
+		if (cursor)
+			mdb_cursor_close(cursor);
+		mdb_txn_abort(txn);
 		exit(EXIT_FAILURE);
 	}
 
@@ -876,10 +1163,33 @@ bench_do_reads(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
 
 	for (size_t i = 0; i < cfg->read_ops; ++i) {
 		size_t idx = read_order[i];
-		size_t klen = format_key(idx, cfg->prefix_len, keybuf, key_buflen);
+		size_t key_index = bench_variant_key_index(variant, idx);
+		size_t klen = format_key(key_index, cfg->prefix_len, keybuf,
+		    key_buflen);
 		MDB_val key = {.mv_size = klen, .mv_data = keybuf};
-		MDB_val data;
-		CHECK_RC(mdb_get(txn, dbi, &key, &data), "mdb_get");
+		if (variant->use_dupsort) {
+			if (!versions) {
+				fprintf(stderr,
+				    "bench_do_reads: missing version table for dupsort variant\n");
+				exit(EXIT_FAILURE);
+			}
+			size_t version = versions[idx];
+			MDB_val data = {.mv_size = cfg->value_size,
+			    .mv_data = cfg->value_size ? valbuf : NULL};
+			if (cfg->value_size)
+				bench_fill_entry_value(cfg, variant, idx, version, valbuf);
+			int rc = mdb_cursor_get(cursor, &key, &data, MDB_GET_BOTH);
+			if (rc != MDB_SUCCESS) {
+				fprintf(stderr,
+				    "[%s] dupsort read failed idx=%zu (%s)\n",
+				    g_current_variant ? g_current_variant : "?",
+				    idx, mdb_strerror(rc));
+				exit(EXIT_FAILURE);
+			}
+		} else {
+			MDB_val data;
+			CHECK_RC(mdb_get(txn, dbi, &key, &data), "mdb_get");
+		}
 	}
 
 	clock_gettime(CLOCK_MONOTONIC, &end);
@@ -889,15 +1199,23 @@ bench_do_reads(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
 			memset(pm, 0, sizeof(*pm));
 	}
 
+	if (cursor)
+		mdb_cursor_close(cursor);
 	mdb_txn_abort(txn);
+	if (valbuf)
+		free(valbuf);
 	free(keybuf);
 
 	bench_record_timing(timing, cfg->read_ops, &start, &end);
+	if (variant->use_dupsort) {
+		fprintf(stderr, "[%s] reads done\n", variant->label);
+		fflush(stderr);
+	}
 }
 
 static void
-bench_do_scan(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
-    bench_timing *timing, MDB_prefix_metrics *pm
+bench_do_scan(const bench_config *cfg, const bench_variant *variant,
+    MDB_env *env, MDB_dbi dbi, bench_timing *timing, MDB_prefix_metrics *pm
 #ifdef MDB_PROFILE_RANGE
     , MDB_profile_stats *profile
 #endif
@@ -905,6 +1223,13 @@ bench_do_scan(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
 {
 	if (!timing)
 		return;
+
+	if (variant->use_dupsort) {
+		const char *phase =
+		    (timing == &variant->metrics.scan_cold) ? "cold" : "warm";
+		fprintf(stderr, "[%s] %s scan start\n", variant->label, phase);
+		fflush(stderr);
+	}
 
 	MDB_txn *txn = NULL;
 	CHECK_RC(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn),
@@ -948,7 +1273,9 @@ bench_do_scan(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
 		    UINT64_C(0xA24BAED4963EE407) : UINT64_C(1);
 		for (uint64_t op = 0; op < cfg->scan_ops; ++op) {
 			size_t idx = (size_t)(prng_next(&state) % cfg->entries);
-			size_t klen = format_key(idx, cfg->prefix_len, keybuf, key_buflen);
+			size_t key_index = bench_variant_key_index(variant, idx);
+			size_t klen = format_key(key_index, cfg->prefix_len,
+			    keybuf, key_buflen);
 			key.mv_size = klen;
 			key.mv_data = keybuf;
 			int rc = mdb_cursor_get(cursor, &key, &data, MDB_SET_RANGE);
@@ -986,6 +1313,10 @@ bench_do_scan(const bench_config *cfg, MDB_env *env, MDB_dbi dbi,
 	mdb_txn_abort(txn);
 
 	bench_record_timing(timing, count, &start, &end);
+	if (variant->use_dupsort) {
+		fprintf(stderr, "[%s] scan done\n", variant->label);
+		fflush(stderr);
+	}
 }
 
 static void
@@ -1009,6 +1340,9 @@ bench_collect_stats(const bench_config *cfg, const bench_variant *variant,
 	if (!m->scan_cold.ops)
 		m->scan_cold.ops = st.ms_entries;
 	m->entries = st.ms_entries;
+	m->is_dupsort = variant->use_dupsort;
+	m->dup_per_key = variant->dup_per_key;
+	m->unique_keys = bench_variant_unique_keys(m->entries, variant);
 
 	mdb_txn_abort(txn);
 
@@ -1168,10 +1502,19 @@ print_metrics(const bench_variant *variant)
 	char buf_map_used[64];
 	char buf_map_size[64];
 	char buf_repack[64];
-	printf("=== %s (%s) ===\n",
-	    variant->label, variant->use_prefix ? "prefix" : "plain");
-	printf("Entries: %" PRIu64 ", Value bytes: %zu, Prefix bytes: %zu\n",
+	printf("=== %s (%s, %s) ===\n",
+	    variant->label,
+	    variant->use_prefix ? "prefix" : "plain",
+	    variant->use_dupsort ? "dupsort" : "unique");
+	printf("Entries: %" PRIu64 ", Value bytes: %zu, Prefix bytes: %zu",
 	    (uint64_t)m->entries, m->value_size, m->prefix_len);
+	if (variant->use_dupsort) {
+		printf(", Duplicates/key target: %zu",
+		    m->dup_per_key ? m->dup_per_key : variant->dup_per_key);
+		if (m->unique_keys)
+			printf(" (~%" PRIu64 " unique keys)", m->unique_keys);
+	}
+	printf("\n");
 	print_timing("Insert", &m->insert, "op");
 	print_timing("Update", &m->updates, "op");
 	print_timing("Delete", &m->deletes, "key");

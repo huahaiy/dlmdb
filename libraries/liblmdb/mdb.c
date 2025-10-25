@@ -4048,13 +4048,14 @@ mdb_cursor_chk(MDB_cursor *mc)
 static void mdb_audit(MDB_txn *txn)
 {
 	MDB_cursor mc = (MDB_cursor){0};
+	MDB_xcursor free_mx = (MDB_xcursor){0};
 	MDB_val key, data;
 	MDB_ID freecount, count;
 	MDB_dbi i;
 	int rc;
 
 	freecount = 0;
-	mdb_cursor_init(&mc, txn, FREE_DBI, NULL);
+	mdb_cursor_init(&mc, txn, FREE_DBI, &free_mx);
 	while ((rc = mdb_cursor_get(&mc, &key, &data, MDB_NEXT)) == 0)
 		freecount += *(MDB_ID *)data.mv_data;
 	mdb_tassert(txn, rc == MDB_NOTFOUND);
@@ -4576,6 +4577,7 @@ mdb_page_alloc(MDB_cursor *mc, int num, MDB_page **mp)
 	txnid_t oldest = 0, last;
 	MDB_cursor_op op;
     MDB_cursor m2 = (MDB_cursor){0};
+    MDB_xcursor m2x = (MDB_xcursor){0};
     int found_old = 0;
 
     rc = MDB_SUCCESS;
@@ -4621,7 +4623,7 @@ mdb_page_alloc(MDB_cursor *mc, int num, MDB_page **mp)
 			/* Prepare to fetch more and coalesce */
 			last = env->me_pglast;
 			oldest = env->me_pgoldest;
-			mdb_cursor_init(&m2, txn, FREE_DBI, NULL);
+			mdb_cursor_init(&m2, txn, FREE_DBI, &m2x);
 #if (MDB_DEVEL) & 2	/* "& 2" so MDB_DEVEL=1 won't hide bugs breaking freeDB */
 			/* Use original snapshot. TODO: Should need less care in code
 			 * which modifies the database. Maybe we can delete some code?
@@ -5583,13 +5585,14 @@ mdb_freelist_save(MDB_txn *txn)
 	 * Page numbers cannot disappear from txn->mt_free_pgs[].
 	 */
 	MDB_cursor mc = (MDB_cursor){0};
+	MDB_xcursor mx = (MDB_xcursor){0};
 	MDB_env	*env = txn->mt_env;
 	int rc, maxfree_1pg = env->me_maxfree_1pg, more = 1;
 	txnid_t	pglast = 0, head_id = 0;
 	pgno_t	freecnt = 0, *free_pgs, *mop;
 	ssize_t	head_room = 0, total_room = 0, mop_len, clean_limit;
 
-	mdb_cursor_init(&mc, txn, FREE_DBI, NULL);
+	mdb_cursor_init(&mc, txn, FREE_DBI, &mx);
 
 	if (env->me_pghead) {
 		/* Make sure first page of freeDB is touched and on freelist */
@@ -11490,6 +11493,9 @@ mdb_cursor_init(MDB_cursor *mc, MDB_txn *txn, MDB_dbi dbi, MDB_xcursor *mx)
 		mdb_tassert(txn, mx != NULL);
 		mc->mc_xcursor = mx;
 		mdb_xcursor_init0(mc);
+	} else if (mx) {
+		mc->mc_xcursor = mx;
+		mdb_xcursor_init0(mc);
 	} else {
 		mc->mc_xcursor = NULL;
 	}
@@ -13597,8 +13603,9 @@ mdb_env_copyfd1(MDB_env *env, HANDLE fd)
 		 */
 		MDB_ID freecount = 0;
 			MDB_cursor mc = (MDB_cursor){0};
+		MDB_xcursor mx = (MDB_xcursor){0};
 		MDB_val key, data;
-		mdb_cursor_init(&mc, txn, FREE_DBI, NULL);
+		mdb_cursor_init(&mc, txn, FREE_DBI, &mx);
 		while ((rc = mdb_cursor_get(&mc, &key, &data, MDB_NEXT)) == 0)
 			freecount += *(MDB_ID *)data.mv_data;
 		if (rc != MDB_NOTFOUND)

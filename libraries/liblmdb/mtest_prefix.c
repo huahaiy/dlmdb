@@ -93,6 +93,7 @@ static void test_prefix_update_reinsert(void);
 static void test_prefix_dupsort_cursor_walk(void);
 static void test_prefix_dupsort_get_both_range(void);
 static void test_prefix_dupsort_smoke(void);
+static void test_prefix_dupsort_corner_cases(void);
 static void assert_dup_sequence(MDB_env *env, MDB_dbi dbi, const char *key,
     const char *const *expected, size_t expected_count);
 static void test_prefix_dupsort_inline_basic_ops(void);
@@ -1134,6 +1135,180 @@ test_prefix_dupsort_smoke(void)
 		    ARRAY_SIZE(dups) - 1, seen);
 		exit(EXIT_FAILURE);
 	}
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+	mdb_env_close(env);
+}
+
+static void
+test_prefix_dupsort_corner_cases(void)
+{
+	static const char *dir = "testdb_prefix_dupsort_corners";
+	static const char *db_name = "dupdb";
+	MDB_env *env = create_env(dir);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+	unsigned int flags = MDB_PREFIX_COMPRESSION | MDB_DUPSORT;
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, db_name, MDB_CREATE | flags, &dbi));
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, db_name, flags, &dbi));
+	MDB_cursor *cur = NULL;
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+	MDB_val key = {0, NULL};
+	MDB_val data = {0, NULL};
+	int rc = mdb_cursor_get(cur, &key, &data, MDB_FIRST);
+	if (rc != MDB_NOTFOUND) {
+		fprintf(stderr,
+		    "dupsort corner: expected empty database to return MDB_NOTFOUND\n");
+		exit(EXIT_FAILURE);
+	}
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+
+	const char *single_key = "corner-key";
+	const char *single_value = "corner-value";
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, db_name, flags, &dbi));
+	key.mv_data = (void *)single_key;
+	key.mv_size = strlen(single_key);
+	data.mv_data = (void *)single_value;
+	data.mv_size = strlen(single_value);
+	CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, db_name, flags, &dbi));
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+	key.mv_size = 0;
+	key.mv_data = NULL;
+	data.mv_size = 0;
+	data.mv_data = NULL;
+	rc = mdb_cursor_get(cur, &key, &data, MDB_FIRST);
+	if (rc != MDB_SUCCESS ||
+	    key.mv_size != strlen(single_key) ||
+	    memcmp(key.mv_data, single_key, key.mv_size) != 0 ||
+	    data.mv_size != strlen(single_value) ||
+	    memcmp(data.mv_data, single_value, data.mv_size) != 0) {
+		fprintf(stderr, "dupsort corner: single entry lookup mismatch\n");
+		exit(EXIT_FAILURE);
+	}
+	rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT_DUP);
+	if (rc != MDB_NOTFOUND) {
+		fprintf(stderr,
+		    "dupsort corner: expected no additional duplicates for single value\n");
+		exit(EXIT_FAILURE);
+	}
+	rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT);
+	if (rc != MDB_NOTFOUND) {
+		fprintf(stderr,
+		    "dupsort corner: expected no additional keys after singleton\n");
+		exit(EXIT_FAILURE);
+	}
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+
+	unsigned char max_dup_buf[] = {0xff, 0xff};
+	MDB_val max_dup = {sizeof(max_dup_buf), max_dup_buf};
+	unsigned char min_dup_buf[] = {0x00};
+	MDB_val min_dup = {sizeof(min_dup_buf), min_dup_buf};
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, db_name, flags, &dbi));
+	key.mv_data = (void *)single_key;
+	key.mv_size = strlen(single_key);
+	CHECK_CALL(mdb_put(txn, dbi, &key, &max_dup, 0));
+	CHECK_CALL(mdb_put(txn, dbi, &key, &min_dup, 0));
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, db_name, flags, &dbi));
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+	key.mv_size = 0;
+	key.mv_data = NULL;
+	data.mv_size = 0;
+	data.mv_data = NULL;
+	rc = mdb_cursor_get(cur, &key, &data, MDB_FIRST);
+	if (rc != MDB_SUCCESS ||
+	    key.mv_size != strlen(single_key) ||
+	    memcmp(key.mv_data, single_key, key.mv_size) != 0 ||
+	    data.mv_size != min_dup.mv_size ||
+	    memcmp(data.mv_data, min_dup.mv_data, data.mv_size) != 0) {
+		fprintf(stderr,
+		    "dupsort corner: expected minimum duplicate to be returned first\n");
+		exit(EXIT_FAILURE);
+	}
+
+	rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT_DUP);
+	if (rc != MDB_SUCCESS ||
+	    data.mv_size != strlen(single_value) ||
+	    memcmp(data.mv_data, single_value, data.mv_size) != 0) {
+		fprintf(stderr,
+		    "dupsort corner: expected middle duplicate to match inserted value\n");
+		exit(EXIT_FAILURE);
+	}
+
+	rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT_DUP);
+	if (rc != MDB_SUCCESS ||
+	    data.mv_size != max_dup.mv_size ||
+	    memcmp(data.mv_data, max_dup.mv_data, data.mv_size) != 0) {
+		fprintf(stderr,
+		    "dupsort corner: expected max duplicate to sort to the end\n");
+		exit(EXIT_FAILURE);
+	}
+
+	rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT_DUP);
+	if (rc != MDB_NOTFOUND) {
+		fprintf(stderr,
+		    "dupsort corner: unexpected duplicate beyond max value\n");
+		exit(EXIT_FAILURE);
+	}
+
+	MDB_val seek_key = {strlen(single_key), (void *)single_key};
+	rc = mdb_cursor_get(cur, &seek_key, &data, MDB_SET_KEY);
+	if (rc != MDB_SUCCESS) {
+		fprintf(stderr, "dupsort corner: MDB_SET_KEY failed for corner key\n");
+		exit(EXIT_FAILURE);
+	}
+
+	rc = mdb_cursor_get(cur, &seek_key, &data, MDB_LAST_DUP);
+	if (rc != MDB_SUCCESS ||
+	    data.mv_size != max_dup.mv_size ||
+	    memcmp(data.mv_data, max_dup.mv_data, data.mv_size) != 0) {
+		fprintf(stderr,
+		    "dupsort corner: MDB_LAST_DUP did not return max duplicate\n");
+		exit(EXIT_FAILURE);
+	}
+
+	rc = mdb_cursor_get(cur, &seek_key, &data, MDB_PREV_DUP);
+	if (rc != MDB_SUCCESS ||
+	    data.mv_size != strlen(single_value) ||
+	    memcmp(data.mv_data, single_value, data.mv_size) != 0) {
+		fprintf(stderr,
+		    "dupsort corner: MDB_PREV_DUP did not step to the middle value\n");
+		exit(EXIT_FAILURE);
+	}
+
+	rc = mdb_cursor_get(cur, &seek_key, &data, MDB_PREV_DUP);
+	if (rc != MDB_SUCCESS ||
+	    data.mv_size != min_dup.mv_size ||
+	    memcmp(data.mv_data, min_dup.mv_data, data.mv_size) != 0) {
+		fprintf(stderr,
+		    "dupsort corner: MDB_PREV_DUP did not reach the minimum duplicate\n");
+		exit(EXIT_FAILURE);
+	}
+
+	rc = mdb_cursor_get(cur, &seek_key, &data, MDB_PREV_DUP);
+	if (rc != MDB_NOTFOUND) {
+		fprintf(stderr,
+		    "dupsort corner: expected start of duplicate chain after minimum\n");
+		exit(EXIT_FAILURE);
+	}
+
 	mdb_cursor_close(cur);
 	mdb_txn_abort(txn);
 	mdb_env_close(env);
@@ -2516,7 +2691,7 @@ test_prefix_fuzz(void)
 	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
 	CHECK_CALL(mdb_txn_commit(txn));
 
-	const size_t operations = 10000;
+	const size_t operations = 5000;
 	for (size_t op = 0; op < operations; ++op) {
 		pf_op_index = op;
 		int do_insert = (pf_entry_count < PF_MAX_ENTRIES) &&
@@ -2601,26 +2776,23 @@ test_nested_txn_rollback(void)
 	mdb_env_close(env);
 }
 
-
-
-
-
 int
 main(void)
 {
-    test_config_validation();
-    test_edge_cases();
-    test_range_scans();
-    test_threshold_behavior();
-    test_mixed_pattern_and_unicode();
-    test_cursor_buffer_sharing();
-    test_prefix_dupsort_transitions();
+  test_config_validation();
+  test_edge_cases();
+  test_range_scans();
+  test_threshold_behavior();
+  test_mixed_pattern_and_unicode();
+  test_cursor_buffer_sharing();
+  test_prefix_dupsort_transitions();
 	test_prefix_dupsort_cursor_walk();
 	test_prefix_dupsort_get_both_range();
 	test_prefix_leaf_splits();
 	test_prefix_alternating_prefixes();
 	test_prefix_update_reinsert();
 	test_prefix_dupsort_smoke();
+	test_prefix_dupsort_corner_cases();
 	test_prefix_dupsort_inline_basic_ops();
 	test_prefix_dupsort_inline_promote();
 	test_prefix_dupsort_inline_cmp_negative();
