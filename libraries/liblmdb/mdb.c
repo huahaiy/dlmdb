@@ -3467,6 +3467,7 @@ mdb_prefix_count(MDB_txn *txn, MDB_dbi dbi, const MDB_val *key,
 		return MDB_SUCCESS;
 	}
 
+	mc.mc_flags |= C_LEAFCACHE;
 	mdb_cursor_init(&mc, txn, dbi, NULL);
 	search = *key;
 	rc = mdb_cursor_set(&mc, &search, NULL, MDB_SET_RANGE, NULL);
@@ -3614,6 +3615,7 @@ mdb_prefix_pair_leq(MDB_txn *txn, MDB_dbi dbi,
 		return MDB_SUCCESS;
 	}
 
+	mc.mc_flags |= C_LEAFCACHE;
 	mdb_cursor_init(&mc, txn, dbi, &mx);
 	search = *key;
 	rc = mdb_cursor_set(&mc, &search, &data, MDB_SET_RANGE, &exact);
