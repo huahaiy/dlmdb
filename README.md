@@ -165,29 +165,47 @@ cursor API; the optimisation is completely internal to the engine.
 ### Prefix compression performance
 
 `compress_bench` measures workloads with and without prefix compression. With
-500,000 entries, 64-byte values, 32-byte shared prefixes, and a 2 GiB map:
+1,000,000 entries, 64-byte values, 32-byte shared prefixes, a 2 GiB map, and
+duplicate-heavy traffic:
 
 ```
-./compress_bench -n 500000 -r 500000 -v 64 -p 32 -m 2048 -U 100000 -X 100000
+./compress_bench -n 1000000 -r 500000 -v 64 -p 32 -m 2048 -U 200000 -X 200000 -D 20
 
-=== plain (plain) ===
-Insert: 398.366 ms (0.797 us/op)   Random read (warm): 289.653 ms (0.579 us/op)
-Range scan (warm): 3.512 ms (0.014 us/key)  Data size: 254.53 MiB, leaf pages: 5405
+=== plain (plain, unique) ===
+Insert: 1205.081 ms (1.205 us/op)   Random read (warm): 409.659 ms (0.819 us/op)
+Range scan (warm): 4.905 ms (0.019 us/key)  Data size: 509.12 MiB, leaf pages: 10810
 
-=== prefix (prefix) ===
-Insert: 396.818 ms (0.794 us/op)   Random read (warm): 271.002 ms (0.542 us/op)
-Range scan (warm): 5.546 ms (0.022 us/key)  Data size: 166.27 MiB, leaf pages: 3529
+=== prefix (prefix, unique) ===
+Insert: 1285.150 ms (1.285 us/op)   Random read (warm): 461.428 ms (0.923 us/op)
+Range scan (warm): 5.160 ms (0.020 us/key)  Data size: 331.83 MiB, leaf pages: 7049
+
+=== plain-dups (plain, dupsort) ===
+Insert: 1703.188 ms (1.703 us/op)   Random read (warm): 410.138 ms (0.820 us/op)
+Range scan (warm): 5.314 ms (0.021 us/key)  Data size: 344.14 MiB, leaf pages: 7302
+
+=== prefix-dups (prefix, dupsort) ===
+Insert: 1902.391 ms (1.902 us/op)   Random read (warm): 387.025 ms (0.774 us/op)
+Range scan (warm): 4.823 ms (0.019 us/key)  Data size: 74.14 MiB, leaf pages: 1590
 
 Prefix metrics:
-  Random Read (cold) decode=3,141,522 (fast=3,141,522) hit=5,184 miss=3,141,522 cached_pages=0
-  Range Scan (warm) decode=6,767 (fast=6,767) hit=257,009 miss=6,767 cached_pages=1,486
+  Random Read (cold) decode=3,142,748 (fast=3,142,748) hit=5,137 miss=3,142,748 cached_pages=0
+  Range Scan (warm) decode=6,805 (fast=6,805) hit=257,003 miss=6,805 cached_pages=1,492
 
 --- Relative to plain ---
-Insert time: 0.996x
-Update time: 0.876x
-Delete time: 0.926x
-Random read (warm): 0.936x
+Insert time: 1.066x
+Update time: 1.012x
+Delete time: 1.109x
+Random read (warm): 1.126x
+Range scan (warm): 1.052x
 Data size / map usage / leaf pages: ~0.65x
+
+--- Relative to plain-dups ---
+Insert time: 1.117x
+Update time: 1.236x
+Delete time: 0.945x
+Random read (warm): 0.944x
+Range scan (warm): 0.908x
+Data size / map usage / leaf pages: ~0.22x
 ```
 
 Prefix compression therefore shrinks on-disk footprint by ~35 % and improves
