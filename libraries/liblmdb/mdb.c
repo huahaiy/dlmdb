@@ -2514,6 +2514,9 @@ mdb_prefix_inline_seed(MDB_page *mp, size_t capacity, const MDB_val *key)
 	return MDB_SUCCESS;
 }
 
+static int mdb_prefix_inline_build_pair(MDB_cursor *mc, MDB_page *mp, size_t capacity,
+    const MDB_val *first, const MDB_val *second);
+
 static int mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp,
     const MDB_val *old_trunk, indx_t insert, const MDB_val *new_key,
     MDB_val *new_data, unsigned int new_flags, MDB_page *ofp);
@@ -9774,6 +9777,7 @@ _mdb_cursor_put(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 	MDB_db dummy;
 	int do_sub = 0, insert_key, insert_data;
 	int split_performed = 0;
+	int inline_pair_ready = 0;
 	unsigned int mcount = 0, dcount = 0, nospill;
 	size_t nsize;
 	int rc, rc2;
@@ -9978,6 +9982,7 @@ more:
 			if (!F_ISSET(leaf->mn_flags, F_DUPDATA)) {
 				MDB_cmp_func *dcmp;
 				int cmp;
+				MDB_val original_dup = olddata;
 				/* Just overwrite the current item */
 				if (flags == MDB_CURRENT)
 					goto current;
@@ -10051,6 +10056,15 @@ more:
 						mc->mc_xcursor->mx_inline_required = required;
 						mc->mc_xcursor->mx_inline_measure_ready = 1;
 					}
+				}
+				if (!force_subdb) {
+					rc2 = mdb_prefix_inline_build_pair(mc, fp, xdata.mv_size,
+					    &original_dup, data);
+					if (rc2 != MDB_SUCCESS)
+						return rc2;
+					inline_pair_ready = 1;
+					dkey.mv_size = 0;
+					dkey.mv_data = NULL;
 				}
 			} else if (leaf->mn_flags & F_SUBDATA) {
 				/* Data is on sub-DB, just store it */
@@ -10163,6 +10177,7 @@ more:
 			}
 			if (NODESIZE + NODEKSZ(leaf) + xdata.mv_size > env->me_nodemax) {
 					/* Too big for a sub-page, convert to sub-DB */
+					inline_pair_ready = 0;
 					fp_flags &= ~P_SUBP;
 prep_subDB:
 			if (mc->mc_db->md_flags & MDB_DUPFIXED) {
@@ -10214,7 +10229,8 @@ prep_subDB:
 
 			rdata = &xdata;
 			flags |= F_DUPDATA;
-			do_sub = 1;
+			if (!inline_pair_ready)
+				do_sub = 1;
 			if (!insert_key)
 				mdb_node_del(mc, 0);
 			goto new_sub;
@@ -10353,6 +10369,31 @@ new_sub:
 
 finish_put:
 	if (rc == MDB_SUCCESS) {
+		if (inline_pair_ready && !do_sub && mc->mc_xcursor) {
+			leaf = NODEPTR(mc->mc_pg[mc->mc_top], mc->mc_ki[mc->mc_top]);
+			mdb_xcursor_init1(mc, leaf);
+			insert_data = 1;
+			{
+				MDB_cursor *m2;
+				unsigned i = mc->mc_top;
+				MDB_page *mp = mc->mc_pg[i];
+				MDB_xcursor *mx = mc->mc_xcursor;
+
+				for (m2 = mc->mc_txn->mt_cursors[mc->mc_dbi]; m2; m2=m2->mc_next) {
+					if (m2 == mc || m2->mc_snum < mc->mc_snum)
+						continue;
+					if (!(m2->mc_flags & C_INITIALIZED))
+						continue;
+					if (m2->mc_pg[i] != mp)
+						continue;
+					if (m2->mc_ki[i] == mc->mc_ki[i]) {
+						mdb_xcursor_init2(m2, mx, 1);
+					} else if (!insert_key) {
+						XCURSOR_REFRESH(m2, i, mp);
+					}
+				}
+			}
+		}
 		/* Now store the actual data in the child DB. Note that we're
 		 * storing the user data in the keys field, so there are strict
 		 * size limits on dupdata. The actual data fields of the child
@@ -10467,6 +10508,108 @@ bad_sub:
 		    rc, (uint64_t)mc->mc_db->md_entries, insert_key, insert_data);
 	}
 	return rc;
+}
+
+static int
+mdb_prefix_inline_build_pair(MDB_cursor *mc, MDB_page *mp, size_t capacity,
+    const MDB_val *first, const MDB_val *second)
+{
+	MDB_xcursor tmp;
+	MDB_cursor *sub;
+	MDB_val items[2];
+	MDB_val zerodata = {0, ""};
+	MDB_cmp_func *dcmp;
+	int rc;
+
+	if (!mc || !mp || !first || !second)
+		return EINVAL;
+	if (capacity <= PAGEHDRSZ)
+		return MDB_PAGE_FULL;
+
+	memset(mp, 0, capacity);
+	MP_FLAGS(mp) = P_LEAF|P_DIRTY|P_SUBP;
+	MP_LOWER(mp) = (indx_t)(PAGEHDRSZ - PAGEBASE);
+	MP_UPPER(mp) = (indx_t)(capacity - PAGEBASE);
+	MP_PAD(mp) = 0;
+	COPY_PGNO(MP_PGNO(mp), mc->mc_pg[mc->mc_top]->mp_pgno);
+
+	memset(&tmp, 0, sizeof(tmp));
+	sub = &tmp.mx_cursor;
+	sub->mc_txn = mc->mc_txn;
+	sub->mc_db = &tmp.mx_db;
+	sub->mc_dbx = &tmp.mx_dbx;
+	sub->mc_dbi = mc->mc_dbi;
+	sub->mc_dbflag = &tmp.mx_dbflag;
+	sub->mc_snum = 1;
+	sub->mc_top = 0;
+	sub->mc_pg[0] = mp;
+	sub->mc_ki[0] = 0;
+	sub->mc_flags = C_SUB | (mc->mc_flags & (C_ORIG_RDONLY|C_WRITEMAP|C_LEAFCACHE));
+	sub->mc_flags |= C_LEAFCACHE | C_INITIALIZED;
+	sub->mc_key.mv_data = sub->mc_keybuf;
+	sub->mc_key.mv_size = 0;
+	sub->mc_key_pgno = P_INVALID;
+	sub->mc_key_last = (indx_t)~0;
+	mdb_cursor_leaf_cache_reset(&sub->mc_leaf_cache);
+	MC_SET_OVPG(sub, NULL);
+
+	tmp.mx_inline_bytes = capacity;
+	tmp.mx_inline_required = 0;
+	tmp.mx_inline_measure_ready = 0;
+	tmp.mx_dbflag = DB_VALID|DB_USRVALID|DB_DUPDATA|DB_DIRTY;
+	tmp.mx_dbx.md_name.mv_size = 0;
+	tmp.mx_dbx.md_name.mv_data = NULL;
+	tmp.mx_dbx.md_cmp = mc->mc_dbx->md_dcmp;
+	tmp.mx_dbx.md_dcmp = NULL;
+	tmp.mx_dbx.md_rel = mc->mc_dbx->md_rel;
+
+	tmp.mx_db.md_pad = 0;
+	tmp.mx_db.md_flags = 0;
+	tmp.mx_db.md_depth = 1;
+	tmp.mx_db.md_branch_pages = 0;
+	tmp.mx_db.md_leaf_pages = 1;
+	tmp.mx_db.md_overflow_pages = 0;
+	tmp.mx_db.md_entries = 0;
+	COPY_PGNO(tmp.mx_db.md_root, MP_PGNO(mp));
+
+	items[0] = *first;
+	items[1] = *second;
+
+	if (mc->mc_db->md_flags & MDB_DUPFIXED) {
+		if (items[0].mv_size != items[1].mv_size)
+			return MDB_BAD_VALSIZE;
+		MP_FLAGS(mp) |= P_LEAF2;
+		mp->mp_pad = items[0].mv_size;
+		tmp.mx_db.md_flags |= MDB_DUPFIXED;
+		tmp.mx_db.md_pad = mp->mp_pad;
+		if (mc->mc_db->md_flags & MDB_INTEGERDUP)
+			tmp.mx_db.md_flags |= MDB_INTEGERKEY;
+	}
+
+	if (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION)
+		tmp.mx_db.md_flags |= MDB_PREFIX_COMPRESSION;
+	if (mc->mc_db->md_flags & MDB_COUNTED)
+		tmp.mx_db.md_flags |= MDB_COUNTED;
+
+	dcmp = tmp.mx_dbx.md_cmp;
+	if (NEED_CMP_CLONG(dcmp, items[0].mv_size) ||
+	    NEED_CMP_CLONG(dcmp, items[1].mv_size))
+		dcmp = mdb_cmp_clong;
+	if (dcmp(&items[1], &items[0]) < 0) {
+		MDB_val swap = items[0];
+		items[0] = items[1];
+		items[1] = swap;
+	}
+
+	rc = _mdb_cursor_put(sub, &items[0], &zerodata, MDB_NOSPILL);
+	if (rc != MDB_SUCCESS)
+		return rc;
+
+	rc = _mdb_cursor_put(sub, &items[1], &zerodata, MDB_NOSPILL);
+	if (rc != MDB_SUCCESS)
+		return rc;
+
+	return MDB_SUCCESS;
 }
 
 int
