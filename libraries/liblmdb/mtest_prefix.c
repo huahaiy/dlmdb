@@ -3,6 +3,8 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -102,6 +104,7 @@ static void test_prefix_dupsort_inline_cmp_negative(void);
 static void test_prefix_dupsort_trunk_swap_inline(void);
 static void test_prefix_dupsort_trunk_swap_promote(void);
 static void test_prefix_dupsort_trunk_key_shift_no_value_change(void);
+static void test_prefix_concurrent_reads(void);
 
 static void
 reset_dir(const char *dir)
@@ -2712,6 +2715,198 @@ test_prefix_fuzz(void)
 	mdb_env_close(env);
 }
 
+struct prefix_concurrent_ctx {
+	MDB_env *env;
+	MDB_dbi dbi;
+	int key_count;
+	int iterations;
+	atomic_int stop;
+};
+
+static unsigned int
+prefix_rng_next(unsigned int *state)
+{
+	*state = (*state * 1103515245u) + 12345u;
+	return *state;
+}
+
+static void
+prefix_assert_snapshot(MDB_env *env, MDB_dbi dbi, const char *context)
+{
+	MDB_txn *txn = NULL;
+	MDB_cursor *cur = NULL;
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+
+	MDB_val key = {0, NULL};
+	MDB_val data = {0, NULL};
+	char keybuf[32];
+	char valbuf[48];
+	char prev_keybuf[32];
+	int have_prev = 0;
+
+	int rc = mdb_cursor_get(cur, &key, &data, MDB_FIRST);
+	while (rc == MDB_SUCCESS) {
+		if (key.mv_size >= sizeof(keybuf)) {
+			fprintf(stderr, "%s: key longer than buffer (%zu bytes)\n",
+			    context, key.mv_size);
+			exit(EXIT_FAILURE);
+		}
+		memcpy(keybuf, key.mv_data, key.mv_size);
+		keybuf[key.mv_size] = '\0';
+		if (have_prev && strcmp(prev_keybuf, keybuf) >= 0) {
+			fprintf(stderr, "%s: keys out of order (%s after %s)\n",
+			    context, keybuf, prev_keybuf);
+			exit(EXIT_FAILURE);
+		}
+
+		if (data.mv_size >= sizeof(valbuf)) {
+			fprintf(stderr, "%s: value longer than buffer (%zu bytes)\n",
+			    context, data.mv_size);
+			exit(EXIT_FAILURE);
+		}
+		memcpy(valbuf, data.mv_data, data.mv_size);
+		valbuf[data.mv_size] = '\0';
+
+		if (memcmp(valbuf, keybuf, key.mv_size) != 0 ||
+		    valbuf[key.mv_size] != '#') {
+			fprintf(stderr, "%s: value mismatch for key %s (value %s)\n",
+			    context, keybuf, valbuf);
+			exit(EXIT_FAILURE);
+		}
+
+		const char *suffix = valbuf + key.mv_size;
+		if (strcmp(suffix, "#even") != 0 && strcmp(suffix, "#odd") != 0) {
+			fprintf(stderr, "%s: unexpected suffix for key %s (value %s)\n",
+			    context, keybuf, valbuf);
+			exit(EXIT_FAILURE);
+		}
+
+		strcpy(prev_keybuf, keybuf);
+		have_prev = 1;
+		rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT);
+	}
+	if (rc != MDB_NOTFOUND)
+		CHECK(rc, "prefix concurrent cursor walk");
+
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+}
+
+static void *
+prefix_reader_thread(void *arg)
+{
+	struct prefix_concurrent_ctx *ctx = arg;
+	while (!atomic_load_explicit(&ctx->stop, memory_order_acquire)) {
+		prefix_assert_snapshot(ctx->env, ctx->dbi, "concurrent reader");
+		usleep(1000);
+	}
+	prefix_assert_snapshot(ctx->env, ctx->dbi, "concurrent reader final");
+	return NULL;
+}
+
+static void *
+prefix_writer_thread(void *arg)
+{
+	struct prefix_concurrent_ctx *ctx = arg;
+	unsigned int state = 0xc0ffeeu;
+	for (int iter = 0; iter < ctx->iterations; ++iter) {
+		unsigned int idx =
+		    prefix_rng_next(&state) % (unsigned int)ctx->key_count;
+		char keybuf[32];
+		char valbuf[48];
+		snprintf(keybuf, sizeof(keybuf), "pref-%05u", idx);
+		const char *suffix = ((iter + (int)idx) & 1) ? "#odd" : "#even";
+		snprintf(valbuf, sizeof(valbuf), "%s%s", keybuf, suffix);
+
+		MDB_txn *txn = NULL;
+		CHECK_CALL(mdb_txn_begin(ctx->env, NULL, 0, &txn));
+		MDB_val key = {strlen(keybuf), keybuf};
+		MDB_val data = {strlen(valbuf), valbuf};
+		CHECK_CALL(mdb_put(txn, ctx->dbi, &key, &data, 0));
+		CHECK_CALL(mdb_txn_commit(txn));
+
+		if ((iter & 15) == 0)
+			usleep(500);
+	}
+	atomic_store_explicit(&ctx->stop, 1, memory_order_release);
+	return NULL;
+}
+
+static void
+test_prefix_concurrent_reads(void)
+{
+	static const char *dir = "testdb_prefix_concurrent";
+	reset_dir(dir);
+
+	MDB_env *env = NULL;
+	CHECK_CALL(mdb_env_create(&env));
+	CHECK_CALL(mdb_env_set_maxdbs(env, 4));
+	CHECK_CALL(mdb_env_set_mapsize(env, 64UL * 1024 * 1024));
+	CHECK_CALL(mdb_env_open(env, dir, MDB_NOLOCK, 0664));
+
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, "prefix-concurrent",
+	    MDB_CREATE | MDB_PREFIX_COMPRESSION, &dbi));
+
+	struct prefix_concurrent_ctx ctx;
+	ctx.env = env;
+	ctx.dbi = dbi;
+	ctx.key_count = 256;
+	ctx.iterations = 1024;
+	atomic_init(&ctx.stop, 0);
+
+	for (int i = 0; i < ctx.key_count; ++i) {
+		char keybuf[32];
+		char valbuf[48];
+		snprintf(keybuf, sizeof(keybuf), "pref-%05d", i);
+		snprintf(valbuf, sizeof(valbuf), "%s#even", keybuf);
+		MDB_val key = {strlen(keybuf), keybuf};
+		MDB_val data = {strlen(valbuf), valbuf};
+		CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	pthread_t readers[2];
+	for (size_t i = 0; i < sizeof(readers) / sizeof(readers[0]); ++i) {
+		if (pthread_create(&readers[i], NULL, prefix_reader_thread, &ctx)) {
+			fprintf(stderr, "failed to create reader thread %zu\n", i);
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	pthread_t writer;
+	if (pthread_create(&writer, NULL, prefix_writer_thread, &ctx)) {
+		fprintf(stderr, "failed to create writer thread\n");
+		exit(EXIT_FAILURE);
+	}
+
+	if (pthread_join(writer, NULL)) {
+		fprintf(stderr, "failed to join writer thread\n");
+		exit(EXIT_FAILURE);
+	}
+
+	atomic_store_explicit(&ctx.stop, 1, memory_order_release);
+
+	for (size_t i = 0; i < sizeof(readers) / sizeof(readers[0]); ++i) {
+		if (pthread_join(readers[i], NULL)) {
+			fprintf(stderr, "failed to join reader thread %zu\n", i);
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	prefix_assert_snapshot(env, dbi, "post-concurrent verification");
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_drop(txn, dbi, 0));
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	mdb_dbi_close(env, dbi);
+	mdb_env_close(env);
+}
+
 static void
 test_nested_txn_rollback(void)
 {
@@ -2800,6 +2995,7 @@ main(void)
 	test_prefix_dupsort_trunk_swap_inline();
 	test_prefix_dupsort_trunk_swap_promote();
 	test_prefix_dupsort_fuzz();
+	test_prefix_concurrent_reads();
 	test_nested_txn_rollback();
 	test_prefix_fuzz();
 	printf("mtest_prefix: all tests passed\n");
