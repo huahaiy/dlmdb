@@ -9229,19 +9229,24 @@ mdb_cursor_next(MDB_cursor *mc, MDB_val *key, MDB_val *data, MDB_cursor_op op)
 
 	if (mc->mc_db->md_flags & MDB_DUPSORT) {
 		leaf = NODEPTR(mp, mc->mc_ki[mc->mc_top]);
-		if (F_ISSET(leaf->mn_flags, F_DUPDATA)) {
-			if (op == MDB_NEXT || op == MDB_NEXT_DUP) {
-				rc = mdb_cursor_next(&mc->mc_xcursor->mx_cursor, data, NULL, MDB_NEXT);
-				if (op != MDB_NEXT || rc != MDB_NOTFOUND) {
-					if (rc == MDB_SUCCESS && key) {
-						int krc = mdb_cursor_read_key_at(mc, mp, mc->mc_ki[mc->mc_top], key);
-						if (krc != MDB_SUCCESS)
-							return krc;
+			if (F_ISSET(leaf->mn_flags, F_DUPDATA)) {
+				if (op == MDB_NEXT || op == MDB_NEXT_DUP) {
+					rc = mdb_cursor_next(&mc->mc_xcursor->mx_cursor, data, NULL, MDB_NEXT);
+					if (op != MDB_NEXT || rc != MDB_NOTFOUND) {
+						if (rc == MDB_SUCCESS && key) {
+							if (mc->mc_key_pgno == mp->mp_pgno &&
+							    mc->mc_key_last == mc->mc_ki[mc->mc_top]) {
+								*key = mc->mc_key;
+							} else {
+								int krc = mdb_cursor_read_key_at(mc, mp, mc->mc_ki[mc->mc_top], key);
+								if (krc != MDB_SUCCESS)
+									return krc;
+							}
+						}
+						return rc;
 					}
-					return rc;
 				}
-			}
-			else {
+				else {
 				MDB_CURSOR_UNREF(&mc->mc_xcursor->mx_cursor, 0);
 			}
 		} else {
