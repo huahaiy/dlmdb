@@ -121,7 +121,7 @@ Insert order: shuffled
 In short: counted metadata adds negligible write-time overhead while delivering
 two to three orders of magnitude acceleration for range counts and rank lookups.
 
-## Prefix compression
+## Prefix Compression
 
 Enabling `MDB_PREFIX_COMPRESSION` flag on a database stores keys using shared
 prefixes within each leaf page, reducing page fan-out and disk footprint. For
@@ -132,11 +132,11 @@ To use prefix compression:
 
 ```c
 MDB_dbi dbi;
-CHECK(mdb_dbi_open(txn, "prefixed", MDB_CREATE | MDB_PREFIX_COMPRESSION, &dbi));
+CHECK(mdb_dbi_open(txn, "db", MDB_CREATE | MDB_PREFIX_COMPRESSION, &dbi));
 ```
 
 Once enabled, read paths continue to expose fully reconstructed keys via the
-cursor API; the optimisation is completely internal to the engine.
+cursor API; the optimization is completely internal to the engine.
 
 ### Prefix compression performance
 
@@ -145,46 +145,76 @@ cursor API; the optimisation is completely internal to the engine.
 duplicate-heavy traffic:
 
 ```
-./compress_bench -n 1000000 -r 500000 -v 64 -p 32 -m 2048 -U 200000 -X 200000 -D 20
+./compress_bench -n 1000000 -r 500000 -v 64 -p 32 -m 2048  -U 200000 -X 200000 -D 20
 
 === plain (plain, unique) ===
-Insert: 1205.081 ms (1.205 us/op)   Random read (warm): 409.659 ms (0.819 us/op)
-Range scan (warm): 4.905 ms (0.019 us/key)  Data size: 509.12 MiB, leaf pages: 10810
+Insert: 960.479 ms (0.960 us/op, 1041147 op/s over 1000000 ops)
+Update: 192.540 ms (0.963 us/op, 1038745 op/s over 200000 ops)
+Delete: 279.387 ms (1.397 us/key, 715853 key/s over 200000 keys)
+Reinsert: 232.080 ms (1.160 us/key, 861772 key/s over 200000 keys)
+Random Read (cold): 373.584 ms (0.747 us/op, 1338387 op/s over 500000 ops)
+Random Read (warm): 363.248 ms (0.726 us/op, 1376470 op/s over 500000 ops)
+Range Scan (cold): 6.883 ms (0.027 us/key, 37193084 key/s over 256000 keys)
+Range Scan (warm): 3.833 ms (0.015 us/key, 66788416 key/s over 256000 keys)
+Map: 509.12 MiB used / 2.00 GiB configured
 
 === prefix (prefix, unique) ===
-Insert: 1285.150 ms (1.285 us/op)   Random read (warm): 461.428 ms (0.923 us/op)
-Range scan (warm): 5.160 ms (0.020 us/key)  Data size: 331.83 MiB, leaf pages: 7049
+Insert: 1055.974 ms (1.056 us/op, 946993 op/s over 1000000 ops)
+Update: 190.974 ms (0.955 us/op, 1047263 op/s over 200000 ops)
+Delete: 355.270 ms (1.776 us/key, 562952 key/s over 200000 keys)
+Reinsert: 241.767 ms (1.209 us/key, 827243 key/s over 200000 keys)
+Random Read (cold): 389.688 ms (0.779 us/op, 1283078 op/s over 500000 ops)
+Random Read (warm): 368.862 ms (0.738 us/op, 1355520 op/s over 500000 ops)
+Range Scan (cold): 6.506 ms (0.025 us/key, 39348294 key/s over 256000 keys)
+Range Scan (warm): 4.489 ms (0.018 us/key, 57028291 key/s over 256000 keys)
+Map: 331.83 MiB used / 2.00 GiB configured
 
 === plain-dups (plain, dupsort) ===
-Insert: 1703.188 ms (1.703 us/op)   Random read (warm): 410.138 ms (0.820 us/op)
-Range scan (warm): 5.314 ms (0.021 us/key)  Data size: 344.14 MiB, leaf pages: 7302
+Insert: 1335.676 ms (1.336 us/op, 748685 op/s over 1000000 ops)
+Update: 421.925 ms (2.110 us/op, 474018 op/s over 200000 ops)
+Delete: 265.496 ms (1.327 us/key, 753307 key/s over 200000 keys)
+Reinsert: 337.803 ms (1.689 us/key, 592061 key/s over 200000 keys)
+Random Read (cold): 473.842 ms (0.948 us/op, 1055204 op/s over 500000 ops)
+Random Read (warm): 406.730 ms (0.813 us/op, 1229317 op/s over 500000 ops)
+Range Scan (cold): 6.411 ms (0.025 us/key, 39931368 key/s over 256000 keys)
+Range Scan (warm): 4.827 ms (0.019 us/key, 53035011 key/s over 256000 keys)
+Map: 344.14 MiB used / 2.00 GiB configured
 
 === prefix-dups (prefix, dupsort) ===
-Insert: 1902.391 ms (1.902 us/op)   Random read (warm): 387.025 ms (0.774 us/op)
-Range scan (warm): 4.823 ms (0.019 us/key)  Data size: 74.14 MiB, leaf pages: 1590
-
-Prefix metrics:
-  Random Read (cold) decode=3,142,748 (fast=3,142,748) hit=5,137 miss=3,142,748 cached_pages=0
-  Range Scan (warm) decode=6,805 (fast=6,805) hit=257,003 miss=6,805 cached_pages=1,492
+Insert: 1407.319 ms (1.407 us/op, 710571 op/s over 1000000 ops)
+Update: 509.726 ms (2.549 us/op, 392368 op/s over 200000 ops)
+Delete: 252.931 ms (1.265 us/key, 790729 key/s over 200000 keys)
+Reinsert: 347.707 ms (1.739 us/key, 575197 key/s over 200000 keys)
+Random Read (cold): 354.284 ms (0.709 us/op, 1411297 op/s over 500000 ops)
+Random Read (warm): 340.684 ms (0.681 us/op, 1467636 op/s over 500000 ops)
+Range Scan (cold): 5.095 ms (0.020 us/key, 50245339 key/s over 256000 keys)
+Range Scan (warm): 4.315 ms (0.017 us/key, 59327926 key/s over 256000 keys)
+Map: 74.14 MiB used / 2.00 GiB configured
 
 --- Relative to plain ---
-Insert time: 1.066x
-Update time: 1.012x
-Delete time: 1.109x
-Random read (warm): 1.126x
-Range scan (warm): 1.052x
-Data size / map usage / leaf pages: ~0.65x
+Insert time: 1.099x (960.479 ms -> 1055.974 ms)
+Update time: 0.992x (192.540 ms -> 190.974 ms)
+Delete time: 1.272x (279.387 ms -> 355.270 ms)
+Reinsert time: 1.042x (232.080 ms -> 241.767 ms)
+Random read (warm): 1.015x
+Random read (cold): 1.043x
+Range scan (warm): 1.171x
+Map used: 0.652x (509.12 MiB -> 331.83 MiB)
+Leaf pages: 0.652x (10810 -> 7049)
 
 --- Relative to plain-dups ---
-Insert time: 1.117x
-Update time: 1.236x
-Delete time: 0.945x
-Random read (warm): 0.944x
-Range scan (warm): 0.908x
-Data size / map usage / leaf pages: ~0.22x
+Insert time: 1.054x (1335.676 ms -> 1407.319 ms)
+Update time: 1.208x (421.925 ms -> 509.726 ms)
+Delete time: 0.953x (265.496 ms -> 252.931 ms)
+Reinsert time: 1.029x (337.803 ms -> 347.707 ms)
+Random read (warm): 0.838x
+Random read (cold): 0.748x
+Range scan (warm): 0.894x
+Map used: 0.215x (344.14 MiB -> 74.14 MiB)
+Leaf pages: 0.218x (7302 -> 1590)
+
 ```
 
-Prefix compression therefore shrinks on-disk footprint by ~35 % for regular
-database, ~75% for DUPSORT database, and improves
-cache-friendly workloads (warm random reads) while keeping write throughput on
+Prefix compression therefore shrinks on-disk footprint by ~35 % for regular
+database, and ~75 % for DUPSORT database, while keeping read/write throughput on
 par with the uncompressed baseline.
