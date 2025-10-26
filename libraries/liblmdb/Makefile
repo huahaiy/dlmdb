@@ -60,8 +60,13 @@ clean:
 test:	all
 	rm -rf testdb && mkdir testdb
 	./mtest && ./mdb_stat testdb
-	rm -rf testdb_count
+	./mtest2
+	./mtest3
+	./mtest4
+	./mtest5
+	rm -rf testdb_count*
 	./mtest_count
+	rm -rf testdb_prefix*
 	./mtest_prefix
 
 liblmdb.a:	mdb.o midl.o
