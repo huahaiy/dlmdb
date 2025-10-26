@@ -2287,6 +2287,51 @@ mdb_prefix_leaf_maxdecoded(const MDB_page *mp)
 	return max_len ? max_len : trunk_len;
 }
 
+static void
+mdb_prefix_leaf_store_stride(MDB_cursor *mc, MDB_page *mp, size_t stride)
+{
+	int prefix_enabled = mc && mc->mc_db &&
+	    (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION);
+
+	if (!IS_LEAF(mp) || IS_LEAF2(mp) || !prefix_enabled) {
+		if (!IS_LEAF2(mp))
+			MP_PAD(mp) = 0;
+		return;
+	}
+
+	if (stride > UINT16_MAX)
+		stride = UINT16_MAX;
+
+	MP_PAD(mp) = (uint16_t)stride;
+}
+
+static void
+mdb_prefix_leaf_refresh_stride(MDB_cursor *mc, MDB_page *mp)
+{
+	int prefix_enabled = mc && mc->mc_db &&
+	    (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION);
+
+	if (!IS_LEAF(mp) || IS_LEAF2(mp) || !prefix_enabled) {
+		if (!IS_LEAF2(mp))
+			MP_PAD(mp) = 0;
+		return;
+	}
+
+	unsigned int total = NUMKEYS(mp);
+	if (!total) {
+		MP_PAD(mp) = 0;
+		return;
+	}
+
+	size_t stride = mdb_prefix_leaf_maxdecoded(mp);
+	if (!stride) {
+		MDB_node *trunk = NODEPTR(mp, 0);
+		stride = trunk->mn_ksize;
+	}
+
+	mdb_prefix_leaf_store_stride(mc, mp, stride);
+}
+
 static size_t
 mdb_prefix_prealloc_size(MDB_txn *txn)
 {
@@ -2696,6 +2741,7 @@ mdb_cursor_leaf_cache_prepare(MDB_cursor *mc, MDB_page *mp)
 	MDB_prefix_scratch *scratch = &txn->mt_prefix;
 	MDB_cursor_leaf_cache *cache = &mc->mc_leaf_cache;
 	unsigned int total = NUMKEYS(mp);
+	int prefix_enabled = (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) != 0;
 	int rc;
 
 	if (cache->decoded_pgno == mp->mp_pgno &&
@@ -2716,7 +2762,9 @@ mdb_cursor_leaf_cache_prepare(MDB_cursor *mc, MDB_page *mp)
 		goto fail;
 
 	size_t stride = 0;
-	if (total)
+	if (total && prefix_enabled && !IS_LEAF2(mp))
+		stride = MP_PAD(mp);
+	if (total && (!stride || !prefix_enabled))
 		stride = mdb_prefix_leaf_maxdecoded(mp);
 	if (total && !stride)
 		stride = mdb_prefix_maxkey(env);
@@ -3479,13 +3527,17 @@ mdb_leaf_rebuild_apply(MDB_cursor *mc, MDB_page *mp,
 	if (!IS_LEAF(mp) || IS_LEAF2(mp)) {
 		MP_LOWER(mp) = (PAGEHDRSZ - PAGEBASE);
 		MP_UPPER(mp) = (indx_t)(capacity - PAGEBASE);
+		if (!IS_LEAF2(mp))
+			mdb_prefix_leaf_store_stride(mc, mp, 0);
 		return MDB_SUCCESS;
 	}
 
 	MP_LOWER(mp) = (PAGEHDRSZ - PAGEBASE);
 	MP_UPPER(mp) = (indx_t)(capacity - PAGEBASE);
-	if (count == 0)
+	if (count == 0) {
+		mdb_prefix_leaf_store_stride(mc, mp, 0);
 		return MDB_SUCCESS;
+	}
 
 	lower_base = (PAGEHDRSZ - PAGEBASE) + (size_t)count * sizeof(indx_t);
 	ofs = capacity - PAGEBASE;
@@ -3495,11 +3547,15 @@ mdb_leaf_rebuild_apply(MDB_cursor *mc, MDB_page *mp,
 
 	{
 		MDB_val *trunk_full = &entries[0].key;
+		size_t max_decoded = 0;
 
 		for (i = 0; i < count; ++i) {
 			MDB_node *node;
 			size_t key_bytes;
 			size_t node_bytes;
+
+			if (entries && entries[i].key.mv_size > max_decoded)
+				max_decoded = entries[i].key.mv_size;
 
 			key_bytes = entries[i].encoded_ksize;
 			node_bytes = NODESIZE + key_bytes + entries[i].data_payload;
@@ -3537,6 +3593,11 @@ mdb_leaf_rebuild_apply(MDB_cursor *mc, MDB_page *mp,
 
 		MP_UPPER(mp) = (indx_t)ofs;
 		MP_LOWER(mp) = (PAGEHDRSZ - PAGEBASE) + count * sizeof(indx_t);
+
+		if (entries)
+			mdb_prefix_leaf_store_stride(mc, mp, max_decoded);
+		else
+			mdb_prefix_leaf_refresh_stride(mc, mp);
 	}
 
 	return MDB_SUCCESS;
@@ -11694,6 +11755,22 @@ update:
 		mdb_node_set_count(mp, node, child_count);
 	}
 
+	if (IS_LEAF(mp) && !IS_LEAF2(mp)) {
+		if (prefix_enabled) {
+			size_t cached = MP_PAD(mp);
+			if (!cached) {
+				if (key && key->mv_data && NUMKEYS(mp) == 1)
+					mdb_prefix_leaf_store_stride(mc, mp, key->mv_size);
+				else
+					mdb_prefix_leaf_refresh_stride(mc, mp);
+			} else if (key && key->mv_data && key->mv_size > cached) {
+				mdb_prefix_leaf_store_stride(mc, mp, key->mv_size);
+			}
+		} else {
+			mdb_prefix_leaf_store_stride(mc, mp, 0);
+		}
+	}
+
 	return MDB_SUCCESS;
 
 full:
@@ -11761,6 +11838,9 @@ mdb_node_del(MDB_cursor *mc, int ksize)
 	}
 	sz = EVEN(sz);
 	mdb_page_remove_slot(mc, mp, indx, sz);
+
+	if (IS_LEAF(mp) && !IS_LEAF2(mp))
+		mdb_prefix_leaf_refresh_stride(mc, mp);
 }
 
 /** Compact the main page after deleting a node on a subpage.
