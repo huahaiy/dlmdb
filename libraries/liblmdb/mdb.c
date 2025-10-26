@@ -2287,6 +2287,19 @@ mdb_prefix_leaf_maxdecoded(const MDB_page *mp)
 	return max_len ? max_len : trunk_len;
 }
 
+static int
+mdb_trace_ops_enabled(void)
+{
+	static int cached = -1;
+
+	if (cached < 0) {
+		const char *flag = getenv("PF_TRACE_OPS");
+		cached = (flag && flag[0]) ? 1 : 0;
+	}
+
+	return cached;
+}
+
 static void
 mdb_prefix_leaf_store_stride(MDB_cursor *mc, MDB_page *mp, size_t stride)
 {
@@ -2847,7 +2860,7 @@ mdb_cursor_container(MDB_cursor *mc)
 	if (!mc || !(mc->mc_flags & C_SUB))
 		return NULL;
 	MDB_xcursor *mx = (MDB_xcursor *)((char *)mc - offsetof(MDB_xcursor, mx_cursor));
-	if (getenv("PF_TRACE_OPS")) {
+	if (mdb_trace_ops_enabled()) {
 		fprintf(stderr, "cursor_container: mc=%p -> mx=%p inline_bytes=%zu flags=0x%x\n",
 		    (void *)mc, (void *)mx, (size_t)mx->mx_inline_bytes, mc->mc_flags);
 	}
@@ -2858,13 +2871,14 @@ static size_t
 mdb_prefix_page_capacity(MDB_cursor *mc, MDB_page *mp)
 {
 	MDB_env *env = mc->mc_txn->mt_env;
+	int trace_ops = mdb_trace_ops_enabled();
 
 	if (!IS_SUBP(mp))
 		return env->me_psize;
 
 	MDB_xcursor *mx = mdb_cursor_container(mc);
 	if (mx && mx->mx_inline_bytes) {
-		if (getenv("PF_TRACE_OPS") && (mc->mc_flags & C_SUB)) {
+		if (trace_ops && (mc->mc_flags & C_SUB)) {
 			fprintf(stderr,
 			    "page capacity: mc=%p mp=%p flags=0x%x inline_bytes=%zu result=%zu\n",
 			    (void *)mc, (void *)mp, MP_FLAGS(mp),
@@ -2876,7 +2890,7 @@ mdb_prefix_page_capacity(MDB_cursor *mc, MDB_page *mp)
 	if (!(mc->mc_flags & C_SUB) && mc->mc_top >= 0) {
 		MDB_node *node = NODEPTR(mc->mc_pg[mc->mc_top], mc->mc_ki[mc->mc_top]);
 		size_t result = NODEDSZ(node);
-		if (getenv("PF_TRACE_OPS") && (mc->mc_flags & C_SUB)) {
+		if (trace_ops && (mc->mc_flags & C_SUB)) {
 			fprintf(stderr,
 			    "page capacity: mc=%p mp=%p flags=0x%x node_ds=%zu\n",
 			    (void *)mc, (void *)mp, MP_FLAGS(mp), result);
@@ -2884,7 +2898,7 @@ mdb_prefix_page_capacity(MDB_cursor *mc, MDB_page *mp)
 		return NODEDSZ(node);
 	}
 
-	if (getenv("PF_TRACE_OPS") && (mc->mc_flags & C_SUB)) {
+	if (trace_ops && (mc->mc_flags & C_SUB)) {
 		fprintf(stderr,
 		    "page capacity fallback: mc=%p mp=%p flags=0x%x result=%zu\n",
 		    (void *)mc, (void *)mp, MP_FLAGS(mp), (size_t)env->me_psize);
@@ -3035,6 +3049,7 @@ mdb_prefix_inline_measure_after_insert(MDB_cursor *mc, MDB_page *mp,
 	unsigned short node_flags =
 	    (unsigned short)(new_flags & (F_BIGDATA|F_DUPDATA|F_SUBDATA));
 	size_t needed = 0;
+	int trace_ops = mdb_trace_ops_enabled();
 
 	if (measure_cache)
 		measure_cache->valid = 0;
@@ -3179,8 +3194,7 @@ mdb_prefix_inline_measure_after_insert(MDB_cursor *mc, MDB_page *mp,
 		key_cursor += entries[i].key.mv_size;
 	}
 
-	const char *trace_env = getenv("PF_TRACE_OPS");
-	if (trace_env) {
+	if (trace_ops) {
 		fprintf(stderr,
 		    "prefix inline measure: mp=%p capacity=%zu total=%u insert=%u new_key=%zu new_data=%zu flags=0x%x\n",
 		    (void *)mp, current_capacity, new_total, insert,
@@ -3196,7 +3210,7 @@ mdb_prefix_inline_measure_after_insert(MDB_cursor *mc, MDB_page *mp,
 	}
 
 	rc = mdb_leaf_rebuild_measure(env, entries, new_total, env->me_psize, &needed);
-	if (trace_env) {
+	if (trace_ops) {
 		fprintf(stderr,
 		    "prefix inline measure result: rc=%d needed=%zu current_capacity=%zu env_psize=%zu\n",
 		    rc, needed, current_capacity, (size_t)env->me_psize);
@@ -3244,11 +3258,12 @@ mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp,
 	unsigned short node_flags = (unsigned short)(new_flags & (F_BIGDATA|F_DUPDATA|F_SUBDATA));
 	size_t capacity = mdb_prefix_page_capacity(mc, mp);
 	int reuse_cache = 0;
+	int trace_ops = mdb_trace_ops_enabled();
 
 	if (!IS_LEAF(mp) || IS_LEAF2(mp))
 		return MDB_SUCCESS;
 
-	if (getenv("PF_TRACE_OPS")) {
+	if (trace_ops) {
 		const char *kind = (mc->mc_flags & C_SUB) ? "sub" : "main";
 		fprintf(stderr,
 		    "rebuild after insert (%s): capacity=%zu total=%u insert=%u new_key=%zu new_data=%zu flags=0x%x inline_bytes=%zu\n",
@@ -3432,7 +3447,7 @@ mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp,
 		new_data->mv_data = NODEDATA(inserted);
 	}
 
-	if (getenv("PF_TRACE_OPS")) {
+	if (trace_ops) {
 		const char *kind = (mc->mc_flags & C_SUB) ? "sub" : "main";
 		fprintf(stderr,
 		    "rebuild after insert done (%s): lower=%u upper=%u num=%u\n",
@@ -3452,6 +3467,7 @@ mdb_leaf_rebuild_measure(MDB_env *env, MDB_prefix_rebuild_entry *entries,
 	unsigned int i;
 	const MDB_val *trunk_full = NULL;
 	int rc = MDB_SUCCESS;
+	int trace_ops = mdb_trace_ops_enabled();
 
 	(void)env;
 
@@ -3484,7 +3500,7 @@ mdb_leaf_rebuild_measure(MDB_env *env, MDB_prefix_rebuild_entry *entries,
 		node_bytes = NODESIZE + key_bytes + entries[i].data_payload;
 		node_bytes = EVEN(node_bytes);
 
-		if (getenv("PF_TRACE_OPS")) {
+		if (trace_ops) {
 			fprintf(stderr, "rebuild measure: idx=%u key_bytes=%zu payload=%zu used=%zu limit=%zu\n",
 			    i, key_bytes, (size_t)entries[i].data_payload, used, limit);
 		}
@@ -3502,7 +3518,7 @@ mdb_leaf_rebuild_measure(MDB_env *env, MDB_prefix_rebuild_entry *entries,
 	if (used_out)
 		*used_out = used;
 
-	if (getenv("PF_TRACE_OPS")) {
+	if (trace_ops) {
 		fprintf(stderr, "rebuild measure final used=%zu limit=%zu rc=%d\n",
 		    used, limit, rc);
 	}
@@ -10308,9 +10324,9 @@ static int
 _mdb_cursor_put(MDB_cursor *mc, MDB_val *key, MDB_val *data,
     unsigned int flags)
 {
-	const char *trace_env = getenv("PF_TRACE_OPS");
+	int trace_ops = mdb_trace_ops_enabled();
 	const char *trace_put_env = getenv("PF_TRACE_PUTS");
-	int trace_sub = trace_env && trace_env[0] && (mc->mc_flags & C_SUB);
+	int trace_sub = trace_ops && (mc->mc_flags & C_SUB);
 	MDB_env		*env;
 	MDB_node	*leaf = NULL;
 	MDB_page	*fp, *mp, *sub_root = NULL;
@@ -10535,7 +10551,7 @@ more:
 					dcmp = mdb_cmp_clong;
 				/* does data match? */
 				cmp = dcmp(data, &olddata);
-				if (getenv("PF_TRACE_OPS")) {
+				if (trace_ops) {
 					fprintf(stderr,
 					    "inline convert mc=%p c_sub=%d cmp=%d old_len=%zu new_len=%zu\n",
 					    (void *)mc, !!(mc->mc_flags & C_SUB),
@@ -10916,7 +10932,7 @@ finish_put:
 	if (rc == MDB_SUCCESS) {
 		if (inline_pair_ready && !do_sub && mc->mc_xcursor) {
 			leaf = NODEPTR(mc->mc_pg[mc->mc_top], mc->mc_ki[mc->mc_top]);
-			if (getenv("PF_TRACE_OPS")) {
+			if (trace_ops) {
 				MDB_page *inline_pg = NODEDATA(leaf);
 				unsigned int inline_num = (inline_pg && !IS_LEAF2(inline_pg)) ? NUMKEYS(inline_pg) : 0;
 				fprintf(stderr,
@@ -11081,6 +11097,7 @@ mdb_prefix_inline_build_pair(MDB_cursor *mc, MDB_page *mp, size_t capacity,
 {
 	MDB_val items[2];
 	MDB_cmp_func *dcmp;
+	int trace_ops = mdb_trace_ops_enabled();
 
 	if (!mc || !mp || !first || !second)
 		return EINVAL;
@@ -11093,7 +11110,7 @@ mdb_prefix_inline_build_pair(MDB_cursor *mc, MDB_page *mp, size_t capacity,
 	MP_UPPER(mp) = (indx_t)(capacity - PAGEBASE);
 	MP_PAD(mp) = 0;
 	COPY_PGNO(MP_PGNO(mp), mc->mc_pg[mc->mc_top]->mp_pgno);
-	if (getenv("PF_TRACE_OPS")) {
+	if (trace_ops) {
 		fprintf(stderr, "inline build init: mp=%p capacity=%zu\n",
 		    (void *)mp, capacity);
 	}
@@ -11118,7 +11135,7 @@ mdb_prefix_inline_build_pair(MDB_cursor *mc, MDB_page *mp, size_t capacity,
 		items[1] = swap;
 	}
 
-	if (getenv("PF_TRACE_OPS")) {
+	if (trace_ops) {
 		fprintf(stderr, "inline build seed pre: upper=%u lower=%u\n",
 		    MP_UPPER(mp), MP_LOWER(mp));
 	}
@@ -11127,7 +11144,7 @@ mdb_prefix_inline_build_pair(MDB_cursor *mc, MDB_page *mp, size_t capacity,
 		size_t ksize = items[0].mv_size;
 		char *dest = LEAF2KEY(mp, 0, ksize);
 
-		if (getenv("PF_TRACE_OPS")) {
+		if (trace_ops) {
 			fprintf(stderr,
 			    "inline build leaf2 seed: ksize=%zu capacity=%zu\n",
 			    ksize, capacity);
@@ -11167,7 +11184,7 @@ mdb_prefix_inline_build_pair(MDB_cursor *mc, MDB_page *mp, size_t capacity,
 		MP_LOWER(mp) = (indx_t)lower;
 		MP_UPPER(mp) = (indx_t)upper;
 
-		if (getenv("PF_TRACE_OPS")) {
+		if (trace_ops) {
 			fprintf(stderr,
 			    "inline manual build: lower=%zu upper=%zu key0=%zu key1=%zu\n",
 			    lower, upper, items[0].mv_size, items[1].mv_size);
@@ -11222,7 +11239,7 @@ mdb_prefix_inline_build_pair(MDB_cursor *mc, MDB_page *mp, size_t capacity,
 			return rc;
 	}
 
-	if (getenv("PF_TRACE_OPS")) {
+	if (trace_ops) {
 		fprintf(stderr,
 		    "inline build pair: capacity=%zu lower=%u upper=%u numkeys=%u first=%zu second=%zu\n",
 		    capacity, MP_LOWER(mp), MP_UPPER(mp), NUMKEYS(mp),
@@ -11522,9 +11539,9 @@ mdb_node_add(MDB_cursor *mc, indx_t indx,
 	MDB_val	old_trunk = {0, NULL};
 	int	need_reencode = 0;
 	int	prefix_enabled = (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) != 0;
+	int	trace_ops = mdb_trace_ops_enabled();
 
-	const char *trace_env = getenv("PF_TRACE_OPS");
-	if ((mc->mc_flags & C_SUB) && trace_env) {
+	if ((mc->mc_flags & C_SUB) && trace_ops) {
 		fprintf(stderr, "node_add: prefix_enabled=%d indx=%u total=%u mp_flags=0x%x mp=%p\n",
 		    prefix_enabled, indx, NUMKEYS(mp), MP_FLAGS(mp), (void *)mp);
 	}
@@ -11554,7 +11571,7 @@ mdb_node_add(MDB_cursor *mc, indx_t indx,
 	}
 
 	room = (ssize_t)SIZELEFT(mp) - (ssize_t)sizeof(indx_t);
-	if ((mc->mc_flags & C_SUB) && trace_env) {
+	if ((mc->mc_flags & C_SUB) && trace_ops) {
 		fprintf(stderr,
 		    "node_add (sub): idx=%u num=%u room=%zd node_size_pre=%zu key_bytes=%zu data=%zu mp=%p mp_upper=%u mp_lower=%u\n",
 		    indx, NUMKEYS(mp), room, node_size, key_bytes, data ? data->mv_size : 0,
@@ -11616,7 +11633,7 @@ mdb_node_add(MDB_cursor *mc, indx_t indx,
 		}
 	}
 	node_size = EVEN(node_size);
-	if ((mc->mc_flags & C_SUB) && trace_env) {
+	if ((mc->mc_flags & C_SUB) && trace_ops) {
 		fprintf(stderr,
 		    "node_add (sub): idx=%u num=%u room=%zd node_size=%zu mp=%p mp_upper=%u mp_lower=%u\n",
 		    indx, NUMKEYS(mp), room, node_size,
