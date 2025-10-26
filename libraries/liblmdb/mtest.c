@@ -42,6 +42,7 @@ int main(int argc,char * argv[])
 	(void)argc;
 	(void)argv;
 	verbose = getenv("MTEST_VERBOSE") != NULL;
+  printf("%s\n", mdb_version(NULL, NULL, NULL));
 
 	srand(time(NULL));
 
