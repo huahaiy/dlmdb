@@ -894,6 +894,37 @@ test_range_count_values(MDB_env *env)
     CHECK(mdb_count_all(txn, dbi, 0, &total_all), "dup range count_all total");
     expect_eq(total_all, naive, "dup range count_all match");
 
+    const char *outside_low = "j00";
+    const char *outside_high = "lzz";
+    MDB_val low_outside, high_outside;
+    low_outside.mv_data = (void *)outside_low;
+    low_outside.mv_size = strlen(outside_low);
+    high_outside.mv_data = (void *)outside_high;
+    high_outside.mv_size = strlen(outside_high);
+
+    CHECK(mdb_range_count_values(txn, dbi, NULL, &high_outside,
+                                 MDB_COUNT_UPPER_INCL, &counted),
+          "dup range upper outside inclusive");
+    expect_eq(counted, total_all, "dup range upper outside inclusive spans all");
+
+    CHECK(mdb_range_count_values(txn, dbi, &low_outside, NULL,
+                                 MDB_COUNT_LOWER_INCL, &counted),
+          "dup range lower outside inclusive");
+    expect_eq(counted, total_all, "dup range lower outside inclusive spans all");
+
+    CHECK(mdb_range_count_values(txn, dbi, &low_outside, &high_outside,
+                                 MDB_COUNT_UPPER_INCL, &counted),
+          "dup range outside lower exclusive");
+    expect_eq(counted, total_all, "dup range outside lower exclusive spans all");
+
+    naive = naive_count_values(txn, dbi, &low_outside, &high_outside, 1, 1, cmp_key);
+    CHECK(mdb_range_count_values(txn, dbi, &low_outside, &high_outside,
+                                 MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
+                                 &counted),
+          "dup range outside inclusive");
+    expect_eq(counted, naive, "dup range outside inclusive match");
+    expect_eq(counted, total_all, "dup range outside inclusive spans all");
+
     MDB_val reverse_low = key_high;
     MDB_val reverse_high = key_low;
     naive = naive_count_values(txn, dbi, &reverse_low, &reverse_high, 1, 1,

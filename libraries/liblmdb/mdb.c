@@ -14640,6 +14640,18 @@ mdb_range_count_values(MDB_txn *txn, MDB_dbi dbi,
 			if (rc != MDB_SUCCESS)
 				return rc;
 		}
+		if (lower == db->md_entries) {
+			MDB_cursor mc = (MDB_cursor){0};
+			MDB_xcursor mx = (MDB_xcursor){0};
+			MDB_val first_key = {0}, first_data = {0};
+
+			mdb_cursor_init(&mc, txn, dbi, &mx);
+			if (mdb_cursor_get(&mc, &first_key, &first_data, MDB_FIRST) == MDB_SUCCESS) {
+				if (key_cmp((MDB_val *)key_low, &first_key) < 0)
+					lower = 0;
+			}
+			MDB_CURSOR_UNREF(&mc, 1);
+		}
 	}
 
 	*out = (upper >= lower) ? (upper - lower) : 0;
