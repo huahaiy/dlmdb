@@ -138,8 +138,15 @@ load_env_from_dump(const char *dump_path, const char *db_name,
     char key_line[2048] = {0};
     char line[2048];
     MDB_env *env = NULL;
-    MDB_txn *txn = NULL;
-    MDB_dbi dbi = 0;
+   MDB_txn *txn = NULL;
+   MDB_dbi dbi = 0;
+    struct dump_kv {
+        MDB_val key;
+        MDB_val data;
+    };
+    struct dump_kv *entries = NULL;
+    size_t entry_count = 0;
+    size_t entry_cap = 0;
 
     while (fgets(line, sizeof(line), fp)) {
         size_t len = strcspn(line, "\r\n");
@@ -192,15 +199,19 @@ load_env_from_dump(const char *dump_path, const char *db_name,
         size_t key_len = 0, val_len = 0;
         unsigned char *key_buf = dup_hex_to_bytes(key_hex, &key_len);
         unsigned char *val_buf = dup_hex_to_bytes(val_hex, &val_len);
-        MDB_val key = { key_len, key_buf };
-        MDB_val data = { val_len, val_buf };
-
-        CHECK(mdb_put(txn, dbi, &key, &data, 0), "dump load put");
-
-        if (key_buf)
-            free(key_buf);
-        if (val_buf)
-            free(val_buf);
+        struct dump_kv kv = {
+            { key_len, key_buf },
+            { val_len, val_buf }
+        };
+        if (entry_count == entry_cap) {
+            size_t new_cap = entry_cap ? entry_cap * 2 : 256;
+            struct dump_kv *tmp = realloc(entries, new_cap * sizeof(*entries));
+            if (!tmp)
+                fatal_errno("realloc dump kv");
+            entries = tmp;
+            entry_cap = new_cap;
+        }
+        entries[entry_count++] = kv;
         have_key_line = 0;
     }
 
@@ -213,11 +224,29 @@ load_env_from_dump(const char *dump_path, const char *db_name,
         exit(EXIT_FAILURE);
     }
 
+    if (txn && entry_count) {
+        unsigned int shuffle_state = 0x915f2dbeu;
+        for (size_t i = entry_count; i > 1; --i) {
+            shuffle_state = shuffle_state * 1103515245u + 12345u;
+            size_t j = shuffle_state % i;
+            struct dump_kv tmp = entries[i - 1];
+            entries[i - 1] = entries[j];
+            entries[j] = tmp;
+        }
+        for (size_t i = 0; i < entry_count; ++i)
+            CHECK(mdb_put(txn, dbi, &entries[i].key, &entries[i].data, 0), "dump load put");
+    }
+
     if (txn)
         CHECK(mdb_txn_commit(txn), "dump load commit");
     if (env && dbi)
         mdb_dbi_close(env, dbi);
     fclose(fp);
+    for (size_t i = 0; i < entry_count; ++i) {
+        free(entries[i].key.mv_data);
+        free(entries[i].data.mv_data);
+    }
+    free(entries);
     return env;
 }
 
@@ -2484,6 +2513,421 @@ verify_windows(MDB_txn *txn, MDB_dbi dbi, const char *tag)
 }
 
 static void
+check_range_with_bounds(MDB_txn *txn, MDB_dbi dbi, const char *prefix,
+                        int low_idx, int high_idx, unsigned int flags,
+                        const char *tag)
+{
+    MDB_val low, high;
+    MDB_val *low_ptr = NULL;
+    MDB_val *high_ptr = NULL;
+    char lowbuf[32];
+    char highbuf[32];
+
+    if (low_idx >= 0) {
+        snprintf(lowbuf, sizeof(lowbuf), "%s%05d", prefix, low_idx);
+        low.mv_size = strlen(lowbuf);
+        low.mv_data = lowbuf;
+        low_ptr = &low;
+    }
+    if (high_idx >= 0) {
+        snprintf(highbuf, sizeof(highbuf), "%s%05d", prefix, high_idx);
+        high.mv_size = strlen(highbuf);
+        high.mv_data = highbuf;
+        high_ptr = &high;
+    }
+
+    check_range_matches(txn, dbi, low_ptr, high_ptr, flags, tag);
+}
+
+static void
+check_range_permutations(MDB_txn *txn, MDB_dbi dbi, const char *prefix,
+                         int low_idx, int high_idx, const char *tag)
+{
+    static const struct {
+        unsigned int flags;
+        const char *label;
+    } combos[] = {
+        { 0, "open" },
+        { MDB_COUNT_LOWER_INCL, "lower-incl" },
+        { MDB_COUNT_UPPER_INCL, "upper-incl" },
+        { MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL, "closed" },
+    };
+
+    for (size_t i = 0; i < sizeof(combos) / sizeof(combos[0]); ++i) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "%s (%s)", tag, combos[i].label);
+        check_range_with_bounds(txn, dbi, prefix, low_idx, high_idx,
+                                combos[i].flags, msg);
+    }
+}
+
+static void
+check_value_range_with_bounds(MDB_txn *txn, MDB_dbi dbi, const char *prefix,
+                              int low_idx, int high_idx, unsigned int key_flags,
+                              const char *tag)
+{
+    MDB_val low, high;
+    MDB_val *low_ptr = NULL;
+    MDB_val *high_ptr = NULL;
+    char lowbuf[32];
+    char highbuf[32];
+
+    if (low_idx >= 0) {
+        snprintf(lowbuf, sizeof(lowbuf), "%s%05d", prefix, low_idx);
+        low.mv_size = strlen(lowbuf);
+        low.mv_data = lowbuf;
+        low_ptr = &low;
+    }
+    if (high_idx >= 0) {
+        snprintf(highbuf, sizeof(highbuf), "%s%05d", prefix, high_idx);
+        high.mv_size = strlen(highbuf);
+        high.mv_data = highbuf;
+        high_ptr = &high;
+    }
+
+    int lower_incl = (key_flags & MDB_COUNT_LOWER_INCL) != 0;
+    int upper_incl = (key_flags & MDB_COUNT_UPPER_INCL) != 0;
+    uint64_t naive = naive_count_values(txn, dbi, low_ptr, high_ptr,
+                                        lower_incl, upper_incl, NULL);
+    uint64_t counted = 0;
+    CHECK(mdb_range_count_values(txn, dbi, low_ptr, high_ptr,
+                                 key_flags, &counted), tag);
+    expect_eq(counted, naive, tag);
+}
+
+static void
+check_value_range_permutations(MDB_txn *txn, MDB_dbi dbi, const char *prefix,
+                               int low_idx, int high_idx, const char *tag)
+{
+    static const struct {
+        unsigned int flags;
+        const char *label;
+    } combos[] = {
+        { 0, "open" },
+        { MDB_COUNT_LOWER_INCL, "lower-incl" },
+        { MDB_COUNT_UPPER_INCL, "upper-incl" },
+        { MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL, "closed" },
+    };
+
+    for (size_t i = 0; i < sizeof(combos) / sizeof(combos[0]); ++i) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "%s (%s)", tag, combos[i].label);
+        check_value_range_with_bounds(txn, dbi, prefix,
+                                      low_idx, high_idx,
+                                      combos[i].flags, msg);
+    }
+}
+
+static void
+key_suffix_to_int(const MDB_val *key, const char *prefix, int *out_value)
+{
+    if (!out_value)
+        return;
+    *out_value = -1;
+    size_t prefix_len = strlen(prefix);
+    if (key->mv_size < prefix_len)
+        return;
+    const char *ptr = (const char *)key->mv_data;
+    if (memcmp(ptr, prefix, prefix_len) != 0)
+        return;
+    int value = 0;
+    for (size_t i = prefix_len; i < key->mv_size; ++i) {
+        char c = ptr[i];
+        if (c < '0' || c > '9')
+            break;
+        value = value * 10 + (c - '0');
+    }
+    *out_value = value;
+}
+
+static void
+test_split_merge_range_count_values(MDB_env *env)
+{
+    const int keys = 512;
+    const int dup_per_key = 18;
+    const int trim_keys = 32;
+    const int remove_start = keys / 4;
+    const int remove_keys = keys / 2;
+    const char *prefix = "sv";
+
+    MDB_txn *txn;
+    MDB_dbi dbi;
+    MDB_val key, data;
+    uint64_t total = 0;
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "values split begin");
+    CHECK(mdb_dbi_open(txn, "edge_values_split_merge",
+                       MDB_CREATE | MDB_COUNTED | MDB_DUPSORT,
+                       &dbi), "values split open");
+
+    char kbuf[32];
+    char vbuf[32];
+    for (int i = 0; i < keys; ++i) {
+        snprintf(kbuf, sizeof(kbuf), "%s%05d", prefix, i);
+        key.mv_size = strlen(kbuf);
+        key.mv_data = kbuf;
+        for (int dup = 0; dup < dup_per_key; ++dup) {
+            snprintf(vbuf, sizeof(vbuf), "val%05d_%02d", i, dup);
+            data.mv_size = strlen(vbuf);
+            data.mv_data = vbuf;
+            unsigned int put_flags = (dup == 0) ? MDB_APPEND : MDB_APPENDDUP;
+            CHECK(mdb_put(txn, dbi, &key, &data, put_flags),
+                  "values split append");
+        }
+        if ((i + 1) % 64 == 0) {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "values split insert chunk %d", i + 1);
+            int low_idx = i - 127;
+            if (low_idx < 0)
+                low_idx = 0;
+            check_value_range_permutations(txn, dbi, prefix,
+                                           low_idx, i, msg);
+        }
+    }
+
+    CHECK(mdb_range_count_values(txn, dbi, NULL, NULL, 0, &total),
+          "values split count insert");
+    expect_eq(total, (uint64_t)keys * dup_per_key,
+              "values split total after insert");
+    check_value_range_permutations(txn, dbi, prefix, 0, keys - 1,
+                                   "values split full span insert");
+    check_value_range_permutations(txn, dbi, prefix,
+                                   keys / 2, keys - 1,
+                                   "values split upper half insert");
+
+    CHECK(mdb_txn_commit(txn), "values split insert commit");
+
+    uint64_t expected_total = (uint64_t)keys * dup_per_key;
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "values trim begin");
+    MDB_cursor *cur;
+    CHECK(mdb_cursor_open(txn, dbi, &cur), "values trim cursor open");
+
+    snprintf(kbuf, sizeof(kbuf), "%s%05d", prefix, remove_start);
+    key.mv_size = strlen(kbuf);
+    key.mv_data = kbuf;
+    MDB_val pdata;
+    int rc = mdb_cursor_get(cur, &key, &pdata, MDB_SET_RANGE);
+    CHECK(rc, "values trim set_range init");
+
+    int per_key_trimmed = dup_per_key / 2;
+    uint64_t trimmed_total = 0;
+    for (int i = 0; i < trim_keys; ++i) {
+        CHECK(mdb_cursor_get(cur, &key, &pdata, MDB_FIRST_DUP),
+              "values trim first dup");
+        int key_index = -1;
+        key_suffix_to_int(&key, prefix, &key_index);
+        for (int dup = 0; dup < per_key_trimmed; ++dup) {
+            CHECK(mdb_cursor_del(cur, 0), "values trim del dup");
+            trimmed_total++;
+            if (dup + 1 < per_key_trimmed) {
+                rc = mdb_cursor_get(cur, &key, &pdata, MDB_GET_CURRENT);
+                CHECK(rc, "values trim next dup");
+            }
+        }
+        char msg[128];
+        snprintf(msg, sizeof(msg), "values trim key %d", key_index);
+        int low_idx = key_index - 24;
+        if (low_idx < 0)
+            low_idx = 0;
+        int high_idx = key_index + 24;
+        if (high_idx >= keys)
+            high_idx = keys - 1;
+        check_value_range_permutations(txn, dbi, prefix,
+                                       low_idx, high_idx, msg);
+        rc = mdb_cursor_get(cur, &key, &pdata, MDB_NEXT_NODUP);
+        if (rc == MDB_NOTFOUND)
+            break;
+        CHECK(rc, "values trim next key");
+    }
+
+    CHECK(mdb_range_count_values(txn, dbi, NULL, NULL, 0, &total),
+          "values trim count");
+    expected_total -= trimmed_total;
+    expect_eq(total, expected_total, "values trim total");
+
+    mdb_cursor_close(cur);
+    CHECK(mdb_txn_commit(txn), "values trim commit");
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "values delete begin");
+    CHECK(mdb_cursor_open(txn, dbi, &cur), "values delete cursor open");
+
+    snprintf(kbuf, sizeof(kbuf), "%s%05d", prefix, remove_start);
+    key.mv_size = strlen(kbuf);
+    key.mv_data = kbuf;
+    rc = mdb_cursor_get(cur, &key, &pdata, MDB_SET_RANGE);
+    CHECK(rc, "values delete set_range init");
+
+    uint64_t removed_total = 0;
+    for (int i = 0; i < remove_keys; ++i) {
+        CHECK(mdb_cursor_get(cur, &key, &pdata, MDB_FIRST_DUP),
+              "values delete first dup");
+        int key_index = -1;
+        key_suffix_to_int(&key, prefix, &key_index);
+        mdb_size_t dupcount = 0;
+        CHECK(mdb_cursor_count(cur, &dupcount), "values delete dupcount");
+        CHECK(mdb_cursor_del(cur, MDB_NODUPDATA), "values delete key");
+        removed_total += dupcount;
+        if ((i + 1) % 32 == 0 || i + 1 == remove_keys) {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "values delete chunk %d", i + 1);
+            int low_idx = remove_start - 48;
+            if (low_idx < 0)
+                low_idx = 0;
+            int high_idx = remove_start + remove_keys + 48;
+            if (high_idx >= keys)
+                high_idx = keys - 1;
+            check_value_range_permutations(txn, dbi, prefix,
+                                           low_idx, high_idx, msg);
+        }
+        rc = mdb_cursor_get(cur, &key, &pdata, MDB_GET_CURRENT);
+        if (rc == MDB_NOTFOUND)
+            break;
+        CHECK(rc, "values delete next");
+    }
+
+    CHECK(mdb_range_count_values(txn, dbi, NULL, NULL, 0, &total),
+          "values delete count");
+    expected_total -= removed_total;
+    expect_eq(total, expected_total, "values delete total");
+
+    mdb_cursor_close(cur);
+    CHECK(mdb_txn_commit(txn), "values delete commit");
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn),
+          "values verify begin");
+    check_value_range_permutations(txn, dbi, prefix,
+                                   0, remove_start - 1,
+                                   "values verify low");
+    check_value_range_permutations(txn, dbi, prefix,
+                                   remove_start + remove_keys, keys - 1,
+                                   "values verify high");
+    check_value_range_permutations(txn, dbi, prefix,
+                                   0, keys - 1,
+                                   "values verify full");
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "values drop begin");
+    CHECK(mdb_drop(txn, dbi, 0), "values drop");
+    CHECK(mdb_txn_commit(txn), "values drop commit");
+
+    mdb_dbi_close(env, dbi);
+}
+
+static void
+test_split_merge_range_counts(MDB_env *env)
+{
+    const int initial = 4096;
+    const char *prefix = "sm";
+    MDB_txn *txn;
+    MDB_dbi dbi;
+    MDB_val key, data;
+    uint64_t total = 0;
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "split-range begin");
+    CHECK(mdb_dbi_open(txn, "edge_split_merge_range",
+                       MDB_CREATE | MDB_COUNTED, &dbi),
+          "split-range open");
+
+    char kbuf[32];
+    char vbuf[32];
+    for (int i = 0; i < initial; ++i) {
+        snprintf(kbuf, sizeof(kbuf), "%s%05d", prefix, i);
+        snprintf(vbuf, sizeof(vbuf), "val%05d", i);
+        key.mv_size = strlen(kbuf);
+        key.mv_data = kbuf;
+        data.mv_size = strlen(vbuf);
+        data.mv_data = vbuf;
+        CHECK(mdb_put(txn, dbi, &key, &data, MDB_APPEND),
+              "split-range append");
+
+        if ((i + 1) % 128 == 0) {
+            char msg[96];
+            snprintf(msg, sizeof(msg), "split-range insert chunk %d", i + 1);
+            int chunk_low = i - 127;
+            if (chunk_low < 0)
+                chunk_low = 0;
+            check_range_permutations(txn, dbi, prefix,
+                                     chunk_low, i, msg);
+        }
+    }
+
+    CHECK(mdb_count_all(txn, dbi, 0, &total), "split-range count_all insert");
+    expect_eq(total, (uint64_t)initial, "split-range total after insert");
+    check_range_permutations(txn, dbi, prefix, 0, initial - 1,
+                             "split-range full span insert");
+    check_range_permutations(txn, dbi, prefix, initial / 2, initial - 1,
+                             "split-range upper half insert");
+
+    CHECK(mdb_txn_commit(txn), "split-range insert commit");
+
+    const int remove_start = initial / 4;
+    const int remove_count = initial / 2;
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "split-range delete begin");
+    MDB_cursor *cur;
+    CHECK(mdb_cursor_open(txn, dbi, &cur), "split-range cursor open");
+
+    snprintf(kbuf, sizeof(kbuf), "%s%05d", prefix, remove_start);
+    key.mv_size = strlen(kbuf);
+    key.mv_data = kbuf;
+    MDB_val pdata;
+    int rc = mdb_cursor_get(cur, &key, &pdata, MDB_SET_RANGE);
+    CHECK(rc, "split-range cursor seek");
+
+    for (int removed = 0; removed < remove_count && rc == MDB_SUCCESS;
+         ++removed) {
+        CHECK(mdb_cursor_del(cur, 0), "split-range cursor del");
+        if ((removed + 1) % 64 == 0) {
+            char msg[96];
+            snprintf(msg, sizeof(msg), "split-range delete chunk %d",
+                     removed + 1);
+            int low_idx = remove_start - 96;
+            if (low_idx < 0)
+                low_idx = 0;
+            int high_idx = remove_start + remove_count + 96;
+            if (high_idx >= initial)
+                high_idx = initial - 1;
+            check_range_permutations(txn, dbi, prefix,
+                                     low_idx, high_idx, msg);
+        }
+        rc = mdb_cursor_get(cur, &key, &pdata, MDB_NEXT);
+    }
+    if (rc != MDB_SUCCESS && rc != MDB_NOTFOUND)
+        CHECK(rc, "split-range cursor next");
+
+    mdb_cursor_close(cur);
+
+    CHECK(mdb_count_all(txn, dbi, 0, &total), "split-range count_all delete");
+    expect_eq(total, (uint64_t)(initial - remove_count),
+              "split-range total after delete");
+    check_range_permutations(txn, dbi, prefix, 0, initial - 1,
+                             "split-range span after delete");
+    check_range_permutations(txn, dbi, prefix,
+                             remove_start + remove_count, initial - 1,
+                             "split-range tail after delete");
+
+    CHECK(mdb_txn_commit(txn), "split-range delete commit");
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn),
+          "split-range verify begin");
+    check_range_permutations(txn, dbi, prefix, 0, remove_start - 1,
+                             "split-range verify low");
+    check_range_permutations(txn, dbi, prefix,
+                             remove_start + remove_count, initial - 1,
+                             "split-range verify high");
+    check_range_permutations(txn, dbi, prefix, 0, initial - 1,
+                             "split-range verify span");
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "split-range drop begin");
+    CHECK(mdb_drop(txn, dbi, 0), "split-range drop");
+    CHECK(mdb_txn_commit(txn), "split-range drop commit");
+
+    mdb_dbi_close(env, dbi);
+}
+
+static void
 test_split_merge(MDB_env *env)
 {
     const int initial = 2048;
@@ -3038,6 +3482,8 @@ main(void)
     test_random_access_dupsort(env);
     test_overwrite_stability(env);
     test_cursor_deletions(env);
+    test_split_merge_range_count_values(env);
+    test_split_merge_range_counts(env);
     test_split_merge(env);
     test_nested_transactions(env);
     test_fuzz_random(env);

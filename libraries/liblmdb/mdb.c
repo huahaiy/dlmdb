@@ -10941,6 +10941,9 @@ put_sub:
 			insert_data = mc->mc_xcursor->mx_db.md_entries - ecount;
 		}
 		/* Increment count unless we just replaced an existing item. */
+		if ((mc->mc_db->md_flags & MDB_DUPSORT) && insert_key && insert_data <= 0)
+			/* normalize MDB_NOTFOUND (or similar) from cursor_set */
+			insert_data = 1;
 		if (insert_data)
 			mc->mc_db->md_entries++;
 		if (insert_key) {
