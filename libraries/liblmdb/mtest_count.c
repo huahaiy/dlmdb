@@ -30,6 +30,56 @@ cmp_key(const MDB_val *a, const MDB_val *b)
     return 0;
 }
 
+static int
+dtlv_cmp_memn(const MDB_val *a, const MDB_val *b)
+{
+    if (a == b)
+        return 0;
+
+    unsigned int len = (unsigned int)a->mv_size;
+    ssize_t len_diff = (ssize_t)a->mv_size - (ssize_t)b->mv_size;
+    if (len_diff > 0)
+        len = (unsigned int)b->mv_size;
+
+    int diff = memcmp(a->mv_data, b->mv_data, len);
+    return diff ? diff : (int)len_diff;
+}
+
+static unsigned char
+hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9')
+        return (unsigned char)(c - '0');
+    if (c >= 'a' && c <= 'f')
+        return (unsigned char)(c - 'a' + 10);
+    if (c >= 'A' && c <= 'F')
+        return (unsigned char)(c - 'A' + 10);
+    fprintf(stderr, "invalid hex digit '%c'\n", c);
+    exit(EXIT_FAILURE);
+}
+
+static size_t
+hex_to_bytes(const char *hex, unsigned char *out, size_t max_out)
+{
+    size_t hex_len = strlen(hex);
+    if (hex_len % 2 != 0) {
+        fprintf(stderr, "hex string has odd length: %s\n", hex);
+        exit(EXIT_FAILURE);
+    }
+    size_t out_len = hex_len / 2;
+    if (out_len > max_out) {
+        fprintf(stderr, "hex buffer too small (need %zu, have %zu)\n",
+                out_len, max_out);
+        exit(EXIT_FAILURE);
+    }
+    for (size_t i = 0; i < out_len; ++i) {
+        unsigned char hi = hex_nibble(hex[2 * i]);
+        unsigned char lo = hex_nibble(hex[2 * i + 1]);
+        out[i] = (unsigned char)((hi << 4) | lo);
+    }
+    return out_len;
+}
+
 static unsigned int
 next_rand(unsigned int *state)
 {
@@ -976,6 +1026,70 @@ test_range_count_values(MDB_env *env)
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "dup range drop begin");
     CHECK(mdb_drop(txn, dbi, 0), "dup range drop");
     CHECK(mdb_txn_commit(txn), "dup range drop commit");
+    mdb_dbi_close(env, dbi);
+}
+
+static void
+test_range_count_values_raw(MDB_env *env)
+{
+    static const char *key_hexes[] = {
+        "00000003F800000000000000040001",
+        "00000004F800000000000000020001",
+        "00000005FA646174616C6576696E0001",
+        "00000006FE505769FCA2151DD741032165B6EFF4B20001",
+        "00000007FB646174616C6576696E2E736572766572007365727665720001",
+        "00000008FB646174616C6576696E2E726F6C6500646174616C6576696E0001",
+        "00000009F800000000000000010001",
+        "0000000AFA524267502B736F66445641454F6D76614353367A66464345642F4373787A4D315A472B6D444F546B78336F0001",
+        "0000000DF800000000000000020001",
+        "0000000FFB646174616C6576696E2E73657276657200636F6E74726F6C0001"
+    };
+    static const char *range_low_hex = "00000009F800000000000000000001";
+    static const char *range_high_hex = "00000009F87FFFFFFFFFFFFFFF0001";
+
+    MDB_txn *txn;
+    MDB_dbi dbi;
+    MDB_val key, data;
+    uint32_t value = 7;
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "dup range raw begin");
+    CHECK(mdb_dbi_open(txn, "dup_values_raw", MDB_CREATE | MDB_DUPSORT | MDB_COUNTED, &dbi),
+          "dup range raw open");
+    CHECK(mdb_set_compare(txn, dbi, dtlv_cmp_memn), "dup range raw set compare");
+    CHECK(mdb_set_dupsort(txn, dbi, dtlv_cmp_memn), "dup range raw set dupsort");
+
+    data.mv_data = &value;
+    data.mv_size = sizeof(value);
+
+    unsigned char keybuf[256];
+    for (size_t i = 0; i < sizeof(key_hexes) / sizeof(key_hexes[0]); ++i) {
+        size_t key_len = hex_to_bytes(key_hexes[i], keybuf, sizeof(keybuf));
+        key.mv_data = keybuf;
+        key.mv_size = key_len;
+        CHECK(mdb_put(txn, dbi, &key, &data, 0), "dup range raw put");
+    }
+    CHECK(mdb_txn_commit(txn), "dup range raw commit");
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "dup range raw read begin");
+
+    unsigned char range_low_buf[64];
+    unsigned char range_high_buf[64];
+    size_t range_low_len = hex_to_bytes(range_low_hex, range_low_buf, sizeof(range_low_buf));
+    size_t range_high_len = hex_to_bytes(range_high_hex, range_high_buf, sizeof(range_high_buf));
+    MDB_val range_low = { range_low_len, range_low_buf };
+    MDB_val range_high = { range_high_len, range_high_buf };
+
+    uint64_t naive = naive_count_values(txn, dbi, &range_low, &range_high, 1, 1, dtlv_cmp_memn);
+    uint64_t counted = 0;
+
+    CHECK(mdb_range_count_values(txn, dbi, &range_low, &range_high,
+                                 MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
+                                 &counted),
+          "dup range raw inclusive");
+    expect_eq(counted, naive, "dup range raw inclusive match");
+    expect_eq(counted, 1, "dup range raw inclusive single duplicate");
+
+    mdb_txn_abort(txn);
     mdb_dbi_close(env, dbi);
 }
 
@@ -2507,6 +2621,7 @@ main(void)
     test_range_outside_bounds(env);
     test_custom_comparator(env);
     test_range_count_values(env);
+    test_range_count_values_raw(env);
     test_count_all_plain(env);
     test_count_all_dupsort(env);
     test_count_all_persistence();
