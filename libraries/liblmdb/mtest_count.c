@@ -704,6 +704,52 @@ test_extreme_keys(MDB_env *env)
 }
 
 static void
+test_range_outside_bounds(MDB_env *env)
+{
+    MDB_txn *txn;
+    MDB_dbi dbi;
+    MDB_val key, data, low, high;
+    uint64_t total;
+    const char *keys[] = { "key1", "key2", "key3" };
+    const char *payload = "value";
+    const char *lower_bound = "aa";
+    const char *upper_bound = "zzzz";
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "outside begin");
+    CHECK(mdb_dbi_open(txn, "range_outside", MDB_CREATE | MDB_COUNTED, &dbi),
+          "outside open");
+
+    data.mv_data = (void *)payload;
+    data.mv_size = strlen(payload);
+
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
+        key.mv_data = (void *)keys[i];
+        key.mv_size = strlen(keys[i]);
+        CHECK(mdb_put(txn, dbi, &key, &data, 0), "outside put");
+    }
+
+    CHECK(mdb_txn_commit(txn), "outside commit");
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "outside read begin");
+
+    low.mv_data = (void *)lower_bound;
+    low.mv_size = strlen(lower_bound);
+    high.mv_data = (void *)upper_bound;
+    high.mv_size = strlen(upper_bound);
+
+    uint64_t naive = naive_count(txn, dbi, &low, &high, 1, 1, cmp_key);
+    CHECK(mdb_count_range(txn, dbi, &low, &high,
+                          MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
+                          &total),
+          "outside inclusive");
+    expect_eq(total, naive, "outside inclusive matches naive");
+    expect_eq(total, 3, "outside inclusive spans all entries");
+
+    mdb_txn_abort(txn);
+    mdb_dbi_close(env, dbi);
+}
+
+static void
 test_custom_comparator(MDB_env *env)
 {
     MDB_txn *txn;
@@ -2427,6 +2473,7 @@ main(void)
     test_empty_db(env);
     test_single_key(env);
     test_extreme_keys(env);
+    test_range_outside_bounds(env);
     test_custom_comparator(env);
     test_range_count_values(env);
     test_count_all_plain(env);
