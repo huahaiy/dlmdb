@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <errno.h>
@@ -78,6 +79,162 @@ hex_to_bytes(const char *hex, unsigned char *out, size_t max_out)
         out[i] = (unsigned char)((hi << 4) | lo);
     }
     return out_len;
+}
+
+static void
+fatal_errno(const char *msg)
+{
+    fprintf(stderr, "%s: %s\n", msg, strerror(errno));
+    exit(EXIT_FAILURE);
+}
+
+static unsigned char *
+dup_hex_to_bytes(const char *hex, size_t *out_len)
+{
+    while (*hex == ' ')
+        ++hex;
+    size_t hex_len = strlen(hex);
+    if (hex_len % 2 != 0) {
+        fprintf(stderr, "hex string has odd length: %s\n", hex);
+        exit(EXIT_FAILURE);
+    }
+    size_t decoded = hex_len / 2;
+    unsigned char *buf = NULL;
+    if (decoded) {
+        buf = malloc(decoded);
+        if (!buf)
+            fatal_errno("malloc hex buffer");
+        hex_to_bytes(hex, buf, decoded);
+    }
+    if (out_len)
+        *out_len = decoded;
+    return buf;
+}
+
+static MDB_env *
+load_env_from_dump(const char *dump_path, const char *db_name,
+                   char *env_dir_buf, size_t env_dir_len)
+{
+    char template[] = "test-many-tmpXXXXXX";
+    size_t template_len = strlen(template);
+    if (env_dir_len < template_len + 1) {
+        fprintf(stderr, "env path buffer too small\n");
+        exit(EXIT_FAILURE);
+    }
+    memcpy(env_dir_buf, template, template_len + 1);
+    char *tmp_dir = mkdtemp(env_dir_buf);
+    if (!tmp_dir)
+        fatal_errno("mkdtemp");
+
+    FILE *fp = fopen(dump_path, "r");
+    if (!fp)
+        fatal_errno("open dump file");
+
+    uint64_t mapsize = 0;
+    int duplicates = 0;
+    int dupsort = 0;
+    int header_done = 0;
+    int have_key_line = 0;
+    char key_line[2048] = {0};
+    char line[2048];
+    MDB_env *env = NULL;
+    MDB_txn *txn = NULL;
+    MDB_dbi dbi = 0;
+
+    while (fgets(line, sizeof(line), fp)) {
+        size_t len = strcspn(line, "\r\n");
+        line[len] = '\0';
+
+        if (!header_done) {
+            if (strcmp(line, "HEADER=END") == 0) {
+                header_done = 1;
+                CHECK(mdb_env_create(&env), "dump env create");
+                CHECK(mdb_env_set_maxdbs(env, 64), "dump env maxdbs");
+                if (mapsize)
+                    CHECK(mdb_env_set_mapsize(env, (mdb_size_t)mapsize), "dump env mapsize");
+                CHECK(mdb_env_open(env, env_dir_buf, MDB_NOLOCK, 0664), "dump env open");
+                CHECK(mdb_txn_begin(env, NULL, 0, &txn), "dump load txn");
+                unsigned int db_flags = MDB_CREATE | MDB_COUNTED;
+                if (duplicates || dupsort)
+                    db_flags |= MDB_DUPSORT;
+                CHECK(mdb_dbi_open(txn, db_name, db_flags, &dbi), "dump dbi open");
+                CHECK(mdb_set_compare(txn, dbi, dtlv_cmp_memn), "dump set compare");
+                CHECK(mdb_set_dupsort(txn, dbi, dtlv_cmp_memn), "dump set dupsort");
+                continue;
+            }
+            if (strncmp(line, "mapsize=", 8) == 0) {
+                mapsize = strtoull(line + 8, NULL, 10);
+            } else if (strncmp(line, "duplicates=", 11) == 0) {
+                duplicates = atoi(line + 11);
+            } else if (strncmp(line, "dupsort=", 8) == 0) {
+                dupsort = atoi(line + 8);
+            }
+            continue;
+        }
+
+        if (!line[0] || line[0] != ' ')
+            continue;
+
+        if (!have_key_line) {
+            strncpy(key_line, line, sizeof(key_line));
+            key_line[sizeof(key_line) - 1] = '\0';
+            have_key_line = 1;
+            continue;
+        }
+
+        char *key_hex = key_line;
+        while (*key_hex == ' ')
+            ++key_hex;
+        char *val_hex = line;
+        while (*val_hex == ' ')
+            ++val_hex;
+
+        size_t key_len = 0, val_len = 0;
+        unsigned char *key_buf = dup_hex_to_bytes(key_hex, &key_len);
+        unsigned char *val_buf = dup_hex_to_bytes(val_hex, &val_len);
+        MDB_val key = { key_len, key_buf };
+        MDB_val data = { val_len, val_buf };
+
+        CHECK(mdb_put(txn, dbi, &key, &data, 0), "dump load put");
+
+        if (key_buf)
+            free(key_buf);
+        if (val_buf)
+            free(val_buf);
+        have_key_line = 0;
+    }
+
+    if (have_key_line) {
+        fprintf(stderr, "dump file ended unexpectedly (missing value line)\n");
+        exit(EXIT_FAILURE);
+    }
+    if (!header_done) {
+        fprintf(stderr, "dump file missing header terminator\n");
+        exit(EXIT_FAILURE);
+    }
+
+    if (txn)
+        CHECK(mdb_txn_commit(txn), "dump load commit");
+    if (env && dbi)
+        mdb_dbi_close(env, dbi);
+    fclose(fp);
+    return env;
+}
+
+static void
+cleanup_env_dir(const char *env_path)
+{
+#ifdef _WIN32
+    const char sep = '\\';
+#else
+    const char sep = '/';
+#endif
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s%cdata.mdb", env_path, sep);
+    unlink(path);
+    snprintf(path, sizeof(path), "%s%clock.mdb", env_path, sep);
+    unlink(path);
+    rmdir(env_path);
 }
 
 static unsigned int
@@ -1094,6 +1251,57 @@ test_range_count_values_raw(MDB_env *env)
 }
 
 static void
+test_range_count_values_many_env(void)
+{
+    const char *dump_path = "test-many.txt";
+    const char *db_name = "datalevin/ave";
+    const char *low_hex = "00000005FA000001";
+    const char *high_prefix = "00000005FA";
+    MDB_env *env = NULL;
+    MDB_txn *txn = NULL;
+    MDB_dbi dbi;
+    unsigned char lowbuf[64];
+    unsigned char highbuf[600];
+    char high_hex[512];
+    MDB_val low, high;
+    uint64_t counted = 0;
+    uint64_t expected = 0;
+    char env_dir[PATH_MAX];
+
+    size_t prefix_len = strlen(high_prefix);
+    memcpy(high_hex, high_prefix, prefix_len);
+    memset(high_hex + prefix_len, 'F', 480);
+    memcpy(high_hex + prefix_len + 480, "0001", 5);
+
+    size_t low_len = hex_to_bytes(low_hex, lowbuf, sizeof(lowbuf));
+    low.mv_size = low_len;
+    low.mv_data = lowbuf;
+    size_t high_len = hex_to_bytes(high_hex, highbuf, sizeof(highbuf));
+    high.mv_size = high_len;
+    high.mv_data = highbuf;
+
+    env = load_env_from_dump(dump_path, db_name, env_dir, sizeof(env_dir));
+
+	CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "range many txn begin");
+	CHECK(mdb_dbi_open(txn, db_name, 0, &dbi), "range many dbi open");
+	CHECK(mdb_set_compare(txn, dbi, dtlv_cmp_memn), "range many set compare");
+	CHECK(mdb_set_dupsort(txn, dbi, dtlv_cmp_memn), "range many set dupsort");
+
+	expected = naive_count_values(txn, dbi, &low, &high, 1, 1, dtlv_cmp_memn);
+	CHECK(mdb_range_count_values(txn, dbi, &low, &high,
+                                 MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
+                                 &counted),
+          "range many mdb_range_count_values");
+    expect_eq(counted, expected, "range many matches naive");
+    expect_eq(counted, 42, "range many expected 42");
+
+    mdb_txn_abort(txn);
+    mdb_dbi_close(env, dbi);
+    mdb_env_close(env);
+    cleanup_env_dir(env_dir);
+}
+
+static void
 test_count_all_plain(MDB_env *env)
 {
     MDB_txn *txn;
@@ -1859,6 +2067,199 @@ run_fuzz_random(MDB_env *env, const char *db_name,
 }
 
 static void
+run_fuzz_random_dupsort(MDB_env *env, const char *db_name,
+                        const char *key_prefix, unsigned int seed_init,
+                        const char *label)
+{
+    const int max_keys = 768;
+    const int rounds = 160;
+    const int ops_per_round = 36;
+    const int checks_per_round = 36;
+    unsigned int seed = seed_init;
+    unsigned int unique_counter = 1;
+
+    MDB_txn *txn;
+    MDB_dbi dbi;
+    char stage_msg[96];
+    format_stage(stage_msg, sizeof(stage_msg), label, "begin");
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), stage_msg);
+    format_stage(stage_msg, sizeof(stage_msg), label, "open");
+    CHECK(mdb_dbi_open(txn, db_name,
+                       MDB_CREATE | MDB_COUNTED | MDB_DUPSORT, &dbi),
+          stage_msg);
+    format_stage(stage_msg, sizeof(stage_msg), label, "commit open");
+    CHECK(mdb_txn_commit(txn), stage_msg);
+
+    for (int round = 0; round < rounds; ++round) {
+        format_stage(stage_msg, sizeof(stage_msg), label, "round begin");
+        CHECK(mdb_txn_begin(env, NULL, 0, &txn), stage_msg);
+        for (int op = 0; op < ops_per_round; ++op) {
+            int idx = (int)(next_rand(&seed) % max_keys);
+            char keybuf[24];
+            snprintf(keybuf, sizeof(keybuf), "%s%05d", key_prefix, idx);
+
+            MDB_val key;
+            key.mv_size = strlen(keybuf);
+            key.mv_data = keybuf;
+
+            unsigned int action = next_rand(&seed) % 4u;
+            if (action == 0) {
+                char valbuf[32];
+                unsigned int dup_id = unique_counter++;
+                snprintf(valbuf, sizeof(valbuf), "%sdup%05d-%08x",
+                         key_prefix, idx, dup_id);
+                MDB_val data;
+                data.mv_size = strlen(valbuf);
+                data.mv_data = valbuf;
+                char op_msg[96];
+                format_stage(op_msg, sizeof(op_msg), label, "insert dup");
+                CHECK(mdb_put(txn, dbi, &key, &data, 0), op_msg);
+            } else if (action == 1) {
+                MDB_cursor *cur = NULL;
+                char op_msg[96];
+                format_stage(op_msg, sizeof(op_msg), label, "cursor open dup");
+                CHECK(mdb_cursor_open(txn, dbi, &cur), op_msg);
+                MDB_val seek_key = key;
+                MDB_val data;
+                int rc = mdb_cursor_get(cur, &seek_key, &data, MDB_SET_KEY);
+                if (rc == MDB_SUCCESS) {
+                    int skips = (int)(next_rand(&seed) & 3u);
+                    while (skips-- > 0) {
+                        rc = mdb_cursor_get(cur, &seek_key, &data, MDB_NEXT_DUP);
+                        if (rc != MDB_SUCCESS)
+                            break;
+                    }
+                    if (rc == MDB_SUCCESS) {
+                        format_stage(op_msg, sizeof(op_msg), label, "cursor del dup");
+                        rc = mdb_cursor_del(cur, 0);
+                        CHECK(rc, op_msg);
+                    }
+                } else if (rc != MDB_NOTFOUND) {
+                    format_stage(op_msg, sizeof(op_msg), label, "cursor set dup");
+                    CHECK(rc, op_msg);
+                }
+                mdb_cursor_close(cur);
+            } else if (action == 2) {
+                int rc = mdb_del(txn, dbi, &key, NULL);
+                if (rc != MDB_SUCCESS && rc != MDB_NOTFOUND) {
+                    char op_msg[96];
+                    format_stage(op_msg, sizeof(op_msg), label, "delete key");
+                    CHECK(rc, op_msg);
+                }
+            } else {
+                char valbuf[24];
+                snprintf(valbuf, sizeof(valbuf), "%salt%05d",
+                         key_prefix, idx);
+                MDB_val data;
+                data.mv_size = strlen(valbuf);
+                data.mv_data = valbuf;
+                int rc = mdb_put(txn, dbi, &key, &data, 0);
+                if (rc != MDB_SUCCESS && rc != MDB_KEYEXIST) {
+                    char op_msg[96];
+                    format_stage(op_msg, sizeof(op_msg), label, "alt dup insert");
+                    CHECK(rc, op_msg);
+                }
+            }
+        }
+        format_stage(stage_msg, sizeof(stage_msg), label, "round commit");
+        CHECK(mdb_txn_commit(txn), stage_msg);
+
+        format_stage(stage_msg, sizeof(stage_msg), label, "verify begin");
+        CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), stage_msg);
+        uint64_t counted_total = 0;
+        format_stage(stage_msg, sizeof(stage_msg), label, "count_all");
+        CHECK(mdb_count_all(txn, dbi, 0, &counted_total), stage_msg);
+        uint64_t naive_total = naive_count_values(txn, dbi, NULL, NULL, 1, 1,
+                                                  cmp_key);
+        format_stage(stage_msg, sizeof(stage_msg), label, "count_all match");
+        expect_eq(counted_total, naive_total, stage_msg);
+
+        for (int q = 0; q < checks_per_round; ++q) {
+            MDB_val low, high;
+            MDB_val *low_ptr = NULL;
+            MDB_val *high_ptr = NULL;
+            unsigned int flags = 0;
+            char lowbuf[24];
+            char highbuf[24];
+
+            if (next_rand(&seed) & 1u) {
+                int low_idx = (int)(next_rand(&seed) % max_keys);
+                snprintf(lowbuf, sizeof(lowbuf), "%s%05d",
+                         key_prefix, low_idx);
+                low.mv_size = strlen(lowbuf);
+                low.mv_data = lowbuf;
+                low_ptr = &low;
+                if (next_rand(&seed) & 1u)
+                    flags |= MDB_COUNT_LOWER_INCL;
+            }
+
+            if (next_rand(&seed) & 1u) {
+                int high_idx = (int)(next_rand(&seed) % max_keys);
+                snprintf(highbuf, sizeof(highbuf), "%s%05d",
+                         key_prefix, high_idx);
+                high.mv_size = strlen(highbuf);
+                high.mv_data = highbuf;
+                high_ptr = &high;
+                if (next_rand(&seed) & 1u)
+                    flags |= MDB_COUNT_UPPER_INCL;
+            }
+
+            int lower_incl = (flags & MDB_COUNT_LOWER_INCL) != 0;
+            int upper_incl = (flags & MDB_COUNT_UPPER_INCL) != 0;
+            uint64_t naive_entries = naive_count(txn, dbi, low_ptr, high_ptr,
+                                                 lower_incl, upper_incl,
+                                                 cmp_key);
+            uint64_t counted_entries = 0;
+            char stage_label[48];
+            char range_msg[96];
+            snprintf(stage_label, sizeof(stage_label),
+                     "range entries %d", q);
+            format_stage(range_msg, sizeof(range_msg), label, stage_label);
+            int crc = mdb_count_range(txn, dbi, low_ptr, high_ptr,
+                                      flags, &counted_entries);
+            if (crc == MDB_SUCCESS) {
+                snprintf(stage_label, sizeof(stage_label),
+                         "range entries match %d", q);
+                format_stage(range_msg, sizeof(range_msg), label,
+                             stage_label);
+                expect_eq(counted_entries, naive_entries, range_msg);
+            } else if (crc != MDB_INCOMPATIBLE) {
+                snprintf(stage_label, sizeof(stage_label),
+                         "range entries error %d", q);
+                format_stage(range_msg, sizeof(range_msg), label,
+                             stage_label);
+                CHECK(crc, range_msg);
+            }
+
+            uint64_t naive_values = naive_count_values(txn, dbi, low_ptr,
+                                                       high_ptr, lower_incl,
+                                                       upper_incl, cmp_key);
+            uint64_t counted_values = 0;
+            snprintf(stage_label, sizeof(stage_label),
+                     "range values %d", q);
+            format_stage(range_msg, sizeof(range_msg), label, stage_label);
+            CHECK(mdb_range_count_values(txn, dbi, low_ptr, high_ptr,
+                                         flags, &counted_values),
+                  range_msg);
+            snprintf(stage_label, sizeof(stage_label),
+                     "range values match %d", q);
+            format_stage(range_msg, sizeof(range_msg), label,
+                         stage_label);
+            expect_eq(counted_values, naive_values, range_msg);
+        }
+        mdb_txn_abort(txn);
+    }
+
+    format_stage(stage_msg, sizeof(stage_msg), label, "drop begin");
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), stage_msg);
+    format_stage(stage_msg, sizeof(stage_msg), label, "drop db");
+    CHECK(mdb_drop(txn, dbi, 0), stage_msg);
+    format_stage(stage_msg, sizeof(stage_msg), label, "drop commit");
+    CHECK(mdb_txn_commit(txn), stage_msg);
+    mdb_dbi_close(env, dbi);
+}
+
+static void
 test_fuzz_random(MDB_env *env)
 {
     run_fuzz_random(env, "edge_fuzz_random",
@@ -1872,6 +2273,13 @@ test_fuzz_random_prefix(MDB_env *env)
     run_fuzz_random(env, "edge_fuzz_prefix",
                     MDB_CREATE | MDB_COUNTED | MDB_PREFIX_COMPRESSION,
                     "pf", 0x51c0cau, "fuzz prefix");
+}
+
+static void
+test_fuzz_random_dupsort(MDB_env *env)
+{
+    run_fuzz_random_dupsort(env, "edge_fuzz_dupsort",
+                            "df", 0x3498a5u, "fuzz dupsort");
 }
 
 static void
@@ -2622,6 +3030,7 @@ main(void)
     test_custom_comparator(env);
     test_range_count_values(env);
     test_range_count_values_raw(env);
+    test_range_count_values_many_env();
     test_count_all_plain(env);
     test_count_all_dupsort(env);
     test_count_all_persistence();
@@ -2633,6 +3042,7 @@ main(void)
     test_nested_transactions(env);
     test_fuzz_random(env);
     test_fuzz_random_prefix(env);
+    test_fuzz_random_dupsort(env);
     test_concurrent_readers();
 
     mdb_env_close(env);

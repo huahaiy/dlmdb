@@ -13573,8 +13573,11 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 					left_total = mdb_page_subtree_count(mp);
 				if (!have_right_tally)
 					right_total = mdb_page_subtree_count(rp);
-				mdb_update_parent_count(parent, mp->mp_pgno, left_total);
-				mdb_update_parent_count(parent, rp->mp_pgno, right_total);
+				int64_t delta_left = mdb_update_parent_count(parent, mp->mp_pgno, left_total);
+				int64_t delta_right = mdb_update_parent_count(parent, rp->mp_pgno, right_total);
+				int64_t delta = delta_left + delta_right;
+				if (delta)
+					mdb_propagate_count_delta(mc, ptop-1, delta);
 			}
 		}
 
