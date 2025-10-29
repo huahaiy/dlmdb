@@ -240,8 +240,7 @@ main(int argc, char **argv)
 	++vi;
 
 	if (include_default) {
-		snprintf(variants[vi].label, sizeof(variants[vi].label),
-		    "prefix");
+		snprintf(variants[vi].label, sizeof(variants[vi].label), "prefix");
 		variants[vi].use_prefix = true;
 		variants[vi].use_dupsort = false;
 		variants[vi].dup_per_key = 1;
@@ -598,7 +597,7 @@ add_variant_spec(bench_config *cfg, const char *arg)
 static unsigned int
 bench_variant_db_flags(const bench_variant *variant)
 {
-	unsigned int flags = 0;
+	unsigned int flags = MDB_COUNTED;
 	if (variant->use_prefix)
 		flags |= MDB_PREFIX_COMPRESSION;
 	if (variant->use_dupsort)

@@ -11190,7 +11190,8 @@ _mdb_cursor_del(MDB_cursor *mc, unsigned int flags)
 				} else {
 					MDB_cursor *m2;
 					/* shrink fake page */
-					mdb_node_shrink(mp, mc->mc_ki[mc->mc_top]);
+					if (!(mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION))
+						mdb_node_shrink(mp, mc->mc_ki[mc->mc_top]);
 					leaf = NODEPTR(mp, mc->mc_ki[mc->mc_top]);
 					mc->mc_xcursor->mx_cursor.mc_pg[0] = NODEDATA(leaf);
 					/* fix other sub-DB cursors pointed at fake pages on this page */
@@ -11717,7 +11718,17 @@ mdb_node_shrink(MDB_page *mp, indx_t indx)
 	node = NODEPTR(mp, indx);
 	sp = (MDB_page *)NODEDATA(node);
 	delta = SIZELEFT(sp);
+	if (delta >= NODEDSZ(node)) {
+		/* nothing to trim or subpage already minimal */
+		return;
+	}
 	nsize = NODEDSZ(node) - delta;
+	if (nsize < PAGEHDRSZ) {
+		delta = NODEDSZ(node) - PAGEHDRSZ;
+		if ((int)delta <= 0)
+			return;
+		nsize = PAGEHDRSZ;
+	}
 
 	/* Prepare to shift upward, set len = length(subpage part to shift) */
 	if (IS_LEAF2(sp)) {

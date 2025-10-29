@@ -199,7 +199,7 @@ populate_db(const char *path, int counted, size_t entries,
     MDB_val key, data;
     char keybuf[32];
     char databuf[32];
-    unsigned int db_flags = MDB_CREATE;
+    unsigned int db_flags = MDB_CREATE | MDB_PREFIX_COMPRESSION;
     struct timespec t0, t1;
 
     CHECK(mdb_env_create(&env), "mdb_env_create");
@@ -248,7 +248,7 @@ populate_dup_db(const char *path, int counted, size_t entries,
     MDB_val key, data;
     char keybuf[32];
     char valbuf[32];
-    unsigned int db_flags = MDB_CREATE | MDB_DUPSORT;
+    unsigned int db_flags = MDB_CREATE | MDB_DUPSORT | MDB_PREFIX_COMPRESSION;
     struct timespec t0, t1;
 
     if (!dupcount)

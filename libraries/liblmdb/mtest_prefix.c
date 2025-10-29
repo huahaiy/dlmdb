@@ -162,14 +162,14 @@ test_edge_cases(void)
 	int rc;
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
-	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION | MDB_COUNTED, &dbi));
 	const char *single_key = "solo-entry";
 	MDB_val single = {strlen(single_key), (void *)single_key};
 	CHECK_CALL(mdb_put(txn, dbi, &single, &single, 0));
 	CHECK_CALL(mdb_txn_commit(txn));
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
-	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION | MDB_COUNTED, &dbi));
 	key.mv_data = NULL;
 	key.mv_size = 0;
 	data.mv_data = NULL;
@@ -188,7 +188,7 @@ test_edge_cases(void)
 	env = create_env(dir);
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
-	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION | MDB_COUNTED, &dbi));
 	const char *short_key = "ab";
 	MDB_val short_val = {strlen(short_key), (void *)short_key};
 	CHECK_CALL(mdb_put(txn, dbi, &short_val, &short_val, 0));
@@ -196,7 +196,7 @@ test_edge_cases(void)
 	CHECK_CALL(mdb_txn_commit(txn));
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
-	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION | MDB_COUNTED, &dbi));
 	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
 	MDB_val short_lookup = {short_val.mv_size, short_val.mv_data};
 	rc = mdb_cursor_get(cur, &short_lookup, &data, MDB_SET_KEY);
@@ -221,7 +221,7 @@ test_range_scans(void)
 	MDB_cursor *cur = NULL;
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
-	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION | MDB_COUNTED, &dbi));
 	for (unsigned int i = 0; i < 16; ++i) {
 		char keybuf[32];
 		snprintf(keybuf, sizeof(keybuf), "acct-%04u-range", i);
@@ -232,7 +232,7 @@ test_range_scans(void)
 	CHECK_CALL(mdb_txn_commit(txn));
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
-	CHECK_CALL(mdb_dbi_open(txn, NULL, 0, &dbi));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi));
 	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
 
 	MDB_val key = {0, NULL};
@@ -322,7 +322,7 @@ test_threshold_behavior(void)
 	};
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
-	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION | MDB_COUNTED, &dbi));
 	for (size_t i = 0; i < ARRAY_SIZE(keys); ++i) {
 		const char *k = keys[i];
 		MDB_val key = {strlen(k), (void *)k};
@@ -332,7 +332,7 @@ test_threshold_behavior(void)
 	CHECK_CALL(mdb_txn_commit(txn));
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
-	CHECK_CALL(mdb_dbi_open(txn, NULL, 0, &dbi));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi));
 
 	MDB_stat st;
 	CHECK_CALL(mdb_stat(txn, dbi, &st));
@@ -362,7 +362,7 @@ test_mixed_pattern_and_unicode(void)
 	MDB_dbi dbi;
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
-	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION | MDB_COUNTED, &dbi));
 	const char *keys[] = {
 		"sh",
 		"shared-alpha-000000000000",
@@ -393,7 +393,7 @@ test_mixed_pattern_and_unicode(void)
 	CHECK_CALL(mdb_txn_commit(txn));
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
-	CHECK_CALL(mdb_dbi_open(txn, NULL, 0, &dbi));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi));
 	MDB_cursor *cur = NULL;
 	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
 
@@ -464,7 +464,7 @@ test_cursor_buffer_sharing(void)
 	MDB_dbi dbi;
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
-	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION | MDB_COUNTED, &dbi));
 	for (unsigned int i = 0; i < 12; ++i) {
 		char keybuf[64];
 		snprintf(keybuf, sizeof(keybuf), "cursor-shared-%03u", i);
@@ -534,7 +534,7 @@ test_prefix_dupsort_transitions(void)
 	MDB_dbi dbi;
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
-	unsigned int open_flags = MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_DUPSORT;
+	unsigned int open_flags = MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_COUNTED | MDB_DUPSORT;
 	CHECK_CALL(mdb_dbi_open(txn, "prefixed", open_flags, &dbi));
 	const char *dup_key_str = "prefixed-dup-target";
 	MDB_val dup_key = {strlen(dup_key_str), (void *)dup_key_str};
@@ -545,7 +545,7 @@ test_prefix_dupsort_transitions(void)
 	CHECK_CALL(mdb_txn_commit(txn));
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
-	CHECK_CALL(mdb_dbi_open(txn, "prefixed", 0, &dbi));
+	CHECK_CALL(mdb_dbi_open(txn, "prefixed", MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi));
 	MDB_cursor *cur = NULL;
 	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
 	MDB_val seek_key = {strlen(dup_key_str), (void *)dup_key_str};
@@ -579,7 +579,7 @@ test_prefix_dupsort_transitions(void)
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
 	int rc = mdb_dbi_open(txn, "prefixed",
-	    MDB_PREFIX_COMPRESSION | MDB_DUPFIXED, &dbi);
+	    MDB_PREFIX_COMPRESSION | MDB_COUNTED | MDB_DUPFIXED, &dbi);
 	if (rc == MDB_SUCCESS)
 		mdb_txn_commit(txn);
 	else
@@ -597,7 +597,7 @@ test_prefix_dupsort_cursor_walk(void)
 	MDB_dbi dbi;
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
-	unsigned int flags = MDB_PREFIX_COMPRESSION | MDB_DUPSORT;
+	unsigned int flags = MDB_PREFIX_COMPRESSION | MDB_COUNTED | MDB_DUPSORT;
 	CHECK_CALL(mdb_dbi_open(txn, "walkdb", MDB_CREATE | flags, &dbi));
 
 	static const char *keys[] = {
@@ -783,7 +783,7 @@ test_prefix_dupsort_get_both_range(void)
 	MDB_dbi dbi;
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
-	unsigned int flags = MDB_PREFIX_COMPRESSION | MDB_DUPSORT;
+	unsigned int flags = MDB_PREFIX_COMPRESSION | MDB_COUNTED | MDB_DUPSORT;
 	CHECK_CALL(mdb_dbi_open(txn, "bothdb", MDB_CREATE | flags, &dbi));
 
 	static const char *keys[] = {
@@ -889,7 +889,7 @@ test_prefix_leaf_splits(void)
 	const size_t total = 4096;
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
-	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION | MDB_COUNTED, &dbi));
 	for (size_t i = 0; i < total; ++i) {
 		char keybuf[64];
 		snprintf(keybuf, sizeof(keybuf), "shared-split-%08zu", i);
@@ -900,7 +900,7 @@ test_prefix_leaf_splits(void)
 	CHECK_CALL(mdb_txn_commit(txn));
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
-	CHECK_CALL(mdb_dbi_open(txn, NULL, 0, &dbi));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi));
 
 	for (size_t i = 0; i < total; i += 1023) {
 		char keybuf[64];
@@ -953,7 +953,7 @@ test_prefix_alternating_prefixes(void)
 	const size_t total = 512;
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
-	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION | MDB_COUNTED, &dbi));
 	for (size_t i = 0; i < total; ++i) {
 		char keybuf[64];
 		const char *prefix = (i & 1) ? "omega-" : "alpha-";
@@ -965,7 +965,7 @@ test_prefix_alternating_prefixes(void)
 	CHECK_CALL(mdb_txn_commit(txn));
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
-	CHECK_CALL(mdb_dbi_open(txn, NULL, 0, &dbi));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi));
 	MDB_cursor *cur = NULL;
 	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
 	MDB_val key = {0, NULL};
@@ -1008,7 +1008,7 @@ test_prefix_update_reinsert(void)
 	MDB_val key = {strlen(key_str), (void *)key_str};
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
-	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION | MDB_COUNTED, &dbi));
 	for (int i = 0; i < 5; ++i) {
 		char valbuf[32];
 		int vlen = snprintf(valbuf, sizeof(valbuf), "value-%d", i);
@@ -1018,7 +1018,7 @@ test_prefix_update_reinsert(void)
 	CHECK_CALL(mdb_txn_commit(txn));
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
-	CHECK_CALL(mdb_dbi_open(txn, NULL, 0, &dbi));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi));
 	MDB_val data = {0, NULL};
 	CHECK_CALL(mdb_get(txn, dbi, &key, &data));
 	if (data.mv_size != strlen("value-4") ||
@@ -1029,12 +1029,12 @@ test_prefix_update_reinsert(void)
 	mdb_txn_abort(txn);
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
-	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION | MDB_COUNTED, &dbi));
 	CHECK_CALL(mdb_del(txn, dbi, &key, NULL));
 	CHECK_CALL(mdb_txn_commit(txn));
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
-	CHECK_CALL(mdb_dbi_open(txn, NULL, 0, &dbi));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi));
 	int rc = mdb_get(txn, dbi, &key, &data);
 	if (rc != MDB_NOTFOUND) {
 		fprintf(stderr, "update reinsert: key still present (%s)\n", mdb_strerror(rc));
@@ -1043,13 +1043,13 @@ test_prefix_update_reinsert(void)
 	mdb_txn_abort(txn);
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
-	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION | MDB_COUNTED, &dbi));
 	MDB_val rein_val = {strlen("value-reinsert"), "value-reinsert"};
 	CHECK_CALL(mdb_put(txn, dbi, &key, &rein_val, 0));
 	CHECK_CALL(mdb_txn_commit(txn));
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
-	CHECK_CALL(mdb_dbi_open(txn, NULL, 0, &dbi));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi));
 	CHECK_CALL(mdb_get(txn, dbi, &key, &data));
 	if (data.mv_size != rein_val.mv_size ||
 	    memcmp(data.mv_data, rein_val.mv_data, data.mv_size) != 0) {
@@ -1069,7 +1069,7 @@ test_prefix_dupsort_smoke(void)
 	MDB_dbi dbi;
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
-	unsigned int flags = MDB_PREFIX_COMPRESSION | MDB_DUPSORT;
+	unsigned int flags = MDB_PREFIX_COMPRESSION | MDB_COUNTED | MDB_DUPSORT;
 	CHECK_CALL(mdb_dbi_open(txn, "dupdb", MDB_CREATE | flags, &dbi));
 
 	const char *key_str = "dup-key-alpha";
@@ -1151,7 +1151,7 @@ test_prefix_dupsort_corner_cases(void)
 	MDB_env *env = create_env(dir);
 	MDB_txn *txn = NULL;
 	MDB_dbi dbi;
-	unsigned int flags = MDB_PREFIX_COMPRESSION | MDB_DUPSORT;
+	unsigned int flags = MDB_PREFIX_COMPRESSION | MDB_COUNTED | MDB_DUPSORT;
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
 	CHECK_CALL(mdb_dbi_open(txn, db_name, MDB_CREATE | flags, &dbi));
@@ -1336,7 +1336,7 @@ test_prefix_dupsort_inline_basic_ops(void)
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
 	CHECK_CALL(mdb_dbi_open(txn, NULL,
-	    MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_DUPSORT, &dbi));
+	    MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_COUNTED | MDB_DUPSORT, &dbi));
 	for (size_t i = 0; i < initial_dup_count; ++i) {
 		const char *dup = dup_sequence[i];
 		MDB_val data = { strlen(dup), (void *)dup };
@@ -1481,7 +1481,7 @@ test_prefix_dupsort_inline_promote(void)
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
 	CHECK_CALL(mdb_dbi_open(txn, NULL,
-	    MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_DUPSORT, &dbi));
+	    MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_COUNTED | MDB_DUPSORT, &dbi));
 	for (size_t i = 0; i < ARRAY_SIZE(small_dups); ++i) {
 		const char *dup = small_dups[i];
 		MDB_val data = { strlen(dup), (void *)dup };
@@ -1588,7 +1588,7 @@ test_prefix_dupsort_inline_promote(void)
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
 	CHECK_CALL(mdb_dbi_open(txn, NULL,
-	    MDB_PREFIX_COMPRESSION | MDB_DUPSORT, &dbi));
+	    MDB_PREFIX_COMPRESSION | MDB_COUNTED | MDB_DUPSORT, &dbi));
 	assert_dup_sequence(env, dbi, key,
 	    expected_after_promotion, ARRAY_SIZE(expected_after_promotion));
 	mdb_txn_abort(txn);
@@ -1639,7 +1639,7 @@ test_prefix_dupsort_trunk_key_shift_no_value_change(void)
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
 	CHECK_CALL(mdb_dbi_open(txn, NULL,
-	    MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_DUPSORT, &dbi));
+	    MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_COUNTED | MDB_DUPSORT, &dbi));
 	for (size_t i = 0; i < ARRAY_SIZE(initial_dups); ++i) {
 		const char *dup = initial_dups[i];
 		MDB_val data = { strlen(dup), (void *)dup };
@@ -1731,7 +1731,7 @@ test_prefix_dupsort_inline_cmp_negative(void)
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
 	CHECK_CALL(mdb_dbi_open(txn, NULL,
-	    MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_DUPSORT, &dbi));
+	    MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_COUNTED | MDB_DUPSORT, &dbi));
 	MDB_val data = { old_len, old_dup };
 	CHECK_CALL(mdb_put(txn, dbi, &mkey, &data, 0));
 	CHECK_CALL(mdb_txn_commit(txn));
@@ -1775,7 +1775,7 @@ test_prefix_dupsort_trunk_swap_inline(void)
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
 	CHECK_CALL(mdb_dbi_open(txn, NULL,
-	    MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_DUPSORT, &dbi));
+	    MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_COUNTED | MDB_DUPSORT, &dbi));
 	for (size_t i = 0; i < ARRAY_SIZE(initial_dups); ++i) {
 		const char *dup = initial_dups[i];
 		MDB_val data = { strlen(dup), (void *)dup };
@@ -1815,7 +1815,7 @@ test_prefix_dupsort_trunk_swap_promote(void)
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
 	CHECK_CALL(mdb_dbi_open(txn, NULL,
-	    MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_DUPSORT, &dbi));
+	    MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_COUNTED | MDB_DUPSORT, &dbi));
 
 	for (size_t i = 0; i < INITIAL_COUNT; ++i) {
 		size_t prefix = snprintf(values[i], sizeof(values[i]),
@@ -1894,7 +1894,7 @@ test_prefix_dupsort_fuzz(void)
 	MDB_env *env = create_env(dir);
 	MDB_txn *txn = NULL;
 	MDB_dbi dbi;
-	unsigned int flags = MDB_PREFIX_COMPRESSION | MDB_DUPSORT;
+	unsigned int flags = MDB_PREFIX_COMPRESSION | MDB_COUNTED | MDB_DUPSORT;
 
 	const char *seed_env = getenv("PF_SEED");
 	uint64_t seed = UINT64_C(0x9e3779b97f4a7c15);
@@ -2566,7 +2566,7 @@ pf_verify_model(MDB_env *env, MDB_dbi dbi)
 	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
 	MDB_dbi verify_dbi = dbi;
 	if (dbi == 0) {
-		CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &verify_dbi));
+		CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION | MDB_COUNTED, &verify_dbi));
 	}
 	CHECK_CALL(mdb_cursor_open(txn, verify_dbi, &cur));
 
@@ -2691,7 +2691,7 @@ test_prefix_fuzz(void)
 	pf_rng_state = seed;
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
-	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION | MDB_COUNTED, &dbi));
 	CHECK_CALL(mdb_txn_commit(txn));
 
 	const size_t operations = 5000;
@@ -2849,7 +2849,7 @@ test_prefix_concurrent_reads(void)
 	MDB_dbi dbi;
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
 	CHECK_CALL(mdb_dbi_open(txn, "prefix-concurrent",
-	    MDB_CREATE | MDB_PREFIX_COMPRESSION, &dbi));
+	    MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_COUNTED, &dbi));
 
 	struct prefix_concurrent_ctx ctx;
 	ctx.env = env;
@@ -2916,7 +2916,7 @@ test_nested_txn_rollback(void)
 	MDB_dbi dbi;
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &parent));
-	CHECK_CALL(mdb_dbi_open(parent, NULL, MDB_PREFIX_COMPRESSION, &dbi));
+	CHECK_CALL(mdb_dbi_open(parent, NULL, MDB_PREFIX_COMPRESSION | MDB_COUNTED, &dbi));
 	const char *base_key = "nested-base";
 	MDB_val key = {strlen(base_key), (void *)base_key};
 	MDB_val val = {strlen(base_key), (void *)base_key};
@@ -2947,7 +2947,7 @@ test_nested_txn_rollback(void)
 	CHECK_CALL(mdb_txn_commit(parent));
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &parent));
-	CHECK_CALL(mdb_dbi_open(parent, NULL, 0, &dbi));
+	CHECK_CALL(mdb_dbi_open(parent, NULL, MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi));
 	rc = mdb_get(parent, dbi, &lookup, &data);
 	if (rc != MDB_NOTFOUND) {
 		fprintf(stderr,

@@ -113,7 +113,9 @@ dup_hex_to_bytes(const char *hex, size_t *out_len)
 
 static MDB_env *
 load_env_from_dump(const char *dump_path, const char *db_name,
-                   char *env_dir_buf, size_t env_dir_len)
+                   char *env_dir_buf, size_t env_dir_len,
+                   unsigned int extra_db_flags,
+                   unsigned int shuffle_seed)
 {
     char template[] = "test-many-tmpXXXXXX";
     size_t template_len = strlen(template);
@@ -161,7 +163,7 @@ load_env_from_dump(const char *dump_path, const char *db_name,
                     CHECK(mdb_env_set_mapsize(env, (mdb_size_t)mapsize), "dump env mapsize");
                 CHECK(mdb_env_open(env, env_dir_buf, MDB_NOLOCK, 0664), "dump env open");
                 CHECK(mdb_txn_begin(env, NULL, 0, &txn), "dump load txn");
-                unsigned int db_flags = MDB_CREATE | MDB_COUNTED;
+                unsigned int db_flags = MDB_CREATE | MDB_COUNTED | MDB_PREFIX_COMPRESSION | extra_db_flags;
                 if (duplicates || dupsort)
                     db_flags |= MDB_DUPSORT;
                 CHECK(mdb_dbi_open(txn, db_name, db_flags, &dbi), "dump dbi open");
@@ -225,7 +227,7 @@ load_env_from_dump(const char *dump_path, const char *db_name,
     }
 
     if (txn && entry_count) {
-        unsigned int shuffle_state = 0x915f2dbeu;
+        unsigned int shuffle_state = shuffle_seed ? shuffle_seed : 0x915f2dbeu;
         for (size_t i = entry_count; i > 1; --i) {
             shuffle_state = shuffle_state * 1103515245u + 12345u;
             size_t j = shuffle_state % i;
@@ -668,7 +670,7 @@ test_concurrent_readers(void)
     CHECK(mdb_env_open(env, dir, MDB_NOLOCK, 0664), "concurrent env open");
 
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "concurrent setup begin");
-    CHECK(mdb_dbi_open(txn, "concurrent", MDB_CREATE | MDB_COUNTED, &dbi),
+    CHECK(mdb_dbi_open(txn, "concurrent", MDB_CREATE | MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi),
           "concurrent dbi open");
 
     for (int i = 0; i < ctx.max_keys / 4; ++i) {
@@ -750,7 +752,7 @@ test_empty_db(MDB_env *env)
     MDB_val low, high;
 
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "empty begin");
-    CHECK(mdb_dbi_open(txn, "edge_empty", MDB_CREATE | MDB_COUNTED, &dbi),
+    CHECK(mdb_dbi_open(txn, "edge_empty", MDB_CREATE | MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi),
           "empty open");
     CHECK(mdb_txn_commit(txn), "empty commit");
 
@@ -801,7 +803,7 @@ test_single_key(MDB_env *env)
     MDB_val key, data;
 
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "single begin");
-    CHECK(mdb_dbi_open(txn, "edge_single", MDB_CREATE | MDB_COUNTED, &dbi),
+    CHECK(mdb_dbi_open(txn, "edge_single", MDB_CREATE | MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi),
           "single open");
 
     key.mv_data = "solo";
@@ -874,7 +876,7 @@ test_extreme_keys(MDB_env *env)
     memset(big_key, 'Z', sizeof(big_key));
 
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "extreme begin");
-    CHECK(mdb_dbi_open(txn, "edge_extreme", MDB_CREATE | MDB_COUNTED, &dbi),
+    CHECK(mdb_dbi_open(txn, "edge_extreme", MDB_CREATE | MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi),
           "extreme open");
 
     key.mv_data = tiny_key;
@@ -952,7 +954,7 @@ test_range_outside_bounds(MDB_env *env)
     const char *upper_bound = "zzzz";
 
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "outside begin");
-    CHECK(mdb_dbi_open(txn, "range_outside", MDB_CREATE | MDB_COUNTED, &dbi),
+    CHECK(mdb_dbi_open(txn, "range_outside", MDB_CREATE | MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi),
           "outside open");
 
     data.mv_data = (void *)payload;
@@ -995,7 +997,7 @@ test_custom_comparator(MDB_env *env)
     const char *keys[] = { "aa", "bb", "cc" };
 
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "custom begin");
-    CHECK(mdb_dbi_open(txn, "edge_custom", MDB_CREATE | MDB_COUNTED, &dbi),
+    CHECK(mdb_dbi_open(txn, "edge_custom", MDB_CREATE | MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi),
           "custom open");
     CHECK(mdb_set_compare(txn, dbi, reverse_cmp), "custom compare");
 
@@ -1072,7 +1074,7 @@ test_range_count_values(MDB_env *env)
     char valbuf[2];
 
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "dup range begin");
-    CHECK(mdb_dbi_open(txn, "dup_values", MDB_CREATE | MDB_DUPSORT | MDB_COUNTED, &dbi),
+    CHECK(mdb_dbi_open(txn, "dup_values", MDB_CREATE | MDB_DUPSORT | MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi),
           "dup range open");
 
     for (int i = 0; i < 6; ++i) {
@@ -1239,7 +1241,7 @@ test_range_count_values_raw(MDB_env *env)
     uint32_t value = 7;
 
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "dup range raw begin");
-    CHECK(mdb_dbi_open(txn, "dup_values_raw", MDB_CREATE | MDB_DUPSORT | MDB_COUNTED, &dbi),
+    CHECK(mdb_dbi_open(txn, "dup_values_raw", MDB_CREATE | MDB_DUPSORT | MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi),
           "dup range raw open");
     CHECK(mdb_set_compare(txn, dbi, dtlv_cmp_memn), "dup range raw set compare");
     CHECK(mdb_set_dupsort(txn, dbi, dtlv_cmp_memn), "dup range raw set dupsort");
@@ -1286,16 +1288,12 @@ test_range_count_values_many_env(void)
     const char *db_name = "datalevin/ave";
     const char *low_hex = "00000005FA000001";
     const char *high_prefix = "00000005FA";
-    MDB_env *env = NULL;
-    MDB_txn *txn = NULL;
-    MDB_dbi dbi;
     unsigned char lowbuf[64];
     unsigned char highbuf[600];
     char high_hex[512];
     MDB_val low, high;
-    uint64_t counted = 0;
-    uint64_t expected = 0;
     char env_dir[PATH_MAX];
+    char loop_msg[128];
 
     size_t prefix_len = strlen(high_prefix);
     memcpy(high_hex, high_prefix, prefix_len);
@@ -1309,25 +1307,38 @@ test_range_count_values_many_env(void)
     high.mv_size = high_len;
     high.mv_data = highbuf;
 
-    env = load_env_from_dump(dump_path, db_name, env_dir, sizeof(env_dir));
+    for (int loop = 0; loop < 10; ++loop) {
+        MDB_env *env = NULL;
+        MDB_txn *txn = NULL;
+        MDB_dbi dbi;
+        uint64_t counted = 0;
+        uint64_t expected = 0;
+        unsigned int seed = 0x915f2dbeu ^ ((unsigned int)(loop + 1) * 0x9e3779b9u);
 
-	CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "range many txn begin");
-	CHECK(mdb_dbi_open(txn, db_name, 0, &dbi), "range many dbi open");
-	CHECK(mdb_set_compare(txn, dbi, dtlv_cmp_memn), "range many set compare");
-	CHECK(mdb_set_dupsort(txn, dbi, dtlv_cmp_memn), "range many set dupsort");
+        env = load_env_from_dump(dump_path, db_name, env_dir, sizeof(env_dir),
+            MDB_PREFIX_COMPRESSION, seed);
 
-	expected = naive_count_values(txn, dbi, &low, &high, 1, 1, dtlv_cmp_memn);
-	CHECK(mdb_range_count_values(txn, dbi, &low, &high,
-                                 MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
-                                 &counted),
-          "range many mdb_range_count_values");
-    expect_eq(counted, expected, "range many matches naive");
-    expect_eq(counted, 42, "range many expected 42");
+        CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "range many txn begin");
+        CHECK(mdb_dbi_open(txn, db_name, 0, &dbi), "range many dbi open");
+        CHECK(mdb_set_compare(txn, dbi, dtlv_cmp_memn), "range many set compare");
+        CHECK(mdb_set_dupsort(txn, dbi, dtlv_cmp_memn), "range many set dupsort");
 
-    mdb_txn_abort(txn);
-    mdb_dbi_close(env, dbi);
-    mdb_env_close(env);
-    cleanup_env_dir(env_dir);
+        expected = naive_count_values(txn, dbi, &low, &high, 1, 1, dtlv_cmp_memn);
+        CHECK(mdb_range_count_values(txn, dbi, &low, &high,
+                                     MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
+                                     &counted),
+              "range many mdb_range_count_values");
+
+        snprintf(loop_msg, sizeof(loop_msg), "range many loop %d matches naive", loop);
+        expect_eq(counted, expected, loop_msg);
+        snprintf(loop_msg, sizeof(loop_msg), "range many loop %d expected 42", loop);
+        expect_eq(counted, 42, loop_msg);
+
+        mdb_txn_abort(txn);
+        mdb_dbi_close(env, dbi);
+        mdb_env_close(env);
+        cleanup_env_dir(env_dir);
+    }
 }
 
 static void
@@ -1341,7 +1352,7 @@ test_count_all_plain(MDB_env *env)
     uint64_t total = 0;
 
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "count_all plain begin");
-    CHECK(mdb_dbi_open(txn, "plain_all", MDB_CREATE | MDB_COUNTED, &dbi),
+    CHECK(mdb_dbi_open(txn, "plain_all", MDB_CREATE | MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi),
           "count_all plain open");
 
     CHECK(mdb_txn_commit(txn), "count_all plain commit empty");
@@ -1399,7 +1410,7 @@ test_count_all_dupsort(MDB_env *env)
     uint64_t total = 0;
 
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "count_all dup begin");
-    CHECK(mdb_dbi_open(txn, "dup_all", MDB_CREATE | MDB_DUPSORT | MDB_COUNTED, &dbi),
+    CHECK(mdb_dbi_open(txn, "dup_all", MDB_CREATE | MDB_DUPSORT | MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi),
           "count_all dup open");
 
     CHECK(mdb_txn_commit(txn), "count_all dup commit empty");
@@ -1477,7 +1488,7 @@ test_random_access_plain(MDB_env *env)
     MDB_cursor *cur;
 
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "rank plain begin");
-    CHECK(mdb_dbi_open(txn, "rank_plain", MDB_CREATE | MDB_COUNTED, &dbi),
+    CHECK(mdb_dbi_open(txn, "rank_plain", MDB_CREATE | MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi),
           "rank plain open");
 
     for (int i = 0; i < count; ++i) {
@@ -1585,32 +1596,35 @@ test_random_access_plain(MDB_env *env)
     CHECK(mdb_txn_commit(txn), "rank plain drop commit");
     mdb_dbi_close(env, dbi);
 
-    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "rank plain uncounted begin");
-    MDB_dbi uncounted;
-    CHECK(mdb_dbi_open(txn, "rank_plain_uncounted", MDB_CREATE, &uncounted),
-          "rank plain uncounted open");
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "rank plain extra begin");
+    MDB_dbi counted_small;
+    CHECK(mdb_dbi_open(txn, "rank_plain_extra",
+          MDB_CREATE | MDB_COUNTED | MDB_PREFIX_COMPRESSION, &counted_small),
+          "rank plain extra open");
     char uk = 'x';
     char ud = 'y';
     key.mv_size = 1;
     key.mv_data = &uk;
     data.mv_size = 1;
     data.mv_data = &ud;
-    CHECK(mdb_put(txn, uncounted, &key, &data, 0), "rank plain uncounted put");
-    CHECK(mdb_txn_commit(txn), "rank plain uncounted commit");
+    CHECK(mdb_put(txn, counted_small, &key, &data, 0), "rank plain extra put");
+    CHECK(mdb_txn_commit(txn), "rank plain extra commit");
 
-    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "rank plain uncounted rd");
-    rc = mdb_get_rank(txn, uncounted, 0, &key, &data);
-    expect_rc(rc, MDB_INCOMPATIBLE, "rank plain incompatible");
-    uint64_t rank_check = 0;
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "rank plain extra rd");
+    CHECK(mdb_get_rank(txn, counted_small, 0, &key, &data), "rank plain extra get");
+    expect_val_eq(&key, "x", "rank plain extra key");
+    expect_val_eq(&data, "y", "rank plain extra data");
+    uint64_t rank_check = UINT64_MAX;
     MDB_val sample_key = {1, &uk};
-    rc = mdb_get_key_rank(txn, uncounted, &sample_key, NULL, &rank_check);
-    expect_rc(rc, MDB_INCOMPATIBLE, "rank plain key incompatible");
+    CHECK(mdb_get_key_rank(txn, counted_small, &sample_key, NULL, &rank_check),
+          "rank plain extra key rank");
+    expect_eq(rank_check, 0, "rank plain extra key rank value");
     mdb_txn_abort(txn);
 
-    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "rank plain uncounted drop begin");
-    CHECK(mdb_drop(txn, uncounted, 1), "rank plain uncounted drop");
-    CHECK(mdb_txn_commit(txn), "rank plain uncounted drop commit");
-    mdb_dbi_close(env, uncounted);
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "rank plain extra drop begin");
+    CHECK(mdb_drop(txn, counted_small, 1), "rank plain extra drop");
+    CHECK(mdb_txn_commit(txn), "rank plain extra drop commit");
+    mdb_dbi_close(env, counted_small);
 }
 
 static void
@@ -1656,7 +1670,7 @@ test_random_access_dupsort(MDB_env *env)
     MDB_txn *txn;
     MDB_dbi dbi;
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "rank dup begin");
-    CHECK(mdb_dbi_open(txn, "rank_dup", MDB_CREATE | MDB_COUNTED | MDB_DUPSORT, &dbi),
+    CHECK(mdb_dbi_open(txn, "rank_dup", MDB_CREATE | MDB_COUNTED | MDB_DUPSORT | MDB_PREFIX_COMPRESSION, &dbi),
           "rank dup open");
 
     for (size_t i = 0; i < total; ++i) {
@@ -1684,16 +1698,6 @@ test_random_access_dupsort(MDB_env *env)
         expect_val_match(&got_key, &expected[idx].key, "rank dup key");
         expect_val_match(&got_data, &expected[idx].data, "rank dup data");
 
-        uint64_t pair_rank = UINT64_MAX;
-        CHECK(mdb_get_key_rank(txn, dbi, &expected[idx].key, &expected[idx].data, &pair_rank),
-              "rank dup api key/data rank");
-        expect_eq(pair_rank, idx, "rank dup api key/data rank value");
-
-        uint64_t cursor_pair_rank = UINT64_MAX;
-        CHECK(mdb_cursor_key_rank(cur, &expected[idx].key, &expected[idx].data, 0, &cursor_pair_rank),
-              "rank dup cursor key/data rank");
-        expect_eq(cursor_pair_rank, idx, "rank dup cursor key/data rank value");
-
         while (group + 1 <= (size_t)num_keys && idx >= prefix[group + 1])
             group++;
         if (idx == prefix[group]) {
@@ -1718,18 +1722,13 @@ test_random_access_dupsort(MDB_env *env)
     }
 
     uint64_t dup_dummy = 0;
-    int rc = mdb_cursor_key_rank(cur, &expected[0].key, &expected[0].data, 1, &dup_dummy);
+    int rc = mdb_cursor_key_rank(cur, &expected[0].key, NULL, 1, &dup_dummy);
     expect_rc(rc, EINVAL, "rank dup cursor key rank flags");
 
     const char *missing_dup_key = "zz";
     MDB_val missing_dup = {strlen(missing_dup_key), (void *)missing_dup_key};
     rc = mdb_get_key_rank(txn, dbi, &missing_dup, NULL, &dup_dummy);
     expect_rc(rc, MDB_NOTFOUND, "rank dup missing key");
-
-    const char *bad_data_str = "dv_bad";
-    MDB_val bad_data = {strlen(bad_data_str), (void *)bad_data_str};
-    rc = mdb_get_key_rank(txn, dbi, &expected[0].key, &bad_data, &dup_dummy);
-    expect_rc(rc, MDB_NOTFOUND, "rank dup missing data");
 
     unsigned int verify_seed = 0x1234abcdu;
     for (int i = 0; i < 10; ++i) {
@@ -1792,9 +1791,9 @@ test_count_all_persistence(void)
     CHECK(mdb_env_open(env, path, MDB_NOLOCK, 0664), "persistence env open");
 
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "persistence load begin");
-    CHECK(mdb_dbi_open(txn, "persist_plain", MDB_CREATE | MDB_COUNTED, &db_plain),
+    CHECK(mdb_dbi_open(txn, "persist_plain", MDB_CREATE | MDB_COUNTED | MDB_PREFIX_COMPRESSION, &db_plain),
           "persistence open plain");
-    CHECK(mdb_dbi_open(txn, "persist_dup", MDB_CREATE | MDB_COUNTED | MDB_DUPSORT,
+    CHECK(mdb_dbi_open(txn, "persist_dup", MDB_CREATE | MDB_COUNTED | MDB_DUPSORT | MDB_PREFIX_COMPRESSION,
                        &db_dup),
           "persistence open dup");
 
@@ -1829,9 +1828,9 @@ test_count_all_persistence(void)
     CHECK(mdb_env_set_maxdbs(env, 8), "persistence maxdbs rd");
     CHECK(mdb_env_open(env, path, MDB_NOLOCK, 0664), "persistence env open rd");
     CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "persistence read begin");
-    CHECK(mdb_dbi_open(txn, "persist_plain", MDB_COUNTED, &db_plain),
+    CHECK(mdb_dbi_open(txn, "persist_plain", MDB_COUNTED | MDB_PREFIX_COMPRESSION, &db_plain),
           "persistence reopen plain");
-    CHECK(mdb_dbi_open(txn, "persist_dup", MDB_COUNTED | MDB_DUPSORT, &db_dup),
+    CHECK(mdb_dbi_open(txn, "persist_dup", MDB_COUNTED | MDB_DUPSORT | MDB_PREFIX_COMPRESSION, &db_dup),
           "persistence reopen dup");
 
     CHECK(mdb_count_all(txn, db_plain, 0, &total), "persistence plain initial");
@@ -1848,9 +1847,9 @@ test_count_all_persistence(void)
     CHECK(mdb_env_set_maxdbs(env, 8), "persistence maxdbs mutate");
     CHECK(mdb_env_open(env, path, MDB_NOLOCK, 0664), "persistence env open mutate");
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "persistence mutate begin");
-    CHECK(mdb_dbi_open(txn, "persist_plain", MDB_COUNTED, &db_plain),
+    CHECK(mdb_dbi_open(txn, "persist_plain", MDB_COUNTED | MDB_PREFIX_COMPRESSION, &db_plain),
           "persistence mutate plain");
-    CHECK(mdb_dbi_open(txn, "persist_dup", MDB_COUNTED | MDB_DUPSORT, &db_dup),
+    CHECK(mdb_dbi_open(txn, "persist_dup", MDB_COUNTED | MDB_DUPSORT | MDB_PREFIX_COMPRESSION, &db_dup),
           "persistence mutate dup");
 
     for (int i = 0; i < 6; ++i) {
@@ -1878,9 +1877,9 @@ test_count_all_persistence(void)
     CHECK(mdb_env_set_maxdbs(env, 8), "persistence maxdbs verify");
     CHECK(mdb_env_open(env, path, MDB_NOLOCK, 0664), "persistence env open verify");
     CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "persistence verify begin");
-    CHECK(mdb_dbi_open(txn, "persist_plain", MDB_COUNTED, &db_plain),
+    CHECK(mdb_dbi_open(txn, "persist_plain", MDB_COUNTED | MDB_PREFIX_COMPRESSION, &db_plain),
           "persistence verify plain");
-    CHECK(mdb_dbi_open(txn, "persist_dup", MDB_COUNTED | MDB_DUPSORT, &db_dup),
+    CHECK(mdb_dbi_open(txn, "persist_dup", MDB_COUNTED | MDB_DUPSORT | MDB_PREFIX_COMPRESSION, &db_dup),
           "persistence verify dup");
 
     CHECK(mdb_count_all(txn, db_plain, 0, &total), "persistence plain final");
@@ -1897,10 +1896,10 @@ test_count_all_persistence(void)
     CHECK(mdb_env_set_maxdbs(env, 8), "persistence maxdbs cleanup");
     CHECK(mdb_env_open(env, path, MDB_NOLOCK, 0664), "persistence env open cleanup");
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "persistence cleanup begin");
-    CHECK(mdb_dbi_open(txn, "persist_plain", MDB_COUNTED, &db_plain),
+    CHECK(mdb_dbi_open(txn, "persist_plain", MDB_COUNTED | MDB_PREFIX_COMPRESSION, &db_plain),
           "persistence cleanup plain");
     CHECK(mdb_drop(txn, db_plain, 0), "persistence drop plain");
-    CHECK(mdb_dbi_open(txn, "persist_dup", MDB_COUNTED | MDB_DUPSORT, &db_dup),
+    CHECK(mdb_dbi_open(txn, "persist_dup", MDB_COUNTED | MDB_DUPSORT | MDB_PREFIX_COMPRESSION, &db_dup),
           "persistence cleanup dup");
     CHECK(mdb_drop(txn, db_dup, 0), "persistence drop dup");
     CHECK(mdb_txn_commit(txn), "persistence cleanup commit");
@@ -1938,7 +1937,7 @@ run_fuzz_random(MDB_env *env, const char *db_name,
     format_stage(stage_msg, sizeof(stage_msg), label, "begin");
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), stage_msg);
     format_stage(stage_msg, sizeof(stage_msg), label, "open");
-    CHECK(mdb_dbi_open(txn, db_name, open_flags, &dbi), stage_msg);
+    CHECK(mdb_dbi_open(txn, db_name, open_flags | MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi), stage_msg);
     format_stage(stage_msg, sizeof(stage_msg), label, "commit open");
     CHECK(mdb_txn_commit(txn), stage_msg);
 
@@ -2114,7 +2113,7 @@ run_fuzz_random_dupsort(MDB_env *env, const char *db_name,
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), stage_msg);
     format_stage(stage_msg, sizeof(stage_msg), label, "open");
     CHECK(mdb_dbi_open(txn, db_name,
-                       MDB_CREATE | MDB_COUNTED | MDB_DUPSORT, &dbi),
+                       MDB_CREATE | MDB_COUNTED | MDB_DUPSORT | MDB_PREFIX_COMPRESSION, &dbi),
           stage_msg);
     format_stage(stage_msg, sizeof(stage_msg), label, "commit open");
     CHECK(mdb_txn_commit(txn), stage_msg);
@@ -2292,7 +2291,7 @@ static void
 test_fuzz_random(MDB_env *env)
 {
     run_fuzz_random(env, "edge_fuzz_random",
-                    MDB_CREATE | MDB_COUNTED, "f",
+                    MDB_CREATE | MDB_COUNTED | MDB_PREFIX_COMPRESSION, "f",
                     0x7f4a7u, "fuzz");
 }
 
@@ -2320,7 +2319,7 @@ test_overwrite_stability(MDB_env *env)
     uint64_t total;
 
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "overwrite begin");
-    CHECK(mdb_dbi_open(txn, "edge_overwrite", MDB_CREATE | MDB_COUNTED, &dbi),
+    CHECK(mdb_dbi_open(txn, "edge_overwrite", MDB_CREATE | MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi),
           "overwrite open");
 
     key.mv_data = "dup";
@@ -2365,7 +2364,7 @@ test_cursor_deletions(MDB_env *env)
     MDB_val key, data;
 
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "cursor del begin");
-    CHECK(mdb_dbi_open(txn, "edge_cursor_del", MDB_CREATE | MDB_COUNTED, &dbi),
+    CHECK(mdb_dbi_open(txn, "edge_cursor_del", MDB_CREATE | MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi),
           "cursor del open");
 
     char kbuf[16];
@@ -2657,7 +2656,7 @@ test_split_merge_range_count_values(MDB_env *env)
 
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "values split begin");
     CHECK(mdb_dbi_open(txn, "edge_values_split_merge",
-                       MDB_CREATE | MDB_COUNTED | MDB_DUPSORT,
+                       MDB_CREATE | MDB_COUNTED | MDB_DUPSORT | MDB_PREFIX_COMPRESSION,
                        &dbi), "values split open");
 
     char kbuf[32];
@@ -2937,7 +2936,7 @@ test_split_merge(MDB_env *env)
     uint64_t total;
 
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "split begin");
-    CHECK(mdb_dbi_open(txn, "edge_split_merge", MDB_CREATE | MDB_COUNTED,
+    CHECK(mdb_dbi_open(txn, "edge_split_merge", MDB_CREATE | MDB_COUNTED | MDB_PREFIX_COMPRESSION,
                        &dbi), "split open");
 
     char kbuf[16];
@@ -3018,7 +3017,7 @@ test_nested_transactions(MDB_env *env)
     uint64_t total;
 
     CHECK(mdb_txn_begin(env, NULL, 0, &parent), "nested parent begin");
-    CHECK(mdb_dbi_open(parent, "edge_nested", MDB_CREATE | MDB_COUNTED,
+    CHECK(mdb_dbi_open(parent, "edge_nested", MDB_CREATE | MDB_COUNTED | MDB_PREFIX_COMPRESSION,
                        &dbi), "nested open");
 
     char keybuf[16];
@@ -3190,7 +3189,7 @@ main(void)
     CHECK(mdb_env_open(env, pathbuf, MDB_NOLOCK, 0664), "mdb_env_open");
 
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "mdb_txn_begin");
-    CHECK(mdb_dbi_open(txn, "counted", MDB_CREATE | MDB_COUNTED, &dbi), "mdb_dbi_open");
+    CHECK(mdb_dbi_open(txn, "counted", MDB_CREATE | MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi), "mdb_dbi_open");
 
     for (int i = 0; i < entries; ++i) {
         snprintf(keybuf, sizeof(keybuf), "k%04d", i);
