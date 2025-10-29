@@ -121,15 +121,21 @@ reset_dir(const char *dir)
 }
 
 static MDB_env *
-create_env(const char *dir)
+create_env_with_mapsize(const char *dir, size_t mapsize)
 {
 	MDB_env *env = NULL;
 	reset_dir(dir);
 	CHECK_CALL(mdb_env_create(&env));
 	CHECK_CALL(mdb_env_set_maxdbs(env, 4));
-	CHECK_CALL(mdb_env_set_mapsize(env, 64UL * 1024 * 1024));
+	CHECK_CALL(mdb_env_set_mapsize(env, mapsize));
 	CHECK_CALL(mdb_env_open(env, dir, MDB_NOLOCK, 0664));
 	return env;
+}
+
+static MDB_env *
+create_env(const char *dir)
+{
+	return create_env_with_mapsize(dir, 64UL * 1024 * 1024);
 }
 
 
@@ -208,6 +214,74 @@ test_edge_cases(void)
 	mdb_cursor_close(cur);
 	mdb_txn_abort(txn);
 
+	mdb_env_close(env);
+}
+
+static void
+test_prefix_map_full_error(void)
+{
+	static const char *dir = "testdb_prefix_map_full";
+	enum { MAP_SIZE = 128 * 1024 };
+	MDB_env *env = create_env_with_mapsize(dir, MAP_SIZE);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+	unsigned char value_buf[1024];
+	size_t inserted = 0;
+	int rc = MDB_SUCCESS;
+	const size_t max_inserts = 100000;
+
+	memset(value_buf, 0xAB, sizeof(value_buf));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL,
+	    MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_COUNTED, &dbi));
+
+	for (;;) {
+		char keybuf[64];
+		int written = snprintf(keybuf, sizeof(keybuf),
+		    "prefix-map-full-%05zu", inserted);
+		if (written < 0 || (size_t)written >= sizeof(keybuf)) {
+			fprintf(stderr,
+			    "map full test: failed to generate key %zu\n",
+			    inserted);
+			rc = EINVAL;
+			break;
+		}
+		MDB_val key = { (size_t)written, keybuf };
+		MDB_val data = { sizeof(value_buf), value_buf };
+		rc = mdb_put(txn, dbi, &key, &data, 0);
+		if (rc == MDB_SUCCESS) {
+			inserted++;
+			if (inserted > max_inserts) {
+				fprintf(stderr,
+				    "map full test: exceeded %zu inserts without hitting MDB_MAP_FULL\n",
+				    max_inserts);
+				mdb_txn_abort(txn);
+				mdb_env_close(env);
+				exit(EXIT_FAILURE);
+			}
+			continue;
+		}
+		break;
+	}
+
+	if (rc != MDB_MAP_FULL) {
+		fprintf(stderr,
+		    "map full test: expected MDB_MAP_FULL, got %s after %zu inserts\n",
+		    mdb_strerror(rc), inserted);
+		mdb_txn_abort(txn);
+		mdb_env_close(env);
+		exit(EXIT_FAILURE);
+	}
+	if (inserted == 0) {
+		fprintf(stderr,
+		    "map full test: mapsize too small to store any entries\n");
+		mdb_txn_abort(txn);
+		mdb_env_close(env);
+		exit(EXIT_FAILURE);
+	}
+
+	mdb_txn_abort(txn);
 	mdb_env_close(env);
 }
 
@@ -2976,6 +3050,7 @@ main(void)
 {
   test_config_validation();
   test_edge_cases();
+  test_prefix_map_full_error();
   test_range_scans();
   test_threshold_behavior();
   test_mixed_pattern_and_unicode();
