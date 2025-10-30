@@ -1284,8 +1284,8 @@ test_range_count_values_raw(MDB_env *env)
 static void
 test_range_count_values_many_env(void)
 {
-    const char *dump_path = "test-many.txt";
-    const char *db_name = "datalevin/ave";
+	const char *dump_path = "test-many.txt";
+	const char *db_name = "datalevin/ave";
     const char *low_hex = "00000005FA000001";
     const char *high_prefix = "00000005FA";
     unsigned char lowbuf[64];
@@ -1337,15 +1337,86 @@ test_range_count_values_many_env(void)
         mdb_txn_abort(txn);
         mdb_dbi_close(env, dbi);
         mdb_env_close(env);
-        cleanup_env_dir(env_dir);
-    }
+		cleanup_env_dir(env_dir);
+	}
+}
+
+static void
+test_range_count_values_big_txn_env(void)
+{
+	const char *dump_path = "big-txn.txt";
+	const char *db_name = "datalevin/ave";
+	const char *low_hex = "00000003000001";
+	const char *high_prefix = "00000003";
+	unsigned char lowbuf[64];
+	unsigned char highbuf[1024];
+	char high_hex[1024];
+	MDB_val low, high;
+	char env_dir[PATH_MAX];
+	char loop_msg[128];
+
+	size_t prefix_len = strlen(high_prefix);
+	const size_t fill_len = 960;
+
+	memcpy(high_hex, high_prefix, prefix_len);
+	memset(high_hex + prefix_len, 'F', fill_len);
+	memcpy(high_hex + prefix_len + fill_len, "0001", 5);
+
+	size_t low_len = hex_to_bytes(low_hex, lowbuf, sizeof(lowbuf));
+	low.mv_size = low_len;
+	low.mv_data = lowbuf;
+	size_t high_len = hex_to_bytes(high_hex, highbuf, sizeof(highbuf));
+	high.mv_size = high_len;
+	high.mv_data = highbuf;
+
+	for (int loop = 0; loop < 10; ++loop) {
+		MDB_env *env = NULL;
+		MDB_txn *txn = NULL;
+		MDB_dbi dbi;
+		uint64_t counted = 0;
+		const uint64_t expected = 320;
+		uint64_t naive = 0;
+		unsigned int seed = 0x915f2dbeu ^
+			((unsigned int)(loop + 1) * 0x4bf60a3du);
+
+		env = load_env_from_dump(dump_path, db_name, env_dir,
+			sizeof(env_dir), MDB_PREFIX_COMPRESSION, seed);
+
+		CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn),
+			"range big txn begin");
+		CHECK(mdb_dbi_open(txn, db_name, 0, &dbi),
+			"range big txn dbi open");
+		CHECK(mdb_set_compare(txn, dbi, dtlv_cmp_memn),
+			"range big txn set compare");
+		CHECK(mdb_set_dupsort(txn, dbi, dtlv_cmp_memn),
+			"range big txn set dupsort");
+
+		naive = naive_count_values(txn, dbi, &low, &high, 1, 1,
+			dtlv_cmp_memn);
+		snprintf(loop_msg, sizeof(loop_msg),
+			"range big txn loop %d naive match", loop);
+		expect_eq(naive, expected, loop_msg);
+
+		CHECK(mdb_range_count_values(txn, dbi, &low, &high,
+			MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
+			&counted),
+			"range big txn mdb_range_count_values");
+		snprintf(loop_msg, sizeof(loop_msg),
+			"range big txn loop %d counted match", loop);
+		expect_eq(counted, expected, loop_msg);
+
+		mdb_txn_abort(txn);
+		mdb_dbi_close(env, dbi);
+		mdb_env_close(env);
+		cleanup_env_dir(env_dir);
+	}
 }
 
 static void
 test_count_all_plain(MDB_env *env)
 {
-    MDB_txn *txn;
-    MDB_dbi dbi;
+	MDB_txn *txn;
+	MDB_dbi dbi;
     MDB_val key, data;
     char keybuf[16];
     char valbuf[16];
@@ -3471,14 +3542,14 @@ main(void)
     test_extreme_keys(env);
     test_range_outside_bounds(env);
     test_custom_comparator(env);
-    test_range_count_values(env);
-    test_range_count_values_raw(env);
-    test_range_count_values_many_env();
-    test_count_all_plain(env);
-    test_count_all_dupsort(env);
-    test_count_all_persistence();
-    test_random_access_plain(env);
-    test_random_access_dupsort(env);
+	test_range_count_values(env);
+	test_range_count_values_raw(env);
+	test_range_count_values_many_env();
+	test_count_all_plain(env);
+	test_count_all_dupsort(env);
+	test_count_all_persistence();
+	test_random_access_plain(env);
+	test_random_access_dupsort(env);
     test_overwrite_stability(env);
     test_cursor_deletions(env);
     test_split_merge_range_count_values(env);
@@ -3489,6 +3560,7 @@ main(void)
     test_fuzz_random_prefix(env);
     test_fuzz_random_dupsort(env);
     test_concurrent_readers();
+	test_range_count_values_big_txn_env();
 
     mdb_env_close(env);
     return EXIT_SUCCESS;

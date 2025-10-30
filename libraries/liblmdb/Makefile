@@ -24,8 +24,8 @@ W	= -W -Wall -Wno-unused-parameter -Wbad-function-cast -Wuninitialized
 THREADS = -pthread
 OPT = -O2 -g
 CFLAGS	= $(THREADS) $(OPT) $(W) $(XCFLAGS)
-LDLIBS	= 
-SOLIBS	= 
+LDLIBS	=
+SOLIBS	=
 SOEXT	= .so
 prefix	= /usr/local
 exec_prefix = $(prefix)
@@ -64,10 +64,10 @@ test:	all
 	./mtest3
 	./mtest4
 	./mtest5
-	rm -rf testdb_count*
-	./mtest_count
 	rm -rf testdb_prefix*
 	./mtest_prefix
+	rm -rf testdb_count*
+	./mtest_count
 
 liblmdb.a:	mdb.o midl.o
 	$(AR) rs $@ mdb.o midl.o
