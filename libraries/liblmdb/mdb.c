@@ -3334,8 +3334,8 @@ mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp,
 			}
 			total_key_bytes += entries[i].key.mv_size;
 		}
-		total_key_bytes += insert_entry->key.mv_size;
 	}
+	total_key_bytes += insert_entry->key.mv_size;
 
 	rc = mdb_prefix_ensure_keybuf(txn, total_key_bytes, &key_storage);
 	if (rc != MDB_SUCCESS)
