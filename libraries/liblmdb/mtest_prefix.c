@@ -120,6 +120,17 @@ reset_dir(const char *dir)
 	unlink(path);
 }
 
+static void
+cleanup_env_dir(const char *dir)
+{
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/data.mdb", dir);
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/lock.mdb", dir);
+	unlink(path);
+	rmdir(dir);
+}
+
 static MDB_env *
 create_env_with_mapsize(const char *dir, size_t mapsize)
 {
@@ -137,7 +148,6 @@ create_env(const char *dir)
 {
 	return create_env_with_mapsize(dir, 64UL * 1024 * 1024);
 }
-
 
 static void
 test_config_validation(void)
@@ -215,6 +225,7 @@ test_edge_cases(void)
 	mdb_txn_abort(txn);
 
 	mdb_env_close(env);
+	cleanup_env_dir(dir);
 }
 
 static void
@@ -283,6 +294,7 @@ test_prefix_map_full_error(void)
 
 	mdb_txn_abort(txn);
 	mdb_env_close(env);
+	cleanup_env_dir(dir);
 }
 
 static void
@@ -377,6 +389,7 @@ test_range_scans(void)
 	mdb_cursor_close(cur);
 	mdb_txn_abort(txn);
 	mdb_env_close(env);
+	cleanup_env_dir(dir);
 }
 
 
@@ -423,6 +436,7 @@ test_threshold_behavior(void)
 
 	mdb_txn_abort(txn);
 	mdb_env_close(env);
+	cleanup_env_dir(dir);
 }
 
 
@@ -523,6 +537,7 @@ test_mixed_pattern_and_unicode(void)
 	mdb_cursor_close(cur);
 	mdb_txn_abort(txn);
 	mdb_env_close(env);
+	cleanup_env_dir(dir);
 }
 
 
@@ -597,6 +612,7 @@ test_cursor_buffer_sharing(void)
 	mdb_cursor_close(primary);
 	mdb_txn_abort(rtxn2);
 	mdb_env_close(env);
+	cleanup_env_dir(dir);
 }
 
 static void
@@ -660,6 +676,7 @@ test_prefix_dupsort_transitions(void)
 		mdb_txn_abort(txn);
 
 	mdb_env_close(env);
+	cleanup_env_dir(dir);
 }
 
 static void
@@ -846,6 +863,7 @@ test_prefix_dupsort_cursor_walk(void)
 	mdb_cursor_close(cur);
 	mdb_txn_abort(txn);
 	mdb_env_close(env);
+	cleanup_env_dir(dir);
 }
 
 static void
@@ -951,6 +969,7 @@ test_prefix_dupsort_get_both_range(void)
 	mdb_cursor_close(cur);
 	mdb_txn_abort(txn);
 	mdb_env_close(env);
+	cleanup_env_dir(dir);
 }
 
 static void
@@ -1015,6 +1034,7 @@ test_prefix_leaf_splits(void)
 	mdb_cursor_close(cur);
 	mdb_txn_abort(txn);
 	mdb_env_close(env);
+	cleanup_env_dir(dir);
 }
 
 static void
@@ -1069,6 +1089,7 @@ test_prefix_alternating_prefixes(void)
 	mdb_cursor_close(cur);
 	mdb_txn_abort(txn);
 	mdb_env_close(env);
+	cleanup_env_dir(dir);
 }
 
 static void
@@ -1132,6 +1153,7 @@ test_prefix_update_reinsert(void)
 	}
 	mdb_txn_abort(txn);
 	mdb_env_close(env);
+	cleanup_env_dir(dir);
 }
 
 static void
@@ -1215,6 +1237,7 @@ test_prefix_dupsort_smoke(void)
 	mdb_cursor_close(cur);
 	mdb_txn_abort(txn);
 	mdb_env_close(env);
+	cleanup_env_dir(dir);
 }
 
 static void
@@ -1389,6 +1412,7 @@ test_prefix_dupsort_corner_cases(void)
 	mdb_cursor_close(cur);
 	mdb_txn_abort(txn);
 	mdb_env_close(env);
+	cleanup_env_dir(dir);
 }
 
 static void
@@ -1510,6 +1534,7 @@ test_prefix_dupsort_inline_basic_ops(void)
 	    dup_sequence, initial_dup_count);
 
 	mdb_env_close(env);
+	cleanup_env_dir(dir);
 }
 
 static void
@@ -1670,6 +1695,7 @@ test_prefix_dupsort_inline_promote(void)
 	free(large_dup1);
 	free(large_dup2);
 	mdb_env_close(env);
+	cleanup_env_dir(dir);
 }
 
 static void
@@ -1777,7 +1803,8 @@ test_prefix_dupsort_trunk_key_shift_no_value_change(void)
 	assert_dup_sequence(env, dbi, key,
 	    expected_after, ARRAY_SIZE(expected_after));
 
-mdb_env_close(env);
+	mdb_env_close(env);
+	cleanup_env_dir(dir);
 }
 
 static void
@@ -1820,6 +1847,7 @@ test_prefix_dupsort_inline_cmp_negative(void)
 	    expected, ARRAY_SIZE(expected));
 
 	mdb_env_close(env);
+	cleanup_env_dir(dir);
 }
 
 static void
@@ -1871,6 +1899,7 @@ test_prefix_dupsort_trunk_swap_inline(void)
 	    expected_after_swap, ARRAY_SIZE(expected_after_swap));
 
 	mdb_env_close(env);
+	cleanup_env_dir(dir);
 }
 
 static void
@@ -1958,6 +1987,7 @@ test_prefix_dupsort_trunk_swap_promote(void)
 	free((void *)expected_after_swap[INITIAL_COUNT + 1]);
 
 	mdb_env_close(env);
+	cleanup_env_dir(dir);
 }
 
 static void
@@ -2027,6 +2057,7 @@ test_prefix_dupsort_fuzz(void)
 	}
 
 	mdb_env_close(env);
+	cleanup_env_dir(dir);
 }
 
 static uint64_t
@@ -2787,6 +2818,7 @@ test_prefix_fuzz(void)
 	}
 
 	mdb_env_close(env);
+	cleanup_env_dir(dir);
 }
 
 struct prefix_concurrent_ctx {
@@ -2979,6 +3011,7 @@ test_prefix_concurrent_reads(void)
 
 	mdb_dbi_close(env, dbi);
 	mdb_env_close(env);
+	cleanup_env_dir(dir);
 }
 
 static void
@@ -3043,6 +3076,7 @@ test_nested_txn_rollback(void)
 	}
 	mdb_txn_abort(parent);
 	mdb_env_close(env);
+	cleanup_env_dir(dir);
 }
 
 int

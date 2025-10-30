@@ -111,13 +111,104 @@ dup_hex_to_bytes(const char *hex, size_t *out_len)
     return buf;
 }
 
+static char *
+dup_bytes_to_hex(const unsigned char *bytes, size_t len)
+{
+    size_t hex_len = len * 2;
+    char *hex = malloc(hex_len + 1);
+    if (!hex)
+        fatal_errno("malloc hex print buffer");
+    static const char digits[] = "0123456789ABCDEF";
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char byte = bytes ? bytes[i] : 0;
+        hex[2 * i] = digits[byte >> 4];
+        hex[2 * i + 1] = digits[byte & 0x0F];
+    }
+    hex[hex_len] = '\0';
+    return hex;
+}
+
+struct dump_insert_debug_state {
+    int enabled;
+    size_t step;
+    unsigned char *prev;
+    size_t prev_len;
+    unsigned char *curr;
+    size_t curr_len;
+};
+
+static struct dump_insert_debug_state dump_insert_debug = {0};
+
+static void
+dump_insert_debug_begin(void)
+{
+    free(dump_insert_debug.prev);
+    free(dump_insert_debug.curr);
+    dump_insert_debug.prev = NULL;
+    dump_insert_debug.curr = NULL;
+    dump_insert_debug.prev_len = 0;
+    dump_insert_debug.curr_len = 0;
+    dump_insert_debug.step = 0;
+    dump_insert_debug.enabled = 1;
+}
+
+static void
+dump_insert_debug_record(const MDB_val *value)
+{
+    if (!dump_insert_debug.enabled)
+        return;
+    unsigned char *copy = NULL;
+    if (value->mv_size) {
+        copy = malloc(value->mv_size);
+        if (!copy)
+            fatal_errno("malloc debug value");
+        memcpy(copy, value->mv_data, value->mv_size);
+    }
+    free(dump_insert_debug.prev);
+    dump_insert_debug.prev = dump_insert_debug.curr;
+    dump_insert_debug.prev_len = dump_insert_debug.curr_len;
+    dump_insert_debug.curr = copy;
+    dump_insert_debug.curr_len = value->mv_size;
+    dump_insert_debug.step += 1;
+}
+
+static void
+dump_insert_debug_log_failure(int loop)
+{
+    char *curr_hex = dup_bytes_to_hex(dump_insert_debug.curr,
+                                      dump_insert_debug.curr_len);
+    char *prev_hex = dup_bytes_to_hex(dump_insert_debug.prev,
+                                      dump_insert_debug.prev_len);
+    fprintf(stderr,
+            "range big txn loop %d insert step %zu current value (hex): %s\n",
+            loop, dump_insert_debug.step, curr_hex);
+    fprintf(stderr,
+            "range big txn loop %d previous value (hex): %s\n",
+            loop, prev_hex);
+    free(curr_hex);
+    free(prev_hex);
+}
+
+static void
+dump_insert_debug_end(void)
+{
+    free(dump_insert_debug.prev);
+    free(dump_insert_debug.curr);
+    dump_insert_debug.prev = NULL;
+    dump_insert_debug.curr = NULL;
+    dump_insert_debug.prev_len = 0;
+    dump_insert_debug.curr_len = 0;
+    dump_insert_debug.step = 0;
+    dump_insert_debug.enabled = 0;
+}
+
 static MDB_env *
 load_env_from_dump(const char *dump_path, const char *db_name,
                    char *env_dir_buf, size_t env_dir_len,
                    unsigned int extra_db_flags,
                    unsigned int shuffle_seed)
 {
-    char template[] = "test-many-tmpXXXXXX";
+    char template[] = "test-loaded-tmpXXXXXX";
     size_t template_len = strlen(template);
     if (env_dir_len < template_len + 1) {
         fprintf(stderr, "env path buffer too small\n");
@@ -235,8 +326,10 @@ load_env_from_dump(const char *dump_path, const char *db_name,
             entries[i - 1] = entries[j];
             entries[j] = tmp;
         }
-        for (size_t i = 0; i < entry_count; ++i)
+        for (size_t i = 0; i < entry_count; ++i) {
+            dump_insert_debug_record(&entries[i].data);
             CHECK(mdb_put(txn, dbi, &entries[i].key, &entries[i].data, 0), "dump load put");
+        }
     }
 
     if (txn)
@@ -738,6 +831,7 @@ test_concurrent_readers(void)
     mdb_env_close(env);
     free(ctx.present);
 
+    cleanup_env_dir(dir);
 }
 
 static void
@@ -1337,79 +1431,85 @@ test_range_count_values_many_env(void)
         mdb_txn_abort(txn);
         mdb_dbi_close(env, dbi);
         mdb_env_close(env);
-		cleanup_env_dir(env_dir);
-	}
+        cleanup_env_dir(env_dir);
+    }
 }
 
 static void
 test_range_count_values_big_txn_env(void)
 {
-	const char *dump_path = "big-txn.txt";
-	const char *db_name = "datalevin/ave";
-	const char *low_hex = "00000003000001";
-	const char *high_prefix = "00000003";
-	unsigned char lowbuf[64];
-	unsigned char highbuf[1024];
-	char high_hex[1024];
-	MDB_val low, high;
-	char env_dir[PATH_MAX];
-	char loop_msg[128];
+    const char *dump_path = "big-txn.txt";
+    const char *db_name = "datalevin/ave";
+    const char *low_hex = "00000003000001";
+    const char *high_prefix = "00000003";
+    unsigned char lowbuf[64];
+    unsigned char highbuf[1024];
+    char high_hex[1024];
+    MDB_val low, high;
+    char env_dir[PATH_MAX];
+    char loop_msg[128];
 
-	size_t prefix_len = strlen(high_prefix);
-	const size_t fill_len = 960;
+    size_t prefix_len = strlen(high_prefix);
+    const size_t fill_len = 960;
 
-	memcpy(high_hex, high_prefix, prefix_len);
-	memset(high_hex + prefix_len, 'F', fill_len);
-	memcpy(high_hex + prefix_len + fill_len, "0001", 5);
+    memcpy(high_hex, high_prefix, prefix_len);
+    memset(high_hex + prefix_len, 'F', fill_len);
+    memcpy(high_hex + prefix_len + fill_len, "0001", 5);
 
-	size_t low_len = hex_to_bytes(low_hex, lowbuf, sizeof(lowbuf));
-	low.mv_size = low_len;
-	low.mv_data = lowbuf;
-	size_t high_len = hex_to_bytes(high_hex, highbuf, sizeof(highbuf));
-	high.mv_size = high_len;
-	high.mv_data = highbuf;
+    size_t low_len = hex_to_bytes(low_hex, lowbuf, sizeof(lowbuf));
+    low.mv_size = low_len;
+    low.mv_data = lowbuf;
+    size_t high_len = hex_to_bytes(high_hex, highbuf, sizeof(highbuf));
+    high.mv_size = high_len;
+    high.mv_data = highbuf;
 
-	for (int loop = 0; loop < 10; ++loop) {
-		MDB_env *env = NULL;
-		MDB_txn *txn = NULL;
-		MDB_dbi dbi;
-		uint64_t counted = 0;
-		const uint64_t expected = 320;
-		uint64_t naive = 0;
-		unsigned int seed = 0x915f2dbeu ^
-			((unsigned int)(loop + 1) * 0x4bf60a3du);
+    for (int loop = 0; loop < 10; ++loop) {
+        MDB_env *env = NULL;
+        MDB_txn *txn = NULL;
+        MDB_dbi dbi;
+        uint64_t counted = 0;
+        const uint64_t expected = 320;
+        uint64_t naive = 0;
+        unsigned int seed = 0x915f2dbeu ^
+            ((unsigned int)(loop + 1) * 0x4bf60a3du);
 
-		env = load_env_from_dump(dump_path, db_name, env_dir,
-			sizeof(env_dir), MDB_PREFIX_COMPRESSION, seed);
+        dump_insert_debug_begin();
+        env = load_env_from_dump(dump_path, db_name, env_dir,
+                                 sizeof(env_dir), MDB_PREFIX_COMPRESSION, seed);
 
-		CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn),
-			"range big txn begin");
-		CHECK(mdb_dbi_open(txn, db_name, 0, &dbi),
-			"range big txn dbi open");
-		CHECK(mdb_set_compare(txn, dbi, dtlv_cmp_memn),
-			"range big txn set compare");
-		CHECK(mdb_set_dupsort(txn, dbi, dtlv_cmp_memn),
-			"range big txn set dupsort");
+        CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn),
+              "range big txn begin");
+        CHECK(mdb_dbi_open(txn, db_name, 0, &dbi),
+              "range big txn dbi open");
+        CHECK(mdb_set_compare(txn, dbi, dtlv_cmp_memn),
+              "range big txn set compare");
+        CHECK(mdb_set_dupsort(txn, dbi, dtlv_cmp_memn),
+              "range big txn set dupsort");
 
-		naive = naive_count_values(txn, dbi, &low, &high, 1, 1,
-			dtlv_cmp_memn);
-		snprintf(loop_msg, sizeof(loop_msg),
-			"range big txn loop %d naive match", loop);
-		expect_eq(naive, expected, loop_msg);
+        naive = naive_count_values(txn, dbi, &low, &high, 1, 1,
+                                   dtlv_cmp_memn);
+        snprintf(loop_msg, sizeof(loop_msg),
+                 "range big txn loop %d naive match", loop);
+        if (naive != expected)
+            dump_insert_debug_log_failure(loop);
+        expect_eq(naive, expected, loop_msg);
 
-		CHECK(mdb_range_count_values(txn, dbi, &low, &high,
-			MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
-			&counted),
-			"range big txn mdb_range_count_values");
-		snprintf(loop_msg, sizeof(loop_msg),
-			"range big txn loop %d counted match", loop);
-		expect_eq(counted, expected, loop_msg);
+        CHECK(mdb_range_count_values(txn, dbi, &low, &high,
+                                     MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL,
+                                     &counted),
+              "range big txn mdb_range_count_values");
+        snprintf(loop_msg, sizeof(loop_msg),
+                 "range big txn loop %d counted match", loop);
+        if (counted != expected)
+            dump_insert_debug_log_failure(loop);
+        expect_eq(counted, expected, loop_msg);
 
-		mdb_txn_abort(txn);
-		mdb_dbi_close(env, dbi);
-		mdb_env_close(env);
-		cleanup_env_dir(env_dir);
-	}
+        mdb_txn_abort(txn);
+        mdb_dbi_close(env, dbi);
+        mdb_env_close(env);
+        cleanup_env_dir(env_dir);
+        dump_insert_debug_end();
+    }
 }
 
 static void
@@ -3542,14 +3642,14 @@ main(void)
     test_extreme_keys(env);
     test_range_outside_bounds(env);
     test_custom_comparator(env);
-	test_range_count_values(env);
-	test_range_count_values_raw(env);
-	test_range_count_values_many_env();
-	test_count_all_plain(env);
-	test_count_all_dupsort(env);
-	test_count_all_persistence();
-	test_random_access_plain(env);
-	test_random_access_dupsort(env);
+    test_range_count_values(env);
+    test_range_count_values_raw(env);
+    test_range_count_values_many_env();
+    test_count_all_plain(env);
+    test_count_all_dupsort(env);
+    test_count_all_persistence();
+    test_random_access_plain(env);
+    test_random_access_dupsort(env);
     test_overwrite_stability(env);
     test_cursor_deletions(env);
     test_split_merge_range_count_values(env);
@@ -3560,8 +3660,9 @@ main(void)
     test_fuzz_random_prefix(env);
     test_fuzz_random_dupsort(env);
     test_concurrent_readers();
-	test_range_count_values_big_txn_env();
+    test_range_count_values_big_txn_env();
 
     mdb_env_close(env);
+    cleanup_env_dir(pathbuf);
     return EXIT_SUCCESS;
 }
