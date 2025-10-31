@@ -3258,6 +3258,7 @@ mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp,
 
 	MDB_prefix_rebuild_entry *insert_entry = &entries[insert];
 	insert_entry->flags = node_flags;
+
 	insert_entry->data_size = new_data ? new_data->mv_size : 0;
 	if (F_ISSET(new_flags, F_BIGDATA)) {
 		if (!ofp)
@@ -3271,6 +3272,7 @@ mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp,
 		else
 			insert_entry->data_ptr = new_data ? new_data->mv_data : NULL;
 	}
+
 	insert_entry->key.mv_size = new_key ? new_key->mv_size : 0;
 	insert_entry->encoded_ksize = 0;
 	insert_entry->encoded_key = NULL;
@@ -11477,22 +11479,6 @@ mdb_node_add(MDB_cursor *mc, indx_t indx,
 			memcpy(old_trunk_buf, NODEKEY(mp, old), old_trunk.mv_size);
 			if (old_trunk.mv_size > 0) {
 				int trunk_decoded = 0;
-				MDB_prefix_scratch *scratch = &mc->mc_txn->mt_prefix;
-				MDB_prefix_measure_cache *measure_cache =
-				    scratch ? &scratch->measure_cache : NULL;
-
-				if (measure_cache && measure_cache->valid &&
-				    measure_cache->cursor == mc &&
-				    measure_cache->pgno == mp->mp_pgno &&
-				    measure_cache->count > 0 &&
-				    measure_cache->entries &&
-				    measure_cache->entries[0].key.mv_data &&
-				    measure_cache->entries[0].key.mv_size <= MDB_KEYBUF_MAX) {
-					memcpy(old_trunk_buf, measure_cache->entries[0].key.mv_data,
-					    measure_cache->entries[0].key.mv_size);
-					old_trunk.mv_size = measure_cache->entries[0].key.mv_size;
-					trunk_decoded = 1;
-				}
 
 				if (!trunk_decoded && (mc->mc_flags & C_SUB) &&
 				    mc->mc_top > 0 && mc->mc_pg[mc->mc_top - 1]) {
@@ -13268,6 +13254,9 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 	DKBUF;
 
 	mp = mc->mc_pg[mc->mc_top];
+	if (mc->mc_txn) {
+		mc->mc_txn->mt_prefix.measure_cache.valid = 0;
+	}
 	newindx = mc->mc_ki[mc->mc_top];
 	nkeys = NUMKEYS(mp);
 	if (mc->mc_db->md_flags & MDB_COUNTED)
