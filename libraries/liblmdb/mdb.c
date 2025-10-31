@@ -11417,6 +11417,7 @@ mdb_node_add(MDB_cursor *mc, indx_t indx,
 	MDB_val	trunk = {0, NULL};
 	size_t	key_bytes = 0;
 	unsigned char old_trunk_buf[MDB_KEYBUF_MAX];
+	unsigned char decoded_trunk_buf[MDB_KEYBUF_MAX];
 	MDB_val	old_trunk = {0, NULL};
 	int	need_reencode = 0;
 	int	prefix_enabled = (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) != 0;
@@ -11474,6 +11475,67 @@ mdb_node_add(MDB_cursor *mc, indx_t indx,
 			old_trunk.mv_size = old->mn_ksize;
 			old_trunk.mv_data = old_trunk_buf;
 			memcpy(old_trunk_buf, NODEKEY(mp, old), old_trunk.mv_size);
+			if (old_trunk.mv_size > 0) {
+				int trunk_decoded = 0;
+				MDB_prefix_scratch *scratch = &mc->mc_txn->mt_prefix;
+				MDB_prefix_measure_cache *measure_cache =
+				    scratch ? &scratch->measure_cache : NULL;
+
+				if (measure_cache && measure_cache->valid &&
+				    measure_cache->cursor == mc &&
+				    measure_cache->pgno == mp->mp_pgno &&
+				    measure_cache->count > 0 &&
+				    measure_cache->entries &&
+				    measure_cache->entries[0].key.mv_data &&
+				    measure_cache->entries[0].key.mv_size <= MDB_KEYBUF_MAX) {
+					memcpy(old_trunk_buf, measure_cache->entries[0].key.mv_data,
+					    measure_cache->entries[0].key.mv_size);
+					old_trunk.mv_size = measure_cache->entries[0].key.mv_size;
+					trunk_decoded = 1;
+				}
+
+				if (!trunk_decoded && (mc->mc_flags & C_SUB) &&
+				    mc->mc_top > 0 && mc->mc_pg[mc->mc_top - 1]) {
+					MDB_page *parent = mc->mc_pg[mc->mc_top - 1];
+					indx_t parent_idx = mc->mc_ki[mc->mc_top - 1];
+					if (IS_LEAF(parent) && parent_idx < NUMKEYS(parent)) {
+						MDB_val parent_key = {0, NULL};
+						int pkrc = mdb_cursor_read_key_at(mc, parent, parent_idx,
+						    &parent_key);
+						if (pkrc == MDB_SUCCESS && parent_key.mv_data &&
+						    parent_key.mv_size <= MDB_KEYBUF_MAX) {
+							memcpy(old_trunk_buf, parent_key.mv_data,
+							    parent_key.mv_size);
+							old_trunk.mv_size = parent_key.mv_size;
+							trunk_decoded = 1;
+						}
+					}
+				}
+
+				if (!trunk_decoded) {
+					MDB_val decoded_trunk = {0, decoded_trunk_buf};
+					int krc = mdb_cursor_read_key_at(mc, mp, 0, &decoded_trunk);
+					if (krc == MDB_SUCCESS && decoded_trunk.mv_data &&
+					    decoded_trunk.mv_size <= MDB_KEYBUF_MAX) {
+						memcpy(old_trunk_buf, decoded_trunk.mv_data,
+						    decoded_trunk.mv_size);
+						old_trunk.mv_size = decoded_trunk.mv_size;
+						trunk_decoded = 1;
+					}
+				}
+			}
+			if (mp->mp_pgno == 3) {
+				size_t hex = old_trunk.mv_size < 32 ? old_trunk.mv_size : 32;
+				fprintf(stderr,
+				    "mdb_node_add page 3 trunk len=%zu data=",
+				    old_trunk.mv_size);
+				for (size_t i = 0; i < hex; ++i)
+					fprintf(stderr, "%02x",
+					    ((const unsigned char *)old_trunk.mv_data)[i]);
+				if (old_trunk.mv_size > hex)
+					fprintf(stderr, "...");
+				fprintf(stderr, "\n");
+			}
 			need_reencode = 1;
 		}
 	}
