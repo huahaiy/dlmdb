@@ -11510,18 +11510,7 @@ mdb_node_add(MDB_cursor *mc, indx_t indx,
 					}
 				}
 			}
-			if (mp->mp_pgno == 3) {
-				size_t hex = old_trunk.mv_size < 32 ? old_trunk.mv_size : 32;
-				fprintf(stderr,
-				    "mdb_node_add page 3 trunk len=%zu data=",
-				    old_trunk.mv_size);
-				for (size_t i = 0; i < hex; ++i)
-					fprintf(stderr, "%02x",
-					    ((const unsigned char *)old_trunk.mv_data)[i]);
-				if (old_trunk.mv_size > hex)
-					fprintf(stderr, "...");
-				fprintf(stderr, "\n");
-			}
+
 			need_reencode = 1;
 		}
 	}
@@ -13560,7 +13549,8 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 			} else {
 				node = (MDB_node *)((char *)mp + copy->mp_ptrs[i] + PAGEBASE);
 				if (IS_LEAF(mp) && (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION)) {
-					if (i == 0) {
+					int src_idx = (i < newindx) ? (int)i : (int)i - 1;
+					if (src_idx == 0) {
 						if (node->mn_ksize > MDB_KEYBUF_MAX) {
 							rc = MDB_BAD_VALSIZE;
 							goto done;

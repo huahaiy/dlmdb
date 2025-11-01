@@ -179,12 +179,12 @@ dump_insert_debug_log_failure(int loop)
                                       dump_insert_debug.curr_len);
     char *prev_hex = dup_bytes_to_hex(dump_insert_debug.prev,
                                       dump_insert_debug.prev_len);
-    fprintf(stderr,
-            "range big txn loop %d insert step %zu current value (hex): %s\n",
-            loop, dump_insert_debug.step, curr_hex);
-    fprintf(stderr,
-            "range big txn loop %d previous value (hex): %s\n",
-            loop, prev_hex);
+    /* fprintf(stderr, */
+    /*         "range big txn loop %d insert step %zu current value (hex): %s\n", */
+    /*         loop, dump_insert_debug.step, curr_hex); */
+    /* fprintf(stderr, */
+    /*         "range big txn loop %d previous value (hex): %s\n", */
+    /*         loop, prev_hex); */
     free(curr_hex);
     free(prev_hex);
 }
@@ -3327,21 +3327,9 @@ test_nested_transactions(MDB_env *env)
     mdb_dbi_close(env, dbi);
 }
 
-int
-main(void)
+static void
+test_basics(MDB_env *env)
 {
-    const int entries = 512;
-
-    /* Pre-emptively create the directory and chmod it. */
-    const char *dir = "./testdb_count";
-    if (mkdir(dir, 0775) && errno != EEXIST) {
-        perror("mkdir testdb_count");
-        return EXIT_FAILURE;
-    }
-    if (chmod(dir, 0775) && errno != EPERM) {
-        perror("chmod testdb_count");
-    }
-    MDB_env *env;
     MDB_txn *txn;
     MDB_dbi dbi;
     MDB_val key, data;
@@ -3350,14 +3338,8 @@ main(void)
     int rc;
     uint64_t total;
 
-    const char *pathbuf = "./testdb_count";
-    unlink("./testdb_count/data.mdb");
-    unlink("./testdb_count/lock.mdb");
+    const int entries = 512;
 
-    rc = mdb_env_create(&env);
-    CHECK(rc, "mdb_env_create");
-    CHECK(mdb_env_set_maxdbs(env, 8), "mdb_env_set_maxdbs");
-    CHECK(mdb_env_open(env, pathbuf, MDB_NOLOCK, 0664), "mdb_env_open");
 
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "mdb_txn_begin");
     CHECK(mdb_dbi_open(txn, "counted", MDB_CREATE | MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi), "mdb_dbi_open");
@@ -3633,10 +3615,39 @@ main(void)
                  q, low_desc, high_desc, range_flags);
         expect_eq(counted, naive, msg);
     }
+
     mdb_txn_abort(txn);
 
     mdb_dbi_close(env, dbi);
 
+}
+
+int
+main(void)
+{
+  MDB_env *env;
+    int rc;
+
+    /* Pre-emptively create the directory and chmod it. */
+    const char *dir = "./testdb_count";
+    if (mkdir(dir, 0775) && errno != EEXIST) {
+        perror("mkdir testdb_count");
+        return EXIT_FAILURE;
+    }
+    if (chmod(dir, 0775) && errno != EPERM) {
+        perror("chmod testdb_count");
+    }
+
+    const char *pathbuf = "./testdb_count";
+    unlink("./testdb_count/data.mdb");
+    unlink("./testdb_count/lock.mdb");
+
+    rc = mdb_env_create(&env);
+    CHECK(rc, "mdb_env_create");
+    CHECK(mdb_env_set_maxdbs(env, 8), "mdb_env_set_maxdbs");
+    CHECK(mdb_env_open(env, pathbuf, MDB_NOLOCK, 0664), "mdb_env_open");
+
+    test_basics(env);
     test_empty_db(env);
     test_single_key(env);
     test_extreme_keys(env);
