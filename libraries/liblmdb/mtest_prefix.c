@@ -2016,7 +2016,7 @@ test_prefix_dupsort_fuzz(void)
 	CHECK_CALL(mdb_dbi_open(txn, dbname, MDB_CREATE | flags, &dbi));
 	CHECK_CALL(mdb_txn_commit(txn));
 
-	const size_t operations = 1500;
+	const size_t operations = 2000;
 	for (size_t op = 0; op < operations; ++op) {
 		df_op_index = op;
 		int do_insert = (df_entry_count == 0) || (df_rng_next() & 1);

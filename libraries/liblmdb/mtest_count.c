@@ -179,12 +179,6 @@ dump_insert_debug_log_failure(int loop)
                                       dump_insert_debug.curr_len);
     char *prev_hex = dup_bytes_to_hex(dump_insert_debug.prev,
                                       dump_insert_debug.prev_len);
-    /* fprintf(stderr, */
-    /*         "range big txn loop %d insert step %zu current value (hex): %s\n", */
-    /*         loop, dump_insert_debug.step, curr_hex); */
-    /* fprintf(stderr, */
-    /*         "range big txn loop %d previous value (hex): %s\n", */
-    /*         loop, prev_hex); */
     free(curr_hex);
     free(prev_hex);
 }
@@ -328,7 +322,8 @@ load_env_from_dump(const char *dump_path, const char *db_name,
         }
         for (size_t i = 0; i < entry_count; ++i) {
             dump_insert_debug_record(&entries[i].data);
-            CHECK(mdb_put(txn, dbi, &entries[i].key, &entries[i].data, 0), "dump load put");
+            CHECK(mdb_put(txn, dbi, &entries[i].key, &entries[i].data, 0),
+                  "dump load put");
         }
     }
 
@@ -1506,10 +1501,54 @@ test_range_count_values_big_txn_env(void)
 
         mdb_txn_abort(txn);
         mdb_dbi_close(env, dbi);
-        mdb_env_close(env);
-        cleanup_env_dir(env_dir);
-        dump_insert_debug_end();
+	mdb_env_close(env);
+	cleanup_env_dir(env_dir);
+	dump_insert_debug_end();
     }
+}
+
+static void
+test_load_big_txn_ave_dump(void)
+{
+	const char *dump_path = "big-txn-1-ave.txt";
+	const char *db_name = "datalevin/ave";
+
+	for (int loop = 0; loop < 5; ++loop) {
+		unsigned int seed = 0x915f2dbeu ^ (unsigned int)(loop + 1);
+		char env_dir[PATH_MAX];
+		MDB_env *env = NULL;
+		MDB_txn *txn = NULL;
+		MDB_dbi dbi;
+
+		dump_insert_debug_begin();
+		env = load_env_from_dump(dump_path, db_name,
+		    env_dir, sizeof(env_dir),
+		    MDB_PREFIX_COMPRESSION, seed);
+		CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn),
+		    "big txn-ave begin");
+		CHECK(mdb_dbi_open(txn, db_name, 0, &dbi),
+		    "big txn-ave dbi open");
+		CHECK(mdb_set_compare(txn, dbi, dtlv_cmp_memn),
+		    "big txn-ave set compare");
+		CHECK(mdb_set_dupsort(txn, dbi, dtlv_cmp_memn),
+		    "big txn-ave set dupsort");
+
+		uint64_t total = naive_count_values(txn, dbi, NULL,
+		    NULL, 0, 0, dtlv_cmp_memn);
+		if (total == 0) {
+			fprintf(stderr,
+			    "big txn-ave %s: expected entries in dump "
+			    "(counted zero)\n", dump_path);
+			dump_insert_debug_log_failure(loop);
+			exit(EXIT_FAILURE);
+		}
+
+		mdb_txn_abort(txn);
+		mdb_dbi_close(env, dbi);
+		mdb_env_close(env);
+		cleanup_env_dir(env_dir);
+		dump_insert_debug_end();
+	}
 }
 
 static void
@@ -3668,12 +3707,13 @@ main(void)
     test_split_merge(env);
     test_nested_transactions(env);
     test_fuzz_random(env);
-    test_fuzz_random_prefix(env);
-    test_fuzz_random_dupsort(env);
-    test_concurrent_readers();
-    test_range_count_values_big_txn_env();
+	test_fuzz_random_prefix(env);
+	test_fuzz_random_dupsort(env);
+	test_concurrent_readers();
+	test_range_count_values_big_txn_env();
+	test_load_big_txn_ave_dump();
 
-    mdb_env_close(env);
-    cleanup_env_dir(pathbuf);
-    return EXIT_SUCCESS;
+	mdb_env_close(env);
+	cleanup_env_dir(pathbuf);
+	return EXIT_SUCCESS;
 }

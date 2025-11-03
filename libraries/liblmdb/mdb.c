@@ -10840,18 +10840,18 @@ new_sub:
 		nsize = IS_LEAF2(cur_pg) ? key->mv_size :
 		    mdb_leaf_size(env, cur_pg, mc->mc_ki[mc->mc_top], key, rdata, prefix_enabled);
 	if (SIZELEFT(mc->mc_pg[mc->mc_top]) < nsize) {
-		if (( flags & (F_DUPDATA|F_SUBDATA)) == F_DUPDATA )
+		if (( flags & (F_DUPDATA|F_SUBDATA)) == F_DUPDATA)
 			nflags &= ~MDB_APPEND; /* sub-page may need room to grow */
 		if (!insert_key)
 			nflags |= MDB_SPLIT_REPLACE;
 		rc = mdb_page_split(mc, key, rdata, P_INVALID, nflags);
-	if (rc == MDB_SUCCESS)
-		split_performed = 1;
+		if (rc == MDB_SUCCESS)
+			split_performed = 1;
 	} else {
 		/* There is room already in this leaf page. */
 		rc = mdb_node_add(mc, mc->mc_ki[mc->mc_top], key, rdata, 0, nflags,
 		    NULL, MDB_COUNT_HINT_NONE);
-		if (rc == 0) {
+		if (rc == MDB_SUCCESS) {
 			/* Adjust other cursors pointing to mp */
 			MDB_cursor *m2, *m3;
 			MDB_dbi dbi = mc->mc_dbi;
@@ -10863,12 +10863,20 @@ new_sub:
 					m3 = &m2->mc_xcursor->mx_cursor;
 				else
 					m3 = m2;
-				if (m3 == mc || m3->mc_snum < mc->mc_snum || m3->mc_pg[i] != mp) continue;
-				if (m3->mc_ki[i] >= mc->mc_ki[i] && insert_key) {
+				if (m3 == mc || m3->mc_snum < mc->mc_snum || m3->mc_pg[i] != mp)
+					continue;
+				if (m3->mc_ki[i] >= mc->mc_ki[i] && insert_key)
 					m3->mc_ki[i]++;
-				}
 				XCURSOR_REFRESH(m3, i, mp);
 			}
+		} else if (rc == MDB_PAGE_FULL) {
+			if ((flags & (F_DUPDATA|F_SUBDATA)) == F_DUPDATA)
+				nflags &= ~MDB_APPEND;
+			if (!insert_key)
+				nflags |= MDB_SPLIT_REPLACE;
+			rc = mdb_page_split(mc, key, rdata, P_INVALID, nflags);
+			if (rc == MDB_SUCCESS)
+				split_performed = 1;
 		}
 	}
 
