@@ -9745,8 +9745,39 @@ mdb_cursor_set(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 	int		 rc;
 	MDB_page	*mp;
 	MDB_node	*leaf = NULL;
+	MDB_val	 saved_key = *key;
+	MDB_val	 saved_data = {0, NULL};
+	int	 saved_data_valid = 0;
+	unsigned char saved_key_local[MDB_KEYBUF_MAX];
+	unsigned char *saved_key_copy = NULL;
 	DKBUF;
 
+	if ((mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) &&
+	    (op == MDB_GET_BOTH || op == MDB_GET_BOTH_RANGE)) {
+		if (data) {
+			saved_data = *data;
+			saved_data_valid = 1;
+		}
+		if (key->mv_data && key->mv_size) {
+			if (key->mv_size <= MDB_KEYBUF_MAX) {
+				memcpy(saved_key_local, key->mv_data, key->mv_size);
+				saved_key_copy = saved_key_local;
+			} else {
+				unsigned char *scratch_copy = NULL;
+				int copy_rc = mdb_prefix_ensure_keybuf(mc->mc_txn, key->mv_size, &scratch_copy);
+				if (copy_rc != MDB_SUCCESS)
+					return copy_rc;
+				memcpy(scratch_copy, key->mv_data, key->mv_size);
+				saved_key_copy = scratch_copy;
+			}
+			if (saved_key_copy) {
+				key->mv_data = saved_key_copy;
+				key->mv_size = saved_key.mv_size;
+			}
+		}
+	}
+
+retry:
 	if (key->mv_size == 0)
 		return MDB_BAD_VALSIZE;
 
@@ -9755,6 +9786,10 @@ mdb_cursor_set(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 		MDB_CURSOR_UNREF(&mc->mc_xcursor->mx_cursor, 0);
 		mc->mc_xcursor->mx_cursor.mc_flags &= ~(C_INITIALIZED|C_EOF);
 	}
+
+	if ((mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) &&
+	    (op == MDB_GET_BOTH || op == MDB_GET_BOTH_RANGE))
+		mc->mc_flags &= ~C_INITIALIZED;
 
 	/* See if we're already on the right page */
 	if (mc->mc_flags & C_INITIALIZED) {
@@ -9838,6 +9873,19 @@ mdb_cursor_set(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 					NUMKEYS(mc->mc_pg[i])-1)
 					break;
 			if (i == mc->mc_top) {
+				if ((mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) &&
+				    (op == MDB_GET_BOTH_RANGE || op == MDB_GET_BOTH)) {
+					mdb_cursor_seq_invalidate(mc);
+					mc->mc_flags &= ~C_INITIALIZED;
+					mc->mc_pg[0] = NULL;
+					MDB_val retry_key = saved_key;
+					if (saved_key_copy)
+						retry_key.mv_data = saved_key_copy;
+					*key = retry_key;
+					if (saved_data_valid && data)
+						*data = saved_data;
+					goto retry;
+				}
 				/* There are no other pages */
 				mc->mc_ki[mc->mc_top] = nkeys;
 				return MDB_NOTFOUND;
@@ -9935,12 +9983,15 @@ set1:
 	}
 
 	/* The key already matches in all other cases */
-	if (op == MDB_SET_RANGE || op == MDB_SET_KEY) {
+	if (op == MDB_SET_RANGE || op == MDB_SET_KEY || saved_key_copy) {
 		rc = mdb_cursor_read_key_at(mc, mp, mc->mc_ki[mc->mc_top], key);
 		if (rc != MDB_SUCCESS)
 			return rc;
 	}
 	DPRINTF(("==> cursor placed on key [%s]", DKEY(key)));
+
+	if (saved_key_copy && (op == MDB_GET_BOTH || op == MDB_GET_BOTH_RANGE))
+		*key = saved_key;
 
 	return rc;
 }

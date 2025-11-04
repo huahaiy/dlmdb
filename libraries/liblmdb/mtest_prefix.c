@@ -105,6 +105,8 @@ static void test_prefix_dupsort_trunk_swap_inline(void);
 static void test_prefix_dupsort_trunk_swap_promote(void);
 static void test_prefix_dupsort_trunk_key_shift_no_value_change(void);
 static void test_prefix_concurrent_reads(void);
+static void test_prefix_tuples_ave_range_hit(void);
+static void test_plain_tuples_get_both_range(void);
 
 static void
 reset_dir(const char *dir)
@@ -131,6 +133,54 @@ cleanup_env_dir(const char *dir)
 	rmdir(dir);
 }
 
+static void
+die_errno(const char *msg)
+{
+	fprintf(stderr, "%s: %s\n", msg, strerror(errno));
+	exit(EXIT_FAILURE);
+}
+
+static unsigned char
+hex_nibble(char c)
+{
+	if (c >= '0' && c <= '9')
+		return (unsigned char)(c - '0');
+	if (c >= 'a' && c <= 'f')
+		return (unsigned char)(c - 'a' + 10);
+	if (c >= 'A' && c <= 'F')
+		return (unsigned char)(c - 'A' + 10);
+	fprintf(stderr, "invalid hex digit '%c'\n", c);
+	exit(EXIT_FAILURE);
+}
+
+static unsigned char *
+dup_hex_to_bytes(const char *hex, size_t *out_len)
+{
+	size_t hex_len = strlen(hex);
+	while (hex_len > 0 && hex[hex_len - 1] == ' ')
+		hex_len--;
+	while (hex_len > 0 && *hex == ' ') {
+		++hex;
+		--hex_len;
+	}
+	if (hex_len % 2 != 0) {
+		fprintf(stderr, "hex string has odd length: %s\n", hex);
+		exit(EXIT_FAILURE);
+	}
+	size_t out_sz = hex_len / 2;
+	unsigned char *buf = malloc(out_sz);
+	if (!buf)
+		die_errno("malloc hex buffer");
+	for (size_t i = 0; i < out_sz; ++i) {
+		unsigned char hi = hex_nibble(hex[2 * i]);
+		unsigned char lo = hex_nibble(hex[2 * i + 1]);
+		buf[i] = (unsigned char)((hi << 4) | lo);
+	}
+	if (out_len)
+		*out_len = out_sz;
+	return buf;
+}
+
 static MDB_env *
 create_env_with_mapsize(const char *dir, size_t mapsize)
 {
@@ -147,6 +197,65 @@ static MDB_env *
 create_env(const char *dir)
 {
 	return create_env_with_mapsize(dir, 64UL * 1024 * 1024);
+}
+
+static void
+apply_ops_file(MDB_txn *txn, MDB_dbi dbi, const char *ops_path)
+{
+	FILE *fp = fopen(ops_path, "r");
+	if (!fp)
+		die_errno("open ops file");
+
+	char line[1024];
+	while (fgets(line, sizeof(line), fp)) {
+		char *newline = strpbrk(line, "\r\n");
+		if (newline)
+			*newline = '\0';
+		if (line[0] == '\0' || line[0] == '#')
+			continue;
+		char op[8] = {0};
+		char key_hex[512] = {0};
+		char val_hex[512] = {0};
+		int fields = sscanf(line, "%7s %511s %511s", op, key_hex, val_hex);
+		if (fields < 2) {
+			fprintf(stderr, "ops file: malformed line '%s'\n", line);
+			exit(EXIT_FAILURE);
+		}
+		size_t key_len = 0;
+		unsigned char *key_buf = dup_hex_to_bytes(key_hex, &key_len);
+		MDB_val key = { key_len, key_buf };
+
+		if (strcmp(op, "put") == 0) {
+			if (fields != 3) {
+				fprintf(stderr, "ops file: put missing value '%s'\n", line);
+				exit(EXIT_FAILURE);
+			}
+			size_t val_len = 0;
+			unsigned char *val_buf = dup_hex_to_bytes(val_hex, &val_len);
+			MDB_val data = { val_len, val_buf };
+			CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+			free(val_buf);
+		} else if (strcmp(op, "del") == 0) {
+			if (fields != 3) {
+				fprintf(stderr, "ops file: del missing value '%s'\n", line);
+				exit(EXIT_FAILURE);
+			}
+			size_t val_len = 0;
+			unsigned char *val_buf = dup_hex_to_bytes(val_hex, &val_len);
+			MDB_val data = { val_len, val_buf };
+			int rc = mdb_del(txn, dbi, &key, &data);
+			if (rc != MDB_SUCCESS) {
+				fprintf(stderr, "ops file: del failed (%s)\n", mdb_strerror(rc));
+				exit(EXIT_FAILURE);
+			}
+			free(val_buf);
+		} else {
+			fprintf(stderr, "ops file: unknown op '%s'\n", op);
+			exit(EXIT_FAILURE);
+		}
+		free(key_buf);
+	}
+	fclose(fp);
 }
 
 static void
@@ -184,7 +293,8 @@ test_edge_cases(void)
 	CHECK_CALL(mdb_put(txn, dbi, &single, &single, 0));
 	CHECK_CALL(mdb_txn_commit(txn));
 
-	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	/* Use a write txn so prefix-compression cursor paths match real workloads. */
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
 	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION | MDB_COUNTED, &dbi));
 	key.mv_data = NULL;
 	key.mv_size = 0;
@@ -677,6 +787,238 @@ test_prefix_dupsort_transitions(void)
 
 	mdb_env_close(env);
 	cleanup_env_dir(dir);
+}
+
+static void
+test_prefix_tuples_ave_range_hit(void)
+{
+	const char *env_dir = "testdb_tuples_ops";
+	const char *ops_path = "tuples-ops.txt";
+	const char *db_name = "datalevin/ave";
+	unsigned char *target_key = NULL;
+	unsigned char *expect_val = NULL;
+	size_t target_len = 0;
+	size_t expect_len = 0;
+	unsigned char *dup_key = NULL;
+	unsigned char *dup_expect = NULL;
+	size_t dup_key_len = 0;
+	size_t dup_expect_len = 0;
+
+	target_key = dup_hex_to_bytes("000000036e026901616901420001", &target_len);
+	expect_val = dup_hex_to_bytes("00000000000000030000000000000000", &expect_len);
+	dup_key = dup_hex_to_bytes("000000046901610001", &dup_key_len);
+	dup_expect = dup_hex_to_bytes("00000000000000010000000000000000", &dup_expect_len);
+
+	MDB_env *env = create_env(env_dir);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+	unsigned int open_flags = MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_DUPSORT;
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, db_name, open_flags, &dbi));
+	apply_ops_file(txn, dbi, ops_path);
+	CHECK_CALL(mdb_txn_commit(txn));
+	mdb_dbi_close(env, dbi);
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, db_name, MDB_PREFIX_COMPRESSION | MDB_DUPSORT, &dbi));
+
+	MDB_cursor *cur = NULL;
+	MDB_val key = { target_len, target_key };
+	MDB_val data = { 0, NULL };
+
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+	int rc = mdb_cursor_get(cur, &key, &data, MDB_SET_RANGE);
+	if (rc != MDB_SUCCESS) {
+		fprintf(stderr, "tuples ops: expected range hit, got %s\n",
+		    mdb_strerror(rc));
+		exit(EXIT_FAILURE);
+	}
+	if (key.mv_size != target_len ||
+	    memcmp(key.mv_data, target_key, target_len) != 0) {
+		fprintf(stderr, "tuples ops: range landed on unexpected key\n");
+		exit(EXIT_FAILURE);
+	}
+
+	int found_expected = 0;
+	if (data.mv_size == expect_len &&
+	    memcmp(data.mv_data, expect_val, expect_len) == 0)
+		found_expected = 1;
+
+	MDB_val seek_key = { target_len, target_key };
+	MDB_val seek_value = { 0, NULL };
+	size_t probe_len = 0;
+	unsigned char *probe_val =
+	    dup_hex_to_bytes("00000000000000000000000000000000", &probe_len);
+	seek_value.mv_size = probe_len;
+	seek_value.mv_data = probe_val;
+
+	rc = mdb_cursor_get(cur, &seek_key, &seek_value, MDB_GET_BOTH_RANGE);
+	if (rc != MDB_SUCCESS) {
+		fprintf(stderr, "tuples ops: MDB_GET_BOTH_RANGE failed: %s\n",
+		    mdb_strerror(rc));
+		exit(EXIT_FAILURE);
+	}
+	if (seek_key.mv_size != target_len ||
+	    memcmp(seek_key.mv_data, target_key, target_len) != 0) {
+		fprintf(stderr, "tuples ops: GET_BOTH_RANGE landed on different key\n");
+		exit(EXIT_FAILURE);
+	}
+	if (seek_value.mv_size != expect_len ||
+	    memcmp(seek_value.mv_data, expect_val, expect_len) != 0) {
+		fprintf(stderr, "tuples ops: GET_BOTH_RANGE did not match expected duplicate\n");
+		fprintf(stderr, "  got size %zu value:", seek_value.mv_size);
+		for (size_t i = 0; i < seek_value.mv_size; ++i)
+			fprintf(stderr, "%02x", ((unsigned char *)seek_value.mv_data)[i]);
+		fprintf(stderr, "\n");
+		exit(EXIT_FAILURE);
+	}
+
+	free(probe_val);
+
+	data = seek_value;
+	key = seek_key;
+
+	for (;;) {
+		rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT_DUP);
+		if (rc == MDB_NOTFOUND)
+			break;
+		if (rc != MDB_SUCCESS) {
+			fprintf(stderr, "tuples ops: duplicate walk failed: %s\n",
+			    mdb_strerror(rc));
+			exit(EXIT_FAILURE);
+		}
+		if (key.mv_size != target_len ||
+		    memcmp(key.mv_data, target_key, target_len) != 0) {
+			fprintf(stderr, "tuples ops: duplicate iteration changed key\n");
+			exit(EXIT_FAILURE);
+		}
+		if (!found_expected &&
+		    data.mv_size == expect_len &&
+		    memcmp(data.mv_data, expect_val, expect_len) == 0)
+			found_expected = 1;
+	}
+	if (!found_expected) {
+		fprintf(stderr, "tuples ops: expected value missing for key\n");
+		exit(EXIT_FAILURE);
+	}
+
+	mdb_cursor_close(cur);
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+	MDB_val dup_key_val = { dup_key_len, dup_key };
+	MDB_val dup_data = { 0, NULL };
+	CHECK_CALL(mdb_cursor_get(cur, &dup_key_val, &dup_data, MDB_SET_RANGE));
+	if (dup_key_val.mv_size != dup_key_len ||
+	    memcmp(dup_key_val.mv_data, dup_key, dup_key_len) != 0) {
+		fprintf(stderr, "tuples ops: duplicate key range mismatch\n");
+		exit(EXIT_FAILURE);
+	}
+
+	MDB_val dup_seek_key = { dup_key_len, dup_key };
+	MDB_val dup_seek_val = { 0, NULL };
+	size_t dup_probe_len = 0;
+	unsigned char *dup_probe =
+	    dup_hex_to_bytes("00000000000000000000000000000000", &dup_probe_len);
+	dup_seek_val.mv_size = dup_probe_len;
+	dup_seek_val.mv_data = dup_probe;
+	rc = mdb_cursor_get(cur, &dup_seek_key, &dup_seek_val, MDB_GET_BOTH_RANGE);
+	if (rc != MDB_SUCCESS) {
+		fprintf(stderr, "tuples ops: duplicate GET_BOTH_RANGE failed: %s\n",
+		    mdb_strerror(rc));
+		exit(EXIT_FAILURE);
+	}
+	if (dup_seek_val.mv_size != dup_expect_len ||
+	    memcmp(dup_seek_val.mv_data, dup_expect, dup_expect_len) != 0) {
+		fprintf(stderr, "tuples ops: duplicate GET_BOTH_RANGE landed on unexpected value\n");
+		fprintf(stderr, "  got size %zu value:", dup_seek_val.mv_size);
+		for (size_t i = 0; i < dup_seek_val.mv_size; ++i)
+			fprintf(stderr, "%02x", ((unsigned char *)dup_seek_val.mv_data)[i]);
+		fprintf(stderr, "\n");
+		exit(EXIT_FAILURE);
+	}
+	mdb_cursor_close(cur);
+	free(dup_probe);
+	mdb_txn_abort(txn);
+	mdb_dbi_close(env, dbi);
+	mdb_env_close(env);
+	cleanup_env_dir(env_dir);
+
+	free(expect_val);
+	free(target_key);
+	free(dup_key);
+	free(dup_expect);
+}
+
+static void
+test_plain_tuples_get_both_range(void)
+{
+	const char *env_dir = "testdb_tuples_plain";
+	const char *ops_path = "tuples-ops.txt";
+	const char *db_name = "datalevin/ave";
+	unsigned char *target_key = NULL;
+	unsigned char *expect_val = NULL;
+	size_t target_len = 0;
+	size_t expect_len = 0;
+
+	target_key = dup_hex_to_bytes("000000036e026901616901420001", &target_len);
+	expect_val = dup_hex_to_bytes("00000000000000030000000000000000", &expect_len);
+
+	MDB_env *env = create_env(env_dir);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, db_name, MDB_CREATE | MDB_DUPSORT, &dbi));
+	apply_ops_file(txn, dbi, ops_path);
+	CHECK_CALL(mdb_txn_commit(txn));
+	mdb_dbi_close(env, dbi);
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, db_name, MDB_DUPSORT, &dbi));
+
+	MDB_cursor *cur = NULL;
+	MDB_val key = { target_len, target_key };
+	MDB_val data = { 0, NULL };
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_SET_RANGE));
+	if (key.mv_size != target_len ||
+	    memcmp(key.mv_data, target_key, target_len) != 0) {
+		fprintf(stderr, "plain tuples: range seek landed on wrong key\n");
+		exit(EXIT_FAILURE);
+	}
+
+	MDB_val seek_key = { target_len, target_key };
+	MDB_val seek_val = { 0, NULL };
+	size_t zero_len = 0;
+	unsigned char *zero_val =
+	    dup_hex_to_bytes("00000000000000000000000000000000", &zero_len);
+	seek_val.mv_size = zero_len;
+	seek_val.mv_data = zero_val;
+
+	CHECK_CALL(mdb_cursor_get(cur, &seek_key, &seek_val, MDB_GET_BOTH_RANGE));
+	if (seek_key.mv_size != target_len ||
+	    memcmp(seek_key.mv_data, target_key, target_len) != 0) {
+		fprintf(stderr, "plain tuples: get_both_range changed key\n");
+		exit(EXIT_FAILURE);
+	}
+	if (seek_val.mv_size != expect_len ||
+	    memcmp(seek_val.mv_data, expect_val, expect_len) != 0) {
+		fprintf(stderr, "plain tuples: get_both_range missed first dup got:");
+		for (size_t i = 0; i < seek_val.mv_size; ++i)
+			fprintf(stderr, "%02x", ((unsigned char *)seek_val.mv_data)[i]);
+		fprintf(stderr, "\n");
+		exit(EXIT_FAILURE);
+	}
+
+	free(zero_val);
+
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+	mdb_dbi_close(env, dbi);
+	mdb_env_close(env);
+	cleanup_env_dir(env_dir);
+	free(expect_val);
+	free(target_key);
 }
 
 static void
@@ -3090,6 +3432,8 @@ main(void)
   test_mixed_pattern_and_unicode();
   test_cursor_buffer_sharing();
   test_prefix_dupsort_transitions();
+  test_plain_tuples_get_both_range();
+  test_prefix_tuples_ave_range_hit();
 	test_prefix_dupsort_cursor_walk();
 	test_prefix_dupsort_get_both_range();
 	test_prefix_leaf_splits();
