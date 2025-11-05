@@ -3966,11 +3966,19 @@ mdb_dup_prefix_count_internal(const MDB_cursor *base, MDB_cursor *cur,
 	if (rc == MDB_NOTFOUND) {
 		uint64_t entries = base->mc_db ? (uint64_t)base->mc_db->md_entries : 0;
 		MDB_cursor edge = (MDB_cursor){0};
+		MDB_xcursor edge_mx = (MDB_xcursor){0};
 		MDB_val edge_key = {0}, edge_data = {0};
 		int edge_rc = MDB_SUCCESS;
 
 		mdb_cursor_copy(base, &edge);
-		edge.mc_xcursor = NULL;
+		if ((base->mc_db->md_flags & MDB_DUPSORT) && base->mc_xcursor) {
+			edge.mc_xcursor = &edge_mx;
+			mdb_xcursor_init0(&edge);
+			if (base->mc_xcursor->mx_cursor.mc_flags & C_INITIALIZED)
+				mdb_xcursor_init2(&edge, base->mc_xcursor, 0);
+		} else {
+			edge.mc_xcursor = NULL;
+		}
 		edge.mc_dbflag = base->mc_dbflag;
 		if (mdb_cursor_get(&edge, &edge_key, &edge_data, MDB_FIRST) == MDB_SUCCESS) {
 			int cmp_first = cmp(&edge_key, (MDB_val *)value);
@@ -3983,7 +3991,15 @@ mdb_dup_prefix_count_internal(const MDB_cursor *base, MDB_cursor *cur,
 		}
 
 		mdb_cursor_copy(base, &edge);
-		edge.mc_xcursor = NULL;
+		edge_mx = (MDB_xcursor){0};
+		if ((base->mc_db->md_flags & MDB_DUPSORT) && base->mc_xcursor) {
+			edge.mc_xcursor = &edge_mx;
+			mdb_xcursor_init0(&edge);
+			if (base->mc_xcursor->mx_cursor.mc_flags & C_INITIALIZED)
+				mdb_xcursor_init2(&edge, base->mc_xcursor, 0);
+		} else {
+			edge.mc_xcursor = NULL;
+		}
 		edge.mc_dbflag = base->mc_dbflag;
 		if (mdb_cursor_get(&edge, &edge_key, &edge_data, MDB_LAST) == MDB_SUCCESS) {
 			int cmp_last = cmp(&edge_key, (MDB_val *)value);
