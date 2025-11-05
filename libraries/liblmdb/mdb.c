@@ -2857,6 +2857,15 @@ mdb_cursor_container(MDB_cursor *mc)
 	if (!mc || !(mc->mc_flags & C_SUB))
 		return NULL;
 	MDB_xcursor *mx = (MDB_xcursor *)((char *)mc - offsetof(MDB_xcursor, mx_cursor));
+
+	/* Guard against stack copies of sub-cursors. Real embedded xcursor cursors
+	 * always point their db/dbx/dbflag fields back to the container. */
+	if (&mx->mx_cursor != mc ||
+	    mc->mc_db != &mx->mx_db ||
+	    mc->mc_dbx != &mx->mx_dbx ||
+	    mc->mc_dbflag != &mx->mx_dbflag)
+		return NULL;
+
 	return mx;
 }
 
