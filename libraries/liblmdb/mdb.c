@@ -1909,6 +1909,12 @@ mdb_cursor_seq_cmp_refresh(MDB_cursor *mc, MDB_page *mp, const MDB_val *search_k
 		return 0;
 	}
 
+	if (mc->mc_seq_cmp_pgno == mp->mp_pgno &&
+	    mc->mc_seq_cmp_keyptr == search_key->mv_data &&
+	    mc->mc_seq_cmp_keysize == search_key->mv_size) {
+		return mc->mc_seq_cmp_prefix;
+	}
+
 	if (!(mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) ||
 	    !IS_LEAF(mp) || NUMKEYS(mp) == 0) {
 		mc->mc_seq_cmp_pgno = P_INVALID;
@@ -8649,6 +8655,11 @@ mdb_node_search(MDB_cursor *mc, MDB_val *key, int *exactp)
 	MDB_val	 nodekey;
 	MDB_cmp_func *cmp;
 	DKBUF;
+
+	mc->mc_seq_cmp_pgno = P_INVALID;
+	mc->mc_seq_cmp_keyptr = NULL;
+	mc->mc_seq_cmp_keysize = 0;
+	mc->mc_seq_cmp_prefix = 0;
 
 	nkeys = NUMKEYS(mp);
 
