@@ -9825,8 +9825,6 @@ mdb_cursor_set(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 			}
 		}
 	}
-
-retry:
 	if (key->mv_size == 0)
 		return MDB_BAD_VALSIZE;
 
@@ -9927,13 +9925,11 @@ retry:
 					mdb_cursor_seq_invalidate(mc);
 					mc->mc_flags &= ~C_INITIALIZED;
 					mc->mc_pg[0] = NULL;
-					MDB_val retry_key = saved_key;
-					if (saved_key_copy)
-						retry_key.mv_data = saved_key_copy;
-					*key = retry_key;
+					if (saved_key_copy && (op == MDB_GET_BOTH || op == MDB_GET_BOTH_RANGE))
+						*key = saved_key;
 					if (saved_data_valid && data)
 						*data = saved_data;
-					goto retry;
+					return MDB_NOTFOUND;
 				}
 				/* There are no other pages */
 				mc->mc_ki[mc->mc_top] = nkeys;
@@ -10037,8 +10033,7 @@ set1:
 		if (rc != MDB_SUCCESS)
 			return rc;
 	}
-	DPRINTF(("==> cursor placed on key [%s]", DKEY(key)));
-
+DPRINTF(("==> cursor placed on key [%s]", DKEY(key)));
 	if (saved_key_copy && (op == MDB_GET_BOTH || op == MDB_GET_BOTH_RANGE))
 		*key = saved_key;
 
