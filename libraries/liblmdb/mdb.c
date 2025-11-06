@@ -1531,6 +1531,7 @@ typedef struct MDB_cursor_leaf_cache {
 	unsigned int	decoded_count;		/**< total keys in cached page */
 	pgno_t		decoded_pgno;		/**< leaf page number currently cached */
 	txnid_t		decoded_gen;		/**< txnid that generated decoded cache */
+	const MDB_page	*decoded_source;	/**< exact leaf/subpage pointer backing the cache */
 } MDB_cursor_leaf_cache;
 
 	/** A database transaction.
@@ -2019,8 +2020,7 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 			}
 		}
 
-		if (!IS_SUBP(mp) &&
-		    (mc->mc_txn->mt_flags & MDB_TXN_RDONLY) &&
+		if ((mc->mc_txn->mt_flags & MDB_TXN_RDONLY) &&
 		    (mc->mc_flags & C_LEAFCACHE) &&
 		    !(mc->mc_flags & C_SEQEXPECT)) {
 			int prc = mdb_cursor_leaf_cache_prepare(mc, mp);
@@ -2567,6 +2567,7 @@ mdb_cursor_leaf_cache_init(MDB_cursor_leaf_cache *cache)
 	cache->decoded_count = 0;
 	cache->decoded_pgno = P_INVALID;
 	cache->decoded_gen = 0;
+	cache->decoded_source = NULL;
 }
 
 static void
@@ -2579,6 +2580,7 @@ mdb_cursor_leaf_cache_reset(MDB_cursor_leaf_cache *cache)
 	cache->decoded_prefix_count = 0;
 	cache->decoded_pgno = P_INVALID;
 	cache->decoded_gen = 0;
+	cache->decoded_source = NULL;
 }
 
 static void
@@ -2753,6 +2755,7 @@ mdb_cursor_leaf_cache_clone(MDB_cursor_leaf_cache *dst,
 	dst->decoded_prefix_count = src->decoded_prefix_count;
 	dst->decoded_pgno = src->decoded_pgno;
 	dst->decoded_gen = src->decoded_gen;
+	dst->decoded_source = src->decoded_source;
 
 	return MDB_SUCCESS;
 }
@@ -2778,10 +2781,12 @@ mdb_cursor_leaf_cache_prepare(MDB_cursor *mc, MDB_page *mp)
 	unsigned int total = NUMKEYS(mp);
 	int prefix_enabled = (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) != 0;
 	int rc;
+	const MDB_page *source = IS_SUBP(mp) ? mp : NULL;
 
 	if (cache->decoded_pgno == mp->mp_pgno &&
 	    cache->decoded_gen == txn->mt_txnid &&
-	    cache->decoded_count == total)
+	    cache->decoded_count == total &&
+	    cache->decoded_source == source)
 		return MDB_SUCCESS;
 
 	mdb_cursor_leaf_cache_reset(cache);
@@ -2848,6 +2853,7 @@ mdb_cursor_leaf_cache_prepare(MDB_cursor *mc, MDB_page *mp)
 	cache->decoded_gen = txn->mt_txnid;
 	cache->decoded_count = total;
 	cache->decoded_stride = stride;
+	cache->decoded_source = source;
 
 	if (total > 0)
 		scratch->metrics.leaf_cache_pages++;
