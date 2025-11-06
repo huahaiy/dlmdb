@@ -11604,19 +11604,28 @@ mdb_node_add(MDB_cursor *mc, indx_t indx,
 			/* Data already on overflow page. */
 			node_size += sizeof(pgno_t);
 		} else if (node_size + data->mv_size > mc->mc_txn->mt_env->me_nodemax) {
-			int ovpages = OVPAGES(data->mv_size, mc->mc_txn->mt_env->me_psize);
-			int rc;
-			/* Put data on overflow page. */
-			DPRINTF(("data size is %"Z"u, node would be %"Z"u, put data on overflow page",
-			    data->mv_size, node_size+data->mv_size));
-			node_size = EVEN(node_size + sizeof(pgno_t));
-			if ((ssize_t)node_size > room)
-				goto full;
-			if ((rc = mdb_page_new(mc, P_OVERFLOW, ovpages, &ofp)))
-				return rc;
-			DPRINTF(("allocated overflow page %"Yu, ofp->mp_pgno));
-			flags |= F_BIGDATA;
-			goto update;
+			int inline_dup = F_ISSET(flags, F_DUPDATA) && !F_ISSET(flags, F_SUBDATA);
+
+			if (inline_dup) {
+				/* Inline duplicate sub-pages must never spill to overflow;
+				 * the dupsort path will resize or promote them as needed.
+				 */
+				node_size += data->mv_size;
+			} else {
+				int ovpages = OVPAGES(data->mv_size, mc->mc_txn->mt_env->me_psize);
+				int rc;
+				/* Put data on overflow page. */
+				DPRINTF(("data size is %"Z"u, node would be %"Z"u, put data on overflow page",
+				    data->mv_size, node_size+data->mv_size));
+				node_size = EVEN(node_size + sizeof(pgno_t));
+				if ((ssize_t)node_size > room)
+					goto full;
+				if ((rc = mdb_page_new(mc, P_OVERFLOW, ovpages, &ofp)))
+					return rc;
+				DPRINTF(("allocated overflow page %"Yu, ofp->mp_pgno));
+				flags |= F_BIGDATA;
+				goto update;
+			}
 		} else {
 			node_size += data->mv_size;
 		}
