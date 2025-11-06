@@ -2251,6 +2251,7 @@ static size_t	mdb_leaf_size(MDB_env *env, MDB_page *mp, indx_t indx, MDB_val *ke
 static size_t	mdb_branch_size(MDB_env *env, MDB_page *mp, MDB_val *key);
 static int mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out);
 static size_t mdb_prefix_maxkey(const MDB_env *env);
+static size_t mdb_leaf_maxkey_raw(const MDB_page *mp);
 static uint64_t mdb_leaf_entry_contribution(const MDB_page *mp, const MDB_node *node);
 static uint64_t mdb_leaf_prefix_contribution(MDB_cursor *mc, MDB_page *mp, indx_t limit);
 
@@ -2295,6 +2296,24 @@ mdb_prefix_leaf_maxdecoded(const MDB_page *mp)
 	}
 
 	return max_len ? max_len : trunk_len;
+}
+
+static size_t
+mdb_leaf_maxkey_raw(const MDB_page *mp)
+{
+	if (!IS_LEAF(mp) || IS_LEAF2(mp))
+		return 0;
+
+	unsigned int total = NUMKEYS(mp);
+	size_t max_len = 0;
+
+	for (unsigned int i = 0; i < total; ++i) {
+		MDB_node *node = NODEPTR(mp, i);
+		if (node->mn_ksize > max_len)
+			max_len = node->mn_ksize;
+	}
+
+	return max_len;
 }
 
 static void
@@ -2774,8 +2793,14 @@ mdb_cursor_leaf_cache_prepare(MDB_cursor *mc, MDB_page *mp)
 	size_t stride = 0;
 	if (total && prefix_enabled && !IS_LEAF2(mp))
 		stride = MP_PAD(mp);
-	if (total && (!stride || !prefix_enabled))
+	if (total && prefix_enabled && !IS_LEAF2(mp) && !stride)
 		stride = mdb_prefix_leaf_maxdecoded(mp);
+	if (total && !prefix_enabled) {
+		if (IS_LEAF2(mp))
+			stride = mc->mc_db ? mc->mc_db->md_pad : 0;
+		else
+			stride = mdb_leaf_maxkey_raw(mp);
+	}
 	if (total && !stride)
 		stride = mdb_prefix_maxkey(env);
 	if (!stride)
@@ -3044,7 +3069,6 @@ mdb_prefix_inline_measure_after_insert(MDB_cursor *mc, MDB_page *mp,
 	if (rc != MDB_SUCCESS)
 		return rc;
 
-	memset(snapshot, 0, env->me_psize);
 	mdb_prefix_snapshot_capture(snapshot, mp, current_capacity);
 
 	rc = mdb_prefix_ensure_entries(txn, new_total, &entries);

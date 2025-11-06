@@ -215,6 +215,6 @@ Leaf pages: 0.218x (7302 -> 1590)
 
 ```
 
-Prefix compression therefore shrinks on-disk footprint by ~35 % for regular
-database, and ~75 % for DUPSORT database, while keeping read/write throughput on
-par with the uncompressed baseline.
+For this highly redundant data set, prefix compression therefore shrinks on-disk
+footprint by ~35 % for regular database, and ~75 % for DUPSORT database, while
+keeping read/write throughput on par with the uncompressed baseline.
