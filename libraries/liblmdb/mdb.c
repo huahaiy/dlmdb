@@ -1528,6 +1528,8 @@ typedef struct MDB_prefix_scratch {
 	unsigned int	entries_cap;	/**< number of cached entry slots */
 	unsigned char	*keybuf;	/**< contiguous decoded key storage */
 	size_t		keybuf_size;	/**< allocated bytes for decoded keys */
+	unsigned char	*encodedbuf;	/**< contiguous encoded key storage */
+	size_t		encodedbuf_size;/**< allocated bytes for encoded keys */
 	MDB_prefix_measure_cache measure_cache; /**< cached measure descriptors */
 	MDB_prefix_stride_cache stride_cache; /**< cached decoded length metadata */
 	MDB_prefix_metrics metrics; /**< instrumentation counters for prefix reads */
@@ -2627,6 +2629,45 @@ mdb_prefix_ensure_keybuf(MDB_txn *txn, size_t size, unsigned char **out)
 	return MDB_SUCCESS;
 }
 
+static int
+mdb_prefix_ensure_encbuf(MDB_txn *txn, size_t size, unsigned char **out)
+{
+	MDB_prefix_scratch *scratch = &txn->mt_prefix;
+	size_t baseline = mdb_prefix_prealloc_size(txn);
+	size_t required = size;
+
+	if (size == 0)
+		required = 1;
+	if (required < baseline)
+		required = baseline;
+
+	if (scratch->encodedbuf_size < required) {
+		size_t newsize = scratch->encodedbuf_size;
+
+		if (!newsize || newsize < baseline)
+			newsize = baseline;
+		if (!newsize)
+			newsize = required;
+
+		while (newsize < required) {
+			if (newsize > (SIZE_MAX >> 1)) {
+				newsize = required;
+				break;
+			}
+			newsize <<= 1;
+		}
+
+		unsigned char *ptr = realloc(scratch->encodedbuf, newsize);
+		if (!ptr)
+			return ENOMEM;
+		scratch->encodedbuf = ptr;
+		scratch->encodedbuf_size = newsize;
+	}
+	if (out)
+		*out = scratch->encodedbuf;
+	return MDB_SUCCESS;
+}
+
 static void
 mdb_prefix_stride_cache_clear(MDB_prefix_stride_cache *cache)
 {
@@ -3241,10 +3282,15 @@ mdb_prefix_scratch_clear(MDB_prefix_scratch *scratch)
 		free(scratch->keybuf);
 		scratch->keybuf = NULL;
 	}
+	if (scratch->encodedbuf) {
+		free(scratch->encodedbuf);
+		scratch->encodedbuf = NULL;
+	}
 	mdb_prefix_stride_cache_clear(&scratch->stride_cache);
 	scratch->snapshot_size = 0;
 	scratch->entries_cap = 0;
 	scratch->keybuf_size = 0;
+	scratch->encodedbuf_size = 0;
 	memset(&scratch->measure_cache, 0, sizeof(scratch->measure_cache));
 	memset(&scratch->metrics, 0, sizeof(scratch->metrics));
 }
@@ -3294,8 +3340,9 @@ static int mdb_prefix_inline_build_pair(MDB_cursor *mc, MDB_page *mp, size_t cap
 static int mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp,
     const MDB_val *old_trunk, indx_t insert, const MDB_val *new_key,
     MDB_val *new_data, unsigned int new_flags, MDB_page *ofp);
-static int mdb_leaf_rebuild_measure(MDB_env *env, MDB_prefix_rebuild_entry *entries,
-    unsigned int count, size_t capacity, size_t *used_out);
+static int mdb_leaf_rebuild_measure(MDB_env *env, MDB_txn *txn,
+    MDB_prefix_rebuild_entry *entries, unsigned int count, size_t capacity,
+    size_t *used_out);
 static int mdb_leaf_rebuild_apply(MDB_cursor *mc, MDB_page *mp,
     MDB_prefix_rebuild_entry *entries, unsigned int count, size_t capacity);
 static void mdb_leaf_refresh_xcursor(MDB_cursor *mc, MDB_page *mp, indx_t idx);
@@ -3409,7 +3456,8 @@ mdb_leaf_rebuild_after_trunk_delete(MDB_cursor *mc, MDB_page *mp, indx_t removed
 		++out;
 	}
 
-	rc = mdb_leaf_rebuild_measure(mc->mc_txn->mt_env, entries, remain, capacity, NULL);
+	rc = mdb_leaf_rebuild_measure(mc->mc_txn->mt_env, mc->mc_txn,
+	    entries, remain, capacity, NULL);
 	if (rc != MDB_SUCCESS)
 		return rc;
 
@@ -3593,7 +3641,8 @@ mdb_prefix_inline_measure_after_insert(MDB_cursor *mc, MDB_page *mp,
 		key_cursor += entries[i].key.mv_size;
 	}
 
-	rc = mdb_leaf_rebuild_measure(env, entries, new_total, env->me_psize, &needed);
+	rc = mdb_leaf_rebuild_measure(env, txn, entries, new_total, env->me_psize,
+	    &needed);
 	if (rc == MDB_SUCCESS && measure_cache) {
 		measure_cache->entries = entries;
 		measure_cache->keybuf = key_storage;
@@ -3800,7 +3849,7 @@ mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp,
 		entries[i].encoded_ksize = 0;
 	}
 
-	rc = mdb_leaf_rebuild_measure(env, entries, new_total, capacity, NULL);
+	rc = mdb_leaf_rebuild_measure(env, txn, entries, new_total, capacity, NULL);
 	if (rc != MDB_SUCCESS)
 		return rc;
 
@@ -3819,8 +3868,9 @@ mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp,
 }
 
 static int
-mdb_leaf_rebuild_measure(MDB_env *env, MDB_prefix_rebuild_entry *entries,
-    unsigned int count, size_t capacity, size_t *used_out)
+mdb_leaf_rebuild_measure(MDB_env *env, MDB_txn *txn,
+    MDB_prefix_rebuild_entry *entries, unsigned int count, size_t capacity,
+    size_t *used_out)
 {
 	size_t lower_base;
 	size_t used;
@@ -3828,7 +3878,9 @@ mdb_leaf_rebuild_measure(MDB_env *env, MDB_prefix_rebuild_entry *entries,
 	unsigned int i;
 	const MDB_val *trunk_full = NULL;
 	int rc = MDB_SUCCESS;
-	int trunk_cached = 0;
+	MDB_prefix_scratch *scratch = txn ? &txn->mt_prefix : NULL;
+	unsigned char *encoded_storage = NULL;
+	size_t total_encoded = 0;
 	(void)env;
 
 	limit = (capacity > PAGEBASE) ? (capacity - PAGEBASE) : 0;
@@ -3844,27 +3896,15 @@ mdb_leaf_rebuild_measure(MDB_env *env, MDB_prefix_rebuild_entry *entries,
 	}
 
 	trunk_full = &entries[0].key;
-	trunk_cached = entries[0].encoded_key != NULL;
-
 	for (i = 0; i < count; ++i) {
 		size_t key_bytes;
 		size_t node_bytes;
 		MDB_prefix_rebuild_entry *entry = &entries[i];
 
-		if (i == 0) {
+		if (i == 0)
 			key_bytes = entry->key.mv_size;
-		} else if (trunk_cached &&
-		    entry->encoded_key &&
-		    entry->shared_prefix != UINT16_MAX &&
-		    entry->shared_prefix <= trunk_full->mv_size &&
-		    entry->key.mv_size >= entry->shared_prefix) {
-			size_t shared = entry->shared_prefix;
-			size_t suffix_len = entry->key.mv_size - shared;
-			size_t header = mdb_varint_length(shared);
-			key_bytes = header + suffix_len;
-		} else {
+		else
 			key_bytes = mdb_leaf_encoded_size(trunk_full, &entry->key, NULL);
-		}
 
 		if (key_bytes > UINT16_MAX)
 			return MDB_BAD_VALSIZE;
@@ -3880,6 +3920,7 @@ mdb_leaf_rebuild_measure(MDB_env *env, MDB_prefix_rebuild_entry *entries,
 
 		used += node_bytes;
 		entries[i].encoded_ksize = (unsigned short)key_bytes;
+		total_encoded += key_bytes;
 	}
 
 	if (used_out)
@@ -3887,6 +3928,42 @@ mdb_leaf_rebuild_measure(MDB_env *env, MDB_prefix_rebuild_entry *entries,
 
 	if (used > limit)
 		rc = MDB_PAGE_FULL;
+
+	if (!scratch || rc != MDB_SUCCESS || total_encoded == 0)
+		return rc;
+
+	int erc = mdb_prefix_ensure_encbuf(txn, total_encoded, &encoded_storage);
+	if (erc != MDB_SUCCESS)
+		return erc;
+
+	unsigned char *cursor = encoded_storage;
+	for (i = 0; i < count; ++i) {
+		MDB_prefix_rebuild_entry *entry = &entries[i];
+		size_t key_bytes = entry->encoded_ksize;
+
+		entry->encoded_key = cursor;
+		entry->encoded_len = key_bytes;
+
+		if (i == 0) {
+			if (key_bytes && entry->key.mv_data)
+				memcpy(cursor, entry->key.mv_data, key_bytes);
+			entry->encoded_used = 0;
+			entry->shared_prefix = UINT16_MAX;
+		} else {
+			size_t shared = 0;
+			size_t wrote = mdb_leaf_encode_key(trunk_full, &entry->key,
+			    cursor, &shared);
+			if (wrote != key_bytes)
+				return MDB_CORRUPTED;
+			if (shared <= UINT16_MAX)
+				entry->shared_prefix = (unsigned short)shared;
+			else
+				entry->shared_prefix = UINT16_MAX;
+			entry->encoded_used = (unsigned short)mdb_varint_length(shared);
+		}
+
+		cursor += key_bytes;
+	}
 
 	return rc;
 }
@@ -3957,30 +4034,30 @@ mdb_leaf_rebuild_apply(MDB_cursor *mc, MDB_page *mp,
 			mdb_node_set_count(mp, node, 0);
 			SETDSZ(node, entry->data_size);
 
-			if (i == 0) {
-				if (trunk_full->mv_size)
-					memcpy(NODEKEY(mp, node), trunk_full->mv_data,
-					    trunk_full->mv_size);
-			} else if (trunk_cached &&
-			    entry->encoded_key &&
-			    entry->encoded_len == key_bytes) {
-				memcpy(NODEKEY(mp, node), entry->encoded_key, key_bytes);
-			} else if (trunk_cached &&
-			    entry->shared_prefix != UINT16_MAX &&
-			    entry->shared_prefix <= trunk_full->mv_size &&
-			    entry->key.mv_size >= entry->shared_prefix) {
-				size_t shared = entry->shared_prefix;
-				size_t suffix_len = entry->key.mv_size - shared;
-				unsigned char *dst = NODEKEY(mp, node);
-				size_t header = mdb_varint_encode(shared, dst);
-				if (suffix_len)
-					memcpy(dst + header,
-					    (const unsigned char *)entry->key.mv_data + shared,
-					    suffix_len);
-			} else {
-				mdb_leaf_encode_key(trunk_full, &entry->key,
-				    NODEKEY(mp, node), NULL);
-			}
+				if (entry->encoded_key &&
+				    entry->encoded_len == key_bytes) {
+					if (key_bytes)
+						memcpy(NODEKEY(mp, node), entry->encoded_key, key_bytes);
+				} else if (i == 0) {
+					if (trunk_full->mv_size && trunk_full->mv_data)
+						memcpy(NODEKEY(mp, node), trunk_full->mv_data,
+						    trunk_full->mv_size);
+				} else if (trunk_cached &&
+				    entry->shared_prefix != UINT16_MAX &&
+				    entry->shared_prefix <= trunk_full->mv_size &&
+				    entry->key.mv_size >= entry->shared_prefix) {
+					size_t shared = entry->shared_prefix;
+					size_t suffix_len = entry->key.mv_size - shared;
+					unsigned char *dst = NODEKEY(mp, node);
+					size_t header = mdb_varint_encode(shared, dst);
+					if (suffix_len)
+						memcpy(dst + header,
+						    (const unsigned char *)entry->key.mv_data + shared,
+						    suffix_len);
+				} else {
+					mdb_leaf_encode_key(trunk_full, &entry->key,
+					    NODEKEY(mp, node), NULL);
+				}
 
 			if (F_ISSET(entry->flags, F_BIGDATA)) {
 				if (entry->data_ptr)
@@ -11116,8 +11193,8 @@ more:
 						calc_entries[i].data_ptr = NULL;
 						calc_entries[i].key = measure_items[i];
 					}
-					rc2 = mdb_leaf_rebuild_measure(env, calc_entries, 2,
-					    env->me_psize, &required);
+					rc2 = mdb_leaf_rebuild_measure(env, mc->mc_txn,
+					    calc_entries, 2, env->me_psize, &required);
 					if (rc2 != MDB_SUCCESS && rc2 != MDB_PAGE_FULL)
 						return rc2;
 					if (rc2 == MDB_PAGE_FULL || required > env->me_psize) {
@@ -11711,7 +11788,8 @@ mdb_prefix_inline_build_pair(MDB_cursor *mc, MDB_page *mp, size_t capacity,
 			entries[i].shared_prefix = UINT16_MAX;
 		}
 
-		int rc = mdb_leaf_rebuild_measure(mc->mc_txn->mt_env, entries, 2, capacity, NULL);
+		int rc = mdb_leaf_rebuild_measure(mc->mc_txn->mt_env, mc->mc_txn,
+		    entries, 2, capacity, NULL);
 		if (rc != MDB_SUCCESS)
 			return rc;
 
