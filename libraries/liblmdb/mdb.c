@@ -1943,7 +1943,7 @@ mdb_cursor_seq_cmp_refresh(MDB_cursor *mc, MDB_page *mp, const MDB_val *search_k
 }
 
 static int
-mdb_leaf_cmp_memn_encoded(MDB_cursor *mc, MDB_page *mp, MDB_node *node,
+mdb_leaf_cmp_memn_encoded(MDB_page *mp, MDB_node *node,
 	const MDB_val *trunk, const MDB_val *search_key, size_t key_trunk_prefix,
 	int *cmp_res)
 {
@@ -1989,7 +1989,6 @@ mdb_leaf_cmp_memn_encoded(MDB_cursor *mc, MDB_page *mp, MDB_node *node,
 		unsigned char b = (pos < shared) ? trunk_bytes[pos] : suffix[pos - shared];
 		if (a != b) {
 			*cmp_res = (a < b) ? -1 : 1;
-			mc->mc_seq_shared = shared;
 			return MDB_SUCCESS;
 		}
 		pos++;
@@ -2002,7 +2001,6 @@ mdb_leaf_cmp_memn_encoded(MDB_cursor *mc, MDB_page *mp, MDB_node *node,
 	else
 		*cmp_res = 1;
 
-	mc->mc_seq_shared = shared;
 	return MDB_SUCCESS;
 }
 
@@ -8787,9 +8785,9 @@ mdb_node_search(MDB_cursor *mc, MDB_val *key, int *exactp)
 			if (need_prefix)
 				prefix = mdb_cursor_seq_cmp_refresh(mc, mp, key);
 
-			if (need_prefix && i > 0 && trunk.mv_data) {
-				int enc_rc = mdb_leaf_cmp_memn_encoded(mc, mp, node,
-					&trunk, key, prefix, &cmp_res);
+				if (need_prefix && i > 0 && trunk.mv_data) {
+					int enc_rc = mdb_leaf_cmp_memn_encoded(mp, node,
+						&trunk, key, prefix, &cmp_res);
 				if (enc_rc == MDB_SUCCESS) {
 					used_encoded = 1;
 				} else {
