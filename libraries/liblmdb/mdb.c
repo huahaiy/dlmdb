@@ -9891,25 +9891,9 @@ mdb_cursor_prev(MDB_cursor *mc, MDB_val *key, MDB_val *data, MDB_cursor_op op)
 	}
 
 	if (key) {
-		if (mc->mc_ki[mc->mc_top] + 1 < NUMKEYS(mp)) {
-			mc->mc_flags |= C_SEQEXPECT;
-			mc->mc_seq_pgno = mp->mp_pgno;
-			mc->mc_seq_idx = mc->mc_ki[mc->mc_top] + 1;
-		} else {
-			mc->mc_flags &= ~C_SEQEXPECT;
-			mdb_cursor_seq_invalidate(mc);
-		}
 		rc = mdb_cursor_read_key_at(mc, mp, mc->mc_ki[mc->mc_top], key);
-		mc->mc_flags &= ~C_SEQEXPECT;
-		if (rc != MDB_SUCCESS) {
-			mdb_cursor_seq_invalidate(mc);
+		if (rc != MDB_SUCCESS)
 			return rc;
-		}
-		mc->mc_seq_pgno = mp->mp_pgno;
-		mc->mc_seq_idx = mc->mc_ki[mc->mc_top];
-	} else {
-		mc->mc_flags &= ~C_SEQEXPECT;
-		mdb_cursor_seq_invalidate(mc);
 	}
 	return MDB_SUCCESS;
 }
