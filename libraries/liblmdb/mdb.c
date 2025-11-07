@@ -1942,6 +1942,70 @@ mdb_cursor_seq_cmp_refresh(MDB_cursor *mc, MDB_page *mp, const MDB_val *search_k
 	return prefix;
 }
 
+static int
+mdb_leaf_cmp_memn_encoded(MDB_cursor *mc, MDB_page *mp, MDB_node *node,
+	const MDB_val *trunk, const MDB_val *search_key, size_t key_trunk_prefix,
+	int *cmp_res)
+{
+	const unsigned char *encoded = NODEKEY(mp, node);
+	size_t encoded_len = node->mn_ksize;
+	const unsigned char *suffix;
+	size_t used = 0;
+	uint64_t shared64 = 0;
+	size_t shared = 0;
+	size_t suffix_len;
+	size_t candidate_len;
+	size_t skip;
+	size_t minlen;
+	size_t pos;
+	const unsigned char *key_bytes;
+	const unsigned char *trunk_bytes;
+
+	if (!encoded_len || !trunk || !trunk->mv_data || !search_key || !search_key->mv_data)
+		return MDB_BAD_VALSIZE;
+
+	int rc = mdb_prefix_decode_shared(encoded, encoded_len, &shared64, &used);
+	if (rc != MDB_SUCCESS)
+		return rc;
+
+	if (shared64 > trunk->mv_size)
+		shared64 = trunk->mv_size;
+	shared = (size_t)shared64;
+	if (used > encoded_len)
+		used = encoded_len;
+
+	suffix = encoded + used;
+	suffix_len = encoded_len - used;
+	candidate_len = shared + suffix_len;
+	key_bytes = (const unsigned char *)search_key->mv_data;
+	trunk_bytes = (const unsigned char *)trunk->mv_data;
+
+	skip = key_trunk_prefix < shared ? key_trunk_prefix : shared;
+	pos = skip;
+	minlen = search_key->mv_size < candidate_len ? search_key->mv_size : candidate_len;
+
+	while (pos < minlen) {
+		unsigned char a = key_bytes[pos];
+		unsigned char b = (pos < shared) ? trunk_bytes[pos] : suffix[pos - shared];
+		if (a != b) {
+			*cmp_res = (a < b) ? -1 : 1;
+			mc->mc_seq_shared = shared;
+			return MDB_SUCCESS;
+		}
+		pos++;
+	}
+
+	if (search_key->mv_size == candidate_len)
+		*cmp_res = 0;
+	else if (search_key->mv_size < candidate_len)
+		*cmp_res = -1;
+	else
+		*cmp_res = 1;
+
+	mc->mc_seq_shared = shared;
+	return MDB_SUCCESS;
+}
+
 	/** Check if there is an inited xcursor */
 #define XCURSOR_INITED(mc) \
 	((mc)->mc_xcursor && ((mc)->mc_xcursor->mx_cursor.mc_flags & C_INITIALIZED))
@@ -8661,6 +8725,7 @@ mdb_node_search(MDB_cursor *mc, MDB_val *key, int *exactp)
 	MDB_val	 nodekey;
 	MDB_cmp_func *cmp;
 	DKBUF;
+	MDB_val trunk = {0, NULL};
 
 	mc->mc_seq_cmp_pgno = P_INVALID;
 	mc->mc_seq_cmp_keyptr = NULL;
@@ -8677,6 +8742,12 @@ mdb_node_search(MDB_cursor *mc, MDB_val *key, int *exactp)
 	high = nkeys - 1;
 	cmp = mc->mc_dbx->md_cmp;
 	int prefix_enabled = (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) != 0;
+
+	if (IS_LEAF(mp) && prefix_enabled && nkeys > 0) {
+		MDB_node *trunk_node = NODEPTR(mp, 0);
+		trunk.mv_size = trunk_node->mn_ksize;
+		trunk.mv_data = NODEKEY(mp, trunk_node);
+	}
 
 	/* Branch pages have no data, so if using integer keys,
 	 * alignment is guaranteed. Use faster mdb_cmp_int.
@@ -8709,26 +8780,52 @@ mdb_node_search(MDB_cursor *mc, MDB_val *key, int *exactp)
 			i = (low + high) >> 1;
 
 			node = NODEPTR(mp, i);
-			if (IS_LEAF(mp) && (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION)) {
+			int used_encoded = 0;
+			size_t prefix = 0;
+			int need_prefix = IS_LEAF(mp) && prefix_enabled &&
+				key && key->mv_data && cmp == mdb_cmp_memn;
+			if (need_prefix)
+				prefix = mdb_cursor_seq_cmp_refresh(mc, mp, key);
+
+			if (need_prefix && i > 0 && trunk.mv_data) {
+				int enc_rc = mdb_leaf_cmp_memn_encoded(mc, mp, node,
+					&trunk, key, prefix, &cmp_res);
+				if (enc_rc == MDB_SUCCESS) {
+					used_encoded = 1;
+				} else {
+					if (enc_rc != MDB_BAD_VALSIZE)
+						goto bad;
+				}
+			}
+
+			if (!used_encoded) {
+				if (IS_LEAF(mp) && prefix_enabled) {
+					rc = mdb_cursor_read_key_at(mc, mp, i, &nodekey);
+					if (rc != MDB_SUCCESS)
+						goto bad;
+				} else {
+					nodekey.mv_size = NODEKSZ(node);
+					nodekey.mv_data = NODEKEY(mp, node);
+				}
+
+				if (need_prefix) {
+					size_t shared = mc->mc_seq_shared;
+					size_t skip = shared < prefix ? shared : prefix;
+					if (skip)
+						cmp_res = mdb_cmp_memn_with_skip(key, &nodekey, skip);
+					else
+						cmp_res = cmp(key, &nodekey);
+				} else {
+					cmp_res = cmp(key, &nodekey);
+				}
+			}
+#if MDB_DEBUG
+			if (used_encoded) {
 				rc = mdb_cursor_read_key_at(mc, mp, i, &nodekey);
 				if (rc != MDB_SUCCESS)
 					goto bad;
-			} else {
-				nodekey.mv_size = NODEKSZ(node);
-				nodekey.mv_data = NODEKEY(mp, node);
 			}
-
-			if (cmp == mdb_cmp_memn && prefix_enabled && key && key->mv_data && IS_LEAF(mp)) {
-				size_t prefix = mdb_cursor_seq_cmp_refresh(mc, mp, key);
-				size_t shared = mc->mc_seq_shared;
-				size_t skip = shared < prefix ? shared : prefix;
-				if (skip)
-					cmp_res = mdb_cmp_memn_with_skip(key, &nodekey, skip);
-				else
-					cmp_res = cmp(key, &nodekey);
-			} else {
-				cmp_res = cmp(key, &nodekey);
-			}
+#endif
 #if MDB_DEBUG
 			if (IS_LEAF(mp))
 				DPRINTF(("found leaf index %u [%s], rc = %i",
