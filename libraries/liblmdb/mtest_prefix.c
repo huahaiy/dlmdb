@@ -57,6 +57,11 @@ typedef struct {
 	DFDuplicate dups[DF_MAX_DUPS];
 } DFEntry;
 
+typedef struct {
+	const char *key_hex;
+	const char *val_hex;
+} prefix_hex_entry;
+
 static PFEntry pf_entries[PF_MAX_ENTRIES];
 static size_t pf_entry_count;
 static uint64_t pf_rng_state = UINT64_C(0x9e3779b97f4a7c15);
@@ -1204,6 +1209,115 @@ test_prefix_dupsort_cursor_walk(void)
 
 	mdb_cursor_close(cur);
 	mdb_txn_abort(txn);
+	mdb_env_close(env);
+	cleanup_env_dir(dir);
+}
+
+static void
+verify_encoded_reverse_walk(MDB_txn *txn, MDB_dbi dbi,
+    const prefix_hex_entry *entries)
+{
+	MDB_cursor *cur = NULL;
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+	MDB_val data = (MDB_val){ 0, NULL };
+
+	size_t warm_len = 0;
+	unsigned char *warm_buf =
+	    dup_hex_to_bytes(entries[0].key_hex, &warm_len);
+	MDB_val warm = { warm_len, warm_buf };
+	CHECK_CALL(mdb_cursor_get(cur, &warm, &data, MDB_SET_RANGE));
+	if (warm.mv_size != warm_len ||
+	    memcmp(warm.mv_data, warm_buf, warm_len) != 0) {
+		fprintf(stderr, "encoded range regression: warmup SET_RANGE mismatch\n");
+		exit(EXIT_FAILURE);
+	}
+
+	size_t seek_len = 0;
+	unsigned char *seek_buf =
+	    dup_hex_to_bytes(entries[2].key_hex, &seek_len);
+	MDB_val seek = { seek_len, seek_buf };
+	data.mv_size = 0;
+	data.mv_data = NULL;
+	CHECK_CALL(mdb_cursor_get(cur, &seek, &data, MDB_SET_RANGE));
+	if (seek.mv_size != seek_len ||
+	    memcmp(seek.mv_data, seek_buf, seek_len) != 0) {
+		fprintf(stderr, "encoded range regression: MDB_SET_RANGE returned wrong key\n");
+		exit(EXIT_FAILURE);
+	}
+	size_t expect2_len = 0;
+	unsigned char *expect2 =
+	    dup_hex_to_bytes(entries[2].val_hex, &expect2_len);
+	if (data.mv_size != expect2_len ||
+	    memcmp(data.mv_data, expect2, expect2_len) != 0) {
+		fprintf(stderr, "encoded range regression: MDB_SET_RANGE returned wrong data\n");
+		exit(EXIT_FAILURE);
+	}
+
+	MDB_val prev_key = (MDB_val){ 0, NULL };
+	MDB_val prev_data = (MDB_val){ 0, NULL };
+	CHECK_CALL(mdb_cursor_get(cur, &prev_key, &prev_data, MDB_PREV_NODUP));
+	size_t expect1_len = 0;
+	unsigned char *expect1 =
+	    dup_hex_to_bytes(entries[0].key_hex, &expect1_len);
+	if (prev_key.mv_size != expect1_len ||
+	    memcmp(prev_key.mv_data, expect1, expect1_len) != 0) {
+		fprintf(stderr, "encoded range regression: MDB_PREV returned wrong key\n");
+		exit(EXIT_FAILURE);
+	}
+
+	free(expect2);
+	free(expect1);
+	free(seek_buf);
+	free(warm_buf);
+	mdb_cursor_close(cur);
+}
+
+static void
+test_prefix_encoded_range_regression(void)
+{
+	static const char *dir = "testdb_prefix_encoded_range";
+	const char *db_name = "datalevin/eav";
+	prefix_hex_entry entries[] = {
+		{ "0000000000000001", "00000003fa50657472000000000000000000" },
+		{ "0000000000000001", "00000004c1000000000000002c000000000000000000" },
+		{ "0000000000000002", "00000003fa4976616e000000000000000000" },
+		{ "0000000000000002", "00000004c10000000000000019000000000000000000" },
+		{ "0000000000000003", "00000003fa536572676579000000000000000000" },
+		{ "0000000000000003", "00000004c1000000000000000b000000000000000000" },
+	};
+
+	MDB_env *env = create_env(dir);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, db_name,
+	    MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_DUPSORT, &dbi));
+
+	for (size_t i = 0; i < ARRAY_SIZE(entries); ++i) {
+		size_t key_len = 0, val_len = 0;
+		unsigned char *key_buf = dup_hex_to_bytes(entries[i].key_hex, &key_len);
+		unsigned char *val_buf = dup_hex_to_bytes(entries[i].val_hex, &val_len);
+		MDB_val key = { key_len, key_buf };
+		MDB_val data = { val_len, val_buf };
+		CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+		free(key_buf);
+		free(val_buf);
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, db_name,
+	    MDB_PREFIX_COMPRESSION | MDB_DUPSORT, &dbi));
+	verify_encoded_reverse_walk(txn, dbi, entries);
+	mdb_txn_abort(txn);
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, db_name,
+	    MDB_PREFIX_COMPRESSION | MDB_DUPSORT, &dbi));
+	verify_encoded_reverse_walk(txn, dbi, entries);
+	mdb_txn_abort(txn);
+
 	mdb_env_close(env);
 	cleanup_env_dir(dir);
 }
@@ -3435,6 +3549,7 @@ main(void)
   test_plain_tuples_get_both_range();
   test_prefix_tuples_ave_range_hit();
 	test_prefix_dupsort_cursor_walk();
+	test_prefix_encoded_range_regression();
 	test_prefix_dupsort_get_both_range();
 	test_prefix_leaf_splits();
 	test_prefix_alternating_prefixes();

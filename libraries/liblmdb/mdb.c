@@ -8785,9 +8785,9 @@ mdb_node_search(MDB_cursor *mc, MDB_val *key, int *exactp)
 			if (need_prefix)
 				prefix = mdb_cursor_seq_cmp_refresh(mc, mp, key);
 
-				if (need_prefix && i > 0 && trunk.mv_data) {
-					int enc_rc = mdb_leaf_cmp_memn_encoded(mp, node,
-						&trunk, key, prefix, &cmp_res);
+			if (need_prefix && i > 0 && trunk.mv_data) {
+				int enc_rc = mdb_leaf_cmp_memn_encoded(mp, node,
+					&trunk, key, prefix, &cmp_res);
 				if (enc_rc == MDB_SUCCESS) {
 					used_encoded = 1;
 				} else {
@@ -8817,6 +8817,13 @@ mdb_node_search(MDB_cursor *mc, MDB_val *key, int *exactp)
 					cmp_res = cmp(key, &nodekey);
 				}
 			}
+#if MDB_DEBUG
+			if (used_encoded) {
+				rc = mdb_cursor_read_key_at(mc, mp, i, &nodekey);
+				if (rc != MDB_SUCCESS)
+					goto bad;
+			}
+#endif
 #if MDB_DEBUG
 			if (used_encoded) {
 				rc = mdb_cursor_read_key_at(mc, mp, i, &nodekey);
@@ -10398,11 +10405,11 @@ fetchm:
 	case MDB_FIRST:
 		rc = mdb_cursor_first(mc, key, data);
 		break;
-	case MDB_FIRST_DUP:
-		mfunc = mdb_cursor_first;
-	mmove:
-		if (data == NULL || !(mc->mc_flags & C_INITIALIZED)) {
-			rc = EINVAL;
+case MDB_FIRST_DUP:
+	mfunc = mdb_cursor_first;
+mmove:
+	if (data == NULL || !(mc->mc_flags & C_INITIALIZED)) {
+		rc = EINVAL;
 			break;
 		}
 		if (mc->mc_xcursor == NULL) {
@@ -10432,11 +10439,17 @@ fetchm:
 			rc = EINVAL;
 			break;
 		}
-		rc = mfunc(&mc->mc_xcursor->mx_cursor, data, NULL);
-		break;
-	case MDB_LAST:
-		rc = mdb_cursor_last(mc, key, data);
-		break;
+	rc = mfunc(&mc->mc_xcursor->mx_cursor, data, NULL);
+	if (rc == MDB_SUCCESS && key) {
+		MDB_page *mp = mc->mc_pg[mc->mc_top];
+		int krc = mdb_cursor_read_key_at(mc, mp, mc->mc_ki[mc->mc_top], key);
+		if (krc != MDB_SUCCESS)
+			return krc;
+	}
+	break;
+case MDB_LAST:
+	rc = mdb_cursor_last(mc, key, data);
+	break;
 	case MDB_LAST_DUP:
 		mfunc = mdb_cursor_last;
 		goto mmove;
