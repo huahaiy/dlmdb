@@ -3056,6 +3056,10 @@ mdb_leaf_rebuild_after_trunk_delete(MDB_cursor *mc, MDB_page *mp, indx_t removed
 			entries[out].data_payload = entries[out].data_size;
 		entries[out].data_ptr = NODEDATA(src);
 		entries[out].encoded_ksize = 0;
+		entries[out].encoded_key = NULL;
+		entries[out].encoded_len = 0;
+		entries[out].encoded_used = 0;
+		entries[out].shared_prefix = UINT16_MAX;
 
 		rc = mdb_leaf_decode_key(old_trunk, NODEKEY(snapshot, src),
 		    src->mn_ksize, &decoded, keybuf, MDB_KEYBUF_MAX, 0, NULL);
@@ -3509,6 +3513,7 @@ mdb_leaf_rebuild_measure(MDB_env *env, MDB_prefix_rebuild_entry *entries,
 	unsigned int i;
 	const MDB_val *trunk_full = NULL;
 	int rc = MDB_SUCCESS;
+	int trunk_cached = 0;
 	(void)env;
 
 	limit = (capacity > PAGEBASE) ? (capacity - PAGEBASE) : 0;
@@ -3524,15 +3529,27 @@ mdb_leaf_rebuild_measure(MDB_env *env, MDB_prefix_rebuild_entry *entries,
 	}
 
 	trunk_full = &entries[0].key;
+	trunk_cached = entries[0].encoded_key != NULL;
 
 	for (i = 0; i < count; ++i) {
 		size_t key_bytes;
 		size_t node_bytes;
+		MDB_prefix_rebuild_entry *entry = &entries[i];
 
-		if (i == 0)
-			key_bytes = entries[i].key.mv_size;
-		else
-			key_bytes = mdb_leaf_encoded_size(trunk_full, &entries[i].key, NULL);
+		if (i == 0) {
+			key_bytes = entry->key.mv_size;
+		} else if (trunk_cached &&
+		    entry->encoded_key &&
+		    entry->shared_prefix != UINT16_MAX &&
+		    entry->shared_prefix <= trunk_full->mv_size &&
+		    entry->key.mv_size >= entry->shared_prefix) {
+			size_t shared = entry->shared_prefix;
+			size_t suffix_len = entry->key.mv_size - shared;
+			size_t header = mdb_varint_length(shared);
+			key_bytes = header + suffix_len;
+		} else {
+			key_bytes = mdb_leaf_encoded_size(trunk_full, &entry->key, NULL);
+		}
 
 		if (key_bytes > UINT16_MAX)
 			return MDB_BAD_VALSIZE;
@@ -3592,19 +3609,21 @@ mdb_leaf_rebuild_apply(MDB_cursor *mc, MDB_page *mp,
 		return MDB_PAGE_FULL;
 
 	{
-		MDB_val *trunk_full = &entries[0].key;
+		const MDB_val *trunk_full = &entries[0].key;
+		int trunk_cached = entries[0].encoded_key != NULL;
 		size_t max_decoded = 0;
 
 		for (i = 0; i < count; ++i) {
 			MDB_node *node;
 			size_t key_bytes;
 			size_t node_bytes;
+			MDB_prefix_rebuild_entry *entry = &entries[i];
 
-			if (entries && entries[i].key.mv_size > max_decoded)
-				max_decoded = entries[i].key.mv_size;
+			if (entries && entry->key.mv_size > max_decoded)
+				max_decoded = entry->key.mv_size;
 
-			key_bytes = entries[i].encoded_ksize;
-			node_bytes = NODESIZE + key_bytes + entries[i].data_payload;
+			key_bytes = entry->encoded_ksize;
+			node_bytes = NODESIZE + key_bytes + entry->data_payload;
 			node_bytes = EVEN(node_bytes);
 
 			if (node_bytes > ofs)
@@ -3616,24 +3635,43 @@ mdb_leaf_rebuild_apply(MDB_cursor *mc, MDB_page *mp,
 
 			node = NODEPTR(mp, i);
 			node->mn_ksize = key_bytes;
-			node->mn_flags = entries[i].flags;
+			node->mn_flags = entry->flags;
 			mdb_node_set_count(mp, node, 0);
-			SETDSZ(node, entries[i].data_size);
+			SETDSZ(node, entry->data_size);
 
-			if (i == 0)
-				mdb_leaf_encode_key(NULL, trunk_full, NODEKEY(mp, node), NULL);
-			else
-				mdb_leaf_encode_key(trunk_full, &entries[i].key,
+			if (i == 0) {
+				if (trunk_full->mv_size)
+					memcpy(NODEKEY(mp, node), trunk_full->mv_data,
+					    trunk_full->mv_size);
+			} else if (trunk_cached &&
+			    entry->encoded_key &&
+			    entry->encoded_len == key_bytes) {
+				memcpy(NODEKEY(mp, node), entry->encoded_key, key_bytes);
+			} else if (trunk_cached &&
+			    entry->shared_prefix != UINT16_MAX &&
+			    entry->shared_prefix <= trunk_full->mv_size &&
+			    entry->key.mv_size >= entry->shared_prefix) {
+				size_t shared = entry->shared_prefix;
+				size_t suffix_len = entry->key.mv_size - shared;
+				unsigned char *dst = NODEKEY(mp, node);
+				size_t header = mdb_varint_encode(shared, dst);
+				if (suffix_len)
+					memcpy(dst + header,
+					    (const unsigned char *)entry->key.mv_data + shared,
+					    suffix_len);
+			} else {
+				mdb_leaf_encode_key(trunk_full, &entry->key,
 				    NODEKEY(mp, node), NULL);
+			}
 
-			if (F_ISSET(entries[i].flags, F_BIGDATA)) {
-				if (entries[i].data_ptr)
-					memcpy(NODEDATA(node), entries[i].data_ptr, sizeof(pgno_t));
-			} else if (entries[i].data_payload) {
-				if (entries[i].data_ptr)
-					memcpy(NODEDATA(node), entries[i].data_ptr, entries[i].data_payload);
+			if (F_ISSET(entry->flags, F_BIGDATA)) {
+				if (entry->data_ptr)
+					memcpy(NODEDATA(node), entry->data_ptr, sizeof(pgno_t));
+			} else if (entry->data_payload) {
+				if (entry->data_ptr)
+					memcpy(NODEDATA(node), entry->data_ptr, entry->data_payload);
 				else
-					memset(NODEDATA(node), 0, entries[i].data_payload);
+					memset(NODEDATA(node), 0, entry->data_payload);
 			}
 		}
 
