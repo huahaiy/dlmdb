@@ -1506,6 +1506,21 @@ typedef struct MDB_prefix_measure_cache {
 	unsigned int valid;
 } MDB_prefix_measure_cache;
 
+typedef struct MDB_prefix_stride_entry {
+	pgno_t			pgno;
+	size_t			*lengths;
+	unsigned int	length_cap;
+	unsigned int	count;
+	size_t			max_len;
+	unsigned int	valid;
+} MDB_prefix_stride_entry;
+
+typedef struct MDB_prefix_stride_cache {
+	MDB_prefix_stride_entry	*entries;
+	unsigned int			count;
+	unsigned int			capacity;
+} MDB_prefix_stride_cache;
+
 typedef struct MDB_prefix_scratch {
 	void		*snapshot;		/**< cached page copy for prefix rebuild */
 	size_t		snapshot_size;	/**< allocated bytes for snapshot */
@@ -1514,6 +1529,7 @@ typedef struct MDB_prefix_scratch {
 	unsigned char	*keybuf;	/**< contiguous decoded key storage */
 	size_t		keybuf_size;	/**< allocated bytes for decoded keys */
 	MDB_prefix_measure_cache measure_cache; /**< cached measure descriptors */
+	MDB_prefix_stride_cache stride_cache; /**< cached decoded length metadata */
 	MDB_prefix_metrics metrics; /**< instrumentation counters for prefix reads */
 } MDB_prefix_scratch;
 
@@ -2612,6 +2628,288 @@ mdb_prefix_ensure_keybuf(MDB_txn *txn, size_t size, unsigned char **out)
 }
 
 static void
+mdb_prefix_stride_cache_clear(MDB_prefix_stride_cache *cache)
+{
+	if (!cache || !cache->entries)
+		return;
+	for (unsigned int i = 0; i < cache->count; ++i) {
+		free(cache->entries[i].lengths);
+		cache->entries[i].lengths = NULL;
+		cache->entries[i].length_cap = 0;
+		cache->entries[i].count = 0;
+		cache->entries[i].max_len = 0;
+		cache->entries[i].valid = 0;
+	}
+	free(cache->entries);
+	cache->entries = NULL;
+	cache->count = 0;
+	cache->capacity = 0;
+}
+
+static MDB_prefix_stride_entry *
+mdb_prefix_stride_entry_lookup(MDB_prefix_stride_cache *cache, pgno_t pgno,
+	unsigned int *pos)
+{
+	unsigned int left = 0, right = cache ? cache->count : 0;
+
+	while (left < right) {
+		unsigned int mid = left + ((right - left) >> 1);
+		MDB_prefix_stride_entry *entry = &cache->entries[mid];
+		if (entry->pgno == pgno) {
+			if (pos)
+				*pos = mid;
+			return entry;
+		}
+		if (entry->pgno < pgno)
+			left = mid + 1;
+		else
+			right = mid;
+	}
+	if (pos)
+		*pos = left;
+	return NULL;
+}
+
+static int
+mdb_prefix_stride_entry_acquire(MDB_prefix_stride_cache *cache, pgno_t pgno,
+	MDB_prefix_stride_entry **out)
+{
+	if (!cache || !out)
+		return EINVAL;
+
+	unsigned int slot = 0;
+	MDB_prefix_stride_entry *entry =
+	    mdb_prefix_stride_entry_lookup(cache, pgno, &slot);
+	if (entry) {
+		*out = entry;
+		return MDB_SUCCESS;
+	}
+
+	if (cache->count == cache->capacity) {
+		unsigned int newcap = cache->capacity ? cache->capacity << 1 : 8;
+		MDB_prefix_stride_entry *grown = realloc(cache->entries,
+		    newcap * sizeof(MDB_prefix_stride_entry));
+		if (!grown)
+			return ENOMEM;
+		cache->entries = grown;
+		cache->capacity = newcap;
+	}
+
+	if (slot < cache->count) {
+		memmove(&cache->entries[slot + 1], &cache->entries[slot],
+		    (cache->count - slot) * sizeof(MDB_prefix_stride_entry));
+	}
+	entry = &cache->entries[slot];
+	memset(entry, 0, sizeof(*entry));
+	entry->pgno = pgno;
+	cache->count++;
+	*out = entry;
+	return MDB_SUCCESS;
+}
+
+static int
+mdb_prefix_stride_entry_reserve(MDB_prefix_stride_entry *entry,
+	unsigned int need)
+{
+	if (!entry)
+		return EINVAL;
+	if (entry->length_cap >= need)
+		return MDB_SUCCESS;
+
+	unsigned int newcap = entry->length_cap ? entry->length_cap : 16;
+	while (newcap < need) {
+		if (newcap > (UINT_MAX >> 1)) {
+			newcap = need;
+			break;
+		}
+		newcap <<= 1;
+	}
+
+	size_t *buf = realloc(entry->lengths, sizeof(size_t) * newcap);
+	if (!buf)
+		return ENOMEM;
+	entry->lengths = buf;
+	entry->length_cap = newcap;
+	return MDB_SUCCESS;
+}
+
+static size_t
+mdb_prefix_decoded_length(size_t trunk_len, const unsigned char *encoded,
+	size_t encoded_len)
+{
+	if (!encoded_len)
+		return 0;
+	uint64_t shared64 = 0;
+	size_t used = 0;
+	int rc = mdb_prefix_decode_shared(encoded, encoded_len, &shared64, &used);
+	if (rc != MDB_SUCCESS)
+		return encoded_len;
+
+	if (shared64 > trunk_len)
+		shared64 = trunk_len;
+	if (used > encoded_len)
+		used = encoded_len;
+
+	return (size_t)shared64 + (encoded_len - used);
+}
+
+static int
+mdb_prefix_stride_entry_rebuild(MDB_cursor *mc, MDB_page *mp,
+	MDB_prefix_stride_entry *entry)
+{
+	if (!entry)
+		return MDB_SUCCESS;
+	if (!mc || !mp)
+		return MDB_SUCCESS;
+	if (!IS_LEAF(mp) || IS_LEAF2(mp) || IS_SUBP(mp))
+		return MDB_SUCCESS;
+
+	unsigned int total = NUMKEYS(mp);
+	int rc = mdb_prefix_stride_entry_reserve(entry, total ? total : 1);
+	if (rc != MDB_SUCCESS)
+		return rc;
+
+	entry->count = total;
+	size_t max_len = 0;
+
+	if (!total) {
+		entry->max_len = 0;
+		entry->valid = 1;
+		mdb_prefix_leaf_store_stride(mc, mp, 0);
+		return MDB_SUCCESS;
+	}
+
+	MDB_node *trunk = NODEPTR(mp, 0);
+	size_t trunk_len = trunk ? trunk->mn_ksize : 0;
+	entry->lengths[0] = trunk_len;
+	max_len = trunk_len;
+
+	for (unsigned int i = 1; i < total; ++i) {
+		MDB_node *node = NODEPTR(mp, i);
+		const unsigned char *encoded = NODEKEY(mp, node);
+		size_t len = mdb_prefix_decoded_length(trunk_len, encoded,
+		    node->mn_ksize);
+		entry->lengths[i] = len;
+		if (len > max_len)
+			max_len = len;
+	}
+
+	entry->max_len = max_len;
+	entry->valid = 1;
+	mdb_prefix_leaf_store_stride(mc, mp, max_len);
+	return MDB_SUCCESS;
+}
+
+static int
+mdb_prefix_stride_prepare(MDB_cursor *mc, MDB_page *mp,
+	MDB_prefix_stride_entry **out)
+{
+	if (out)
+		*out = NULL;
+	if (!mc || !mp || IS_SUBP(mp))
+		return MDB_SUCCESS;
+	if (mc->mc_txn->mt_flags & MDB_TXN_RDONLY)
+		return MDB_SUCCESS;
+	if (!(mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION))
+		return MDB_SUCCESS;
+	if (!IS_LEAF(mp) || IS_LEAF2(mp))
+		return MDB_SUCCESS;
+
+	MDB_prefix_scratch *scratch = &mc->mc_txn->mt_prefix;
+	MDB_prefix_stride_entry *entry = NULL;
+	int rc = mdb_prefix_stride_entry_acquire(&scratch->stride_cache,
+	    mp->mp_pgno, &entry);
+	if (rc != MDB_SUCCESS)
+		return rc;
+	if (!entry)
+		return MDB_SUCCESS;
+
+	if (!entry->valid || entry->count != NUMKEYS(mp)) {
+		entry->valid = 0;
+		rc = mdb_prefix_stride_entry_rebuild(mc, mp, entry);
+		if (rc != MDB_SUCCESS)
+			return rc;
+	}
+
+	if (out)
+		*out = entry;
+	return MDB_SUCCESS;
+}
+
+static int
+mdb_prefix_stride_apply_insert(MDB_prefix_stride_entry *entry, MDB_cursor *mc,
+	MDB_page *mp, indx_t indx, size_t keylen)
+{
+	if (!entry || !mc || !mp)
+		return MDB_SUCCESS;
+
+	unsigned int needed = entry->count + 1;
+	int rc = mdb_prefix_stride_entry_reserve(entry, needed);
+	if (rc != MDB_SUCCESS)
+		return rc;
+
+	if (indx > entry->count)
+		indx = entry->count;
+	if (entry->count > (unsigned int)indx) {
+		memmove(&entry->lengths[indx + 1], &entry->lengths[indx],
+		    (entry->count - indx) * sizeof(size_t));
+	}
+	entry->lengths[indx] = keylen;
+	entry->count++;
+	if (keylen > entry->max_len)
+		entry->max_len = keylen;
+	mdb_prefix_leaf_store_stride(mc, mp, entry->max_len);
+	return MDB_SUCCESS;
+}
+
+static void
+mdb_prefix_stride_apply_delete(MDB_prefix_stride_entry *entry, MDB_cursor *mc,
+	MDB_page *mp, indx_t indx)
+{
+	if (!entry || !mc || !mp)
+		return;
+	if (indx >= entry->count)
+		return;
+
+	size_t removed = entry->lengths[indx];
+	if (indx + 1 < entry->count) {
+		memmove(&entry->lengths[indx], &entry->lengths[indx + 1],
+		    (entry->count - indx - 1) * sizeof(size_t));
+	}
+	if (entry->count)
+		entry->count--;
+
+	if (!entry->count) {
+		entry->max_len = 0;
+		mdb_prefix_leaf_store_stride(mc, mp, 0);
+		return;
+	}
+
+	if (removed >= entry->max_len) {
+		size_t max_len = entry->lengths[0];
+		for (unsigned int i = 1; i < entry->count; ++i) {
+			if (entry->lengths[i] > max_len)
+				max_len = entry->lengths[i];
+		}
+		entry->max_len = max_len;
+	}
+	mdb_prefix_leaf_store_stride(mc, mp, entry->max_len);
+}
+
+static void
+mdb_prefix_stride_entry_invalidate(MDB_txn *txn, pgno_t pgno)
+{
+	if (!txn)
+		return;
+	MDB_prefix_stride_cache *cache = &txn->mt_prefix.stride_cache;
+	unsigned int slot = 0;
+	MDB_prefix_stride_entry *entry =
+	    mdb_prefix_stride_entry_lookup(cache, pgno, &slot);
+	if (entry)
+		entry->valid = 0;
+}
+
+static void
 mdb_cursor_leaf_cache_init(MDB_cursor_leaf_cache *cache)
 {
 	if (!cache)
@@ -2943,6 +3241,7 @@ mdb_prefix_scratch_clear(MDB_prefix_scratch *scratch)
 		free(scratch->keybuf);
 		scratch->keybuf = NULL;
 	}
+	mdb_prefix_stride_cache_clear(&scratch->stride_cache);
 	scratch->snapshot_size = 0;
 	scratch->entries_cap = 0;
 	scratch->keybuf_size = 0;
@@ -3599,6 +3898,9 @@ mdb_leaf_rebuild_apply(MDB_cursor *mc, MDB_page *mp,
 	unsigned int i;
 	size_t lower_base;
 	size_t ofs;
+
+	if (mc && mc->mc_txn)
+		mdb_prefix_stride_entry_invalidate(mc->mc_txn, mp->mp_pgno);
 
 	if (capacity <= PAGEBASE)
 		return MDB_PAGE_FULL;
@@ -11705,6 +12007,7 @@ mdb_node_add(MDB_cursor *mc, indx_t indx,
 	MDB_val	old_trunk = {0, NULL};
 	int	need_reencode = 0;
 	int	prefix_enabled = (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) != 0;
+	MDB_prefix_stride_entry *stride_entry = NULL;
 	mdb_cassert(mc, MP_UPPER(mp) >= MP_LOWER(mp));
 
 	DPRINTF(("add to %s %spage %"Yu" index %i, data size %"Z"u key size %"Z"u [%s]",
@@ -11908,6 +12211,12 @@ mdb_node_add(MDB_cursor *mc, indx_t indx,
 	if ((ssize_t)node_size > room)
 		goto full;
 
+	if (prefix_enabled && !need_reencode && IS_LEAF(mp) && !IS_LEAF2(mp)) {
+		int prc = mdb_prefix_stride_prepare(mc, mp, &stride_entry);
+		if (prc != MDB_SUCCESS)
+			return prc;
+	}
+
 update:
 	mdb_page_insert_slot(mc, mp, indx, node_size);
 
@@ -11964,14 +12273,21 @@ update:
 
 	if (IS_LEAF(mp) && !IS_LEAF2(mp)) {
 		if (prefix_enabled) {
-			size_t cached = MP_PAD(mp);
-			if (!cached) {
-				if (key && key->mv_data && NUMKEYS(mp) == 1)
+			if (stride_entry) {
+				int irc = mdb_prefix_stride_apply_insert(stride_entry, mc, mp,
+				    indx, key ? key->mv_size : 0);
+				if (irc != MDB_SUCCESS)
+					return irc;
+			} else if (key && key->mv_data) {
+				size_t cached = MP_PAD(mp);
+				if (!cached) {
+					if (NUMKEYS(mp) == 1)
+						mdb_prefix_leaf_store_stride(mc, mp, key->mv_size);
+					else
+						mdb_prefix_leaf_refresh_stride(mc, mp);
+				} else if (key->mv_size > cached) {
 					mdb_prefix_leaf_store_stride(mc, mp, key->mv_size);
-				else
-					mdb_prefix_leaf_refresh_stride(mc, mp);
-			} else if (key && key->mv_data && key->mv_size > cached) {
-				mdb_prefix_leaf_store_stride(mc, mp, key->mv_size);
+				}
 			}
 		} else {
 			mdb_prefix_leaf_store_stride(mc, mp, 0);
@@ -12005,9 +12321,7 @@ mdb_node_del(MDB_cursor *mc, int ksize)
 	unsigned char old_trunk_buf[MDB_KEYBUF_MAX];
 	MDB_val old_trunk = {0, NULL};
 	int prefix_enabled = (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) != 0;
-	size_t removed_decoded = 0;
-	int removed_can_skip_refresh = 0;
-	size_t cached_stride = 0;
+	MDB_prefix_stride_entry *stride_entry = NULL;
 
 	DPRINTF(("delete node %u on %s page %"Yu, indx,
 	    IS_LEAF(mp) ? "leaf" : "branch", mdb_dbg_pgno(mp)));
@@ -12024,6 +12338,11 @@ mdb_node_del(MDB_cursor *mc, int ksize)
 		if (rc != MDB_SUCCESS)
 			mdb_txn_mark_error(mc->mc_txn, rc);
 		return;
+	}
+
+	if (prefix_enabled && IS_LEAF(mp) && !IS_LEAF2(mp)) {
+		if (mdb_prefix_stride_prepare(mc, mp, &stride_entry) != MDB_SUCCESS)
+			stride_entry = NULL;
 	}
 
 	if (IS_LEAF2(mp)) {
@@ -12048,44 +12367,19 @@ mdb_node_del(MDB_cursor *mc, int ksize)
 	}
 	sz = EVEN(sz);
 
-	if (prefix_enabled && IS_LEAF(mp) && !IS_LEAF2(mp) && indx > 0) {
-		MDB_node *trunk = NODEPTR(mp, 0);
-		size_t trunk_len = trunk ? trunk->mn_ksize : 0;
-		const unsigned char *encoded = NODEKEY(mp, node);
-		uint64_t shared64 = 0;
-		size_t used = 0;
-		int vrc = MDB_SUCCESS;
-
-		if (encoded && node->mn_ksize > 0) {
-			vrc = mdb_prefix_decode_shared(encoded, node->mn_ksize, &shared64, &used);
-			if (vrc == MDB_SUCCESS) {
-				if (shared64 > trunk_len)
-					shared64 = trunk_len;
-				if (used > node->mn_ksize)
-					used = node->mn_ksize;
-				removed_decoded = (size_t)shared64 + (node->mn_ksize - used);
-			} else {
-				removed_decoded = node->mn_ksize;
-			}
-		} else {
-			removed_decoded = node->mn_ksize;
-		}
-		cached_stride = MP_PAD(mp);
-		if (cached_stride && removed_decoded < cached_stride)
-			removed_can_skip_refresh = 1;
-	}
+	if (stride_entry)
+		mdb_prefix_stride_apply_delete(stride_entry, mc, mp, indx);
 
 	mdb_page_remove_slot(mc, mp, indx, sz);
 
 	if (IS_LEAF(mp) && !IS_LEAF2(mp)) {
 		if (!prefix_enabled) {
 			mdb_prefix_leaf_store_stride(mc, mp, 0);
-		} else {
-			if (!NUMKEYS(mp)) {
+		} else if (!stride_entry) {
+			if (!NUMKEYS(mp))
 				mdb_prefix_leaf_store_stride(mc, mp, 0);
-			} else if (!removed_can_skip_refresh || cached_stride == 0) {
+			else
 				mdb_prefix_leaf_refresh_stride(mc, mp);
-			}
 		}
 	}
 }
@@ -13574,6 +13868,8 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 	DKBUF;
 
 	mp = mc->mc_pg[mc->mc_top];
+	if (mc->mc_txn)
+		mdb_prefix_stride_entry_invalidate(mc->mc_txn, mp->mp_pgno);
 	if (mc->mc_txn) {
 		mc->mc_txn->mt_prefix.measure_cache.valid = 0;
 	}
@@ -13589,6 +13885,8 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 	/* Create a right sibling. */
 	if ((rc = mdb_page_new(mc, mp->mp_flags, 1, &rp)))
 		return rc;
+	if (mc->mc_txn)
+		mdb_prefix_stride_entry_invalidate(mc->mc_txn, rp->mp_pgno);
 	rp->mp_pad = mp->mp_pad;
 	DPRINTF(("new right sibling: page %"Yu, rp->mp_pgno));
 
