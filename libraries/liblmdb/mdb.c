@@ -3014,8 +3014,6 @@ mdb_leaf_rebuild_after_trunk_delete(MDB_cursor *mc, MDB_page *mp, indx_t removed
 	MDB_prefix_rebuild_entry *entries = NULL;
 	unsigned char *key_storage;
 	unsigned char *key_cursor;
-	unsigned char keybuf[MDB_KEYBUF_MAX];
-	MDB_val decoded = {0, keybuf};
 	unsigned int out, i;
 	size_t total_key_bytes = 0;
 	int rc = MDB_SUCCESS;
@@ -3056,17 +3054,35 @@ mdb_leaf_rebuild_after_trunk_delete(MDB_cursor *mc, MDB_page *mp, indx_t removed
 			entries[out].data_payload = entries[out].data_size;
 		entries[out].data_ptr = NODEDATA(src);
 		entries[out].encoded_ksize = 0;
-		entries[out].encoded_key = NULL;
-		entries[out].encoded_len = 0;
+		entries[out].encoded_key = NODEKEY(snapshot, src);
+		entries[out].encoded_len = src->mn_ksize;
 		entries[out].encoded_used = 0;
 		entries[out].shared_prefix = UINT16_MAX;
 
-		rc = mdb_leaf_decode_key(old_trunk, NODEKEY(snapshot, src),
-		    src->mn_ksize, &decoded, keybuf, MDB_KEYBUF_MAX, 0, NULL);
-		if (rc != MDB_SUCCESS)
-			return rc;
-		entries[out].key.mv_size = decoded.mv_size;
-		total_key_bytes += decoded.mv_size;
+		size_t full_len = entries[out].encoded_len;
+		if (old_trunk && old_trunk->mv_data && entries[out].encoded_len > 0) {
+			uint64_t shared64 = 0;
+			size_t used = 0;
+			int vrc = mdb_prefix_decode_shared(entries[out].encoded_key,
+			    entries[out].encoded_len, &shared64, &used);
+			if (vrc == MDB_SUCCESS && used <= entries[out].encoded_len) {
+				if (shared64 > old_trunk->mv_size)
+					shared64 = old_trunk->mv_size;
+				size_t shared = (size_t)shared64;
+				size_t suffix_len = entries[out].encoded_len - used;
+				full_len = shared + suffix_len;
+				if (shared <= UINT16_MAX)
+					entries[out].shared_prefix = (unsigned short)shared;
+				else
+					entries[out].shared_prefix = UINT16_MAX;
+				entries[out].encoded_used = (unsigned short)used;
+			} else {
+				full_len = entries[out].encoded_len;
+			}
+		}
+
+		entries[out].key.mv_size = full_len;
+		total_key_bytes += full_len;
 		++out;
 	}
 
