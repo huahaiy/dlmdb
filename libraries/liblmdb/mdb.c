@@ -12005,6 +12005,9 @@ mdb_node_del(MDB_cursor *mc, int ksize)
 	unsigned char old_trunk_buf[MDB_KEYBUF_MAX];
 	MDB_val old_trunk = {0, NULL};
 	int prefix_enabled = (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) != 0;
+	size_t removed_decoded = 0;
+	int removed_can_skip_refresh = 0;
+	size_t cached_stride = 0;
 
 	DPRINTF(("delete node %u on %s page %"Yu, indx,
 	    IS_LEAF(mp) ? "leaf" : "branch", mdb_dbg_pgno(mp)));
@@ -12044,10 +12047,47 @@ mdb_node_del(MDB_cursor *mc, int ksize)
 			sz += NODEDSZ(node);
 	}
 	sz = EVEN(sz);
+
+	if (prefix_enabled && IS_LEAF(mp) && !IS_LEAF2(mp) && indx > 0) {
+		MDB_node *trunk = NODEPTR(mp, 0);
+		size_t trunk_len = trunk ? trunk->mn_ksize : 0;
+		const unsigned char *encoded = NODEKEY(mp, node);
+		uint64_t shared64 = 0;
+		size_t used = 0;
+		int vrc = MDB_SUCCESS;
+
+		if (encoded && node->mn_ksize > 0) {
+			vrc = mdb_prefix_decode_shared(encoded, node->mn_ksize, &shared64, &used);
+			if (vrc == MDB_SUCCESS) {
+				if (shared64 > trunk_len)
+					shared64 = trunk_len;
+				if (used > node->mn_ksize)
+					used = node->mn_ksize;
+				removed_decoded = (size_t)shared64 + (node->mn_ksize - used);
+			} else {
+				removed_decoded = node->mn_ksize;
+			}
+		} else {
+			removed_decoded = node->mn_ksize;
+		}
+		cached_stride = MP_PAD(mp);
+		if (cached_stride && removed_decoded < cached_stride)
+			removed_can_skip_refresh = 1;
+	}
+
 	mdb_page_remove_slot(mc, mp, indx, sz);
 
-	if (IS_LEAF(mp) && !IS_LEAF2(mp))
-		mdb_prefix_leaf_refresh_stride(mc, mp);
+	if (IS_LEAF(mp) && !IS_LEAF2(mp)) {
+		if (!prefix_enabled) {
+			mdb_prefix_leaf_store_stride(mc, mp, 0);
+		} else {
+			if (!NUMKEYS(mp)) {
+				mdb_prefix_leaf_store_stride(mc, mp, 0);
+			} else if (!removed_can_skip_refresh || cached_stride == 0) {
+				mdb_prefix_leaf_refresh_stride(mc, mp);
+			}
+		}
+	}
 }
 
 /** Compact the main page after deleting a node on a subpage.
