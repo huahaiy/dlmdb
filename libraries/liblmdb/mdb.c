@@ -4029,12 +4029,24 @@ mdb_leaf_rebuild_measure(MDB_env *env, MDB_txn *txn,
 	for (i = 0; i < count; ++i) {
 		size_t key_bytes;
 		size_t node_bytes;
+		size_t shared = 0;
 		MDB_prefix_rebuild_entry *entry = &entries[i];
 
 		if (i == 0)
 			key_bytes = entry->key.mv_size;
 		else
-			key_bytes = mdb_leaf_encoded_size(trunk_full, &entry->key, NULL);
+			key_bytes = mdb_leaf_encoded_size(trunk_full, &entry->key, &shared);
+
+		if (i == 0) {
+			entry->shared_prefix = UINT16_MAX;
+			entry->encoded_used = 0;
+		} else {
+			if (shared <= UINT16_MAX)
+				entry->shared_prefix = (unsigned short)shared;
+			else
+				entry->shared_prefix = UINT16_MAX;
+			entry->encoded_used = (unsigned short)mdb_varint_length(shared);
+		}
 
 		if (key_bytes > UINT16_MAX)
 			return MDB_BAD_VALSIZE;
@@ -4070,6 +4082,9 @@ mdb_leaf_rebuild_measure(MDB_env *env, MDB_txn *txn,
 	for (i = 0; i < count; ++i) {
 		MDB_prefix_rebuild_entry *entry = &entries[i];
 		size_t key_bytes = entry->encoded_ksize;
+		int have_shared_hint = (i != 0) &&
+		    (entry->shared_prefix != UINT16_MAX) &&
+		    entry->shared_prefix <= entry->key.mv_size;
 
 		entry->encoded_key = cursor;
 		entry->encoded_len = key_bytes;
@@ -4081,15 +4096,24 @@ mdb_leaf_rebuild_measure(MDB_env *env, MDB_txn *txn,
 			entry->shared_prefix = UINT16_MAX;
 		} else {
 			size_t shared = 0;
-			size_t wrote = mdb_leaf_encode_key(trunk_full, &entry->key,
-			    cursor, &shared);
+			size_t wrote;
+			if (have_shared_hint) {
+				shared = entry->shared_prefix;
+				wrote = mdb_leaf_encode_key_fast(&entry->key, shared, cursor);
+				if (!entry->encoded_used)
+					entry->encoded_used =
+					    (unsigned short)mdb_varint_length(shared);
+			} else {
+				wrote = mdb_leaf_encode_key(trunk_full, &entry->key,
+				    cursor, &shared);
+				if (shared <= UINT16_MAX)
+					entry->shared_prefix = (unsigned short)shared;
+				else
+					entry->shared_prefix = UINT16_MAX;
+				entry->encoded_used = (unsigned short)mdb_varint_length(shared);
+			}
 			if (wrote != key_bytes)
 				return MDB_CORRUPTED;
-			if (shared <= UINT16_MAX)
-				entry->shared_prefix = (unsigned short)shared;
-			else
-				entry->shared_prefix = UINT16_MAX;
-			entry->encoded_used = (unsigned short)mdb_varint_length(shared);
 		}
 
 		cursor += key_bytes;
