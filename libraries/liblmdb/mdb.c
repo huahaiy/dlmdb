@@ -2681,13 +2681,17 @@ mdb_prefix_stride_cache_clear(MDB_prefix_stride_cache *cache)
 {
 	if (!cache || !cache->entries)
 		return;
-	for (unsigned int i = 0; i < cache->count; ++i) {
-		free(cache->entries[i].lengths);
-		cache->entries[i].lengths = NULL;
-		cache->entries[i].length_cap = 0;
-		cache->entries[i].count = 0;
-		cache->entries[i].max_len = 0;
-		cache->entries[i].valid = 0;
+	for (unsigned int i = 0; i < cache->capacity; ++i) {
+		MDB_prefix_stride_entry *entry = &cache->entries[i];
+		if (entry->pgno == P_INVALID)
+			continue;
+		free(entry->lengths);
+		entry->lengths = NULL;
+		entry->length_cap = 0;
+		entry->count = 0;
+		entry->max_len = 0;
+		entry->valid = 0;
+		entry->pgno = P_INVALID;
 	}
 	free(cache->entries);
 	cache->entries = NULL;
@@ -2695,28 +2699,61 @@ mdb_prefix_stride_cache_clear(MDB_prefix_stride_cache *cache)
 	cache->capacity = 0;
 }
 
-static MDB_prefix_stride_entry *
-mdb_prefix_stride_entry_lookup(MDB_prefix_stride_cache *cache, pgno_t pgno,
-	unsigned int *pos)
+static unsigned int
+mdb_prefix_stride_hash(pgno_t pgno)
 {
-	unsigned int left = 0, right = cache ? cache->count : 0;
+	return (unsigned int)(pgno ^ (pgno >> 32));
+}
 
-	while (left < right) {
-		unsigned int mid = left + ((right - left) >> 1);
-		MDB_prefix_stride_entry *entry = &cache->entries[mid];
-		if (entry->pgno == pgno) {
-			if (pos)
-				*pos = mid;
+static MDB_prefix_stride_entry *
+mdb_prefix_stride_entry_find_slot(MDB_prefix_stride_entry *entries,
+	unsigned int capacity, pgno_t pgno)
+{
+	if (!entries || !capacity)
+		return NULL;
+	unsigned int mask = capacity - 1;
+	unsigned int hash = mdb_prefix_stride_hash(pgno);
+	unsigned int idx = hash & mask;
+	for (unsigned int probe = 0; probe < capacity; ++probe) {
+		MDB_prefix_stride_entry *entry = &entries[idx];
+		if (entry->pgno == pgno)
 			return entry;
-		}
-		if (entry->pgno < pgno)
-			left = mid + 1;
-		else
-			right = mid;
+		if (entry->pgno == P_INVALID)
+			return NULL;
+		idx = (idx + 1) & mask;
 	}
-	if (pos)
-		*pos = left;
 	return NULL;
+}
+
+static int
+mdb_prefix_stride_cache_grow(MDB_prefix_stride_cache *cache)
+{
+	unsigned int newcap = cache->capacity ? cache->capacity << 1 : 8;
+	MDB_prefix_stride_entry *fresh = calloc(newcap,
+	    sizeof(MDB_prefix_stride_entry));
+	if (!fresh)
+		return ENOMEM;
+	for (unsigned int i = 0; i < newcap; ++i)
+		fresh[i].pgno = P_INVALID;
+	if (cache->entries) {
+		for (unsigned int i = 0; i < cache->capacity; ++i) {
+			MDB_prefix_stride_entry *old = &cache->entries[i];
+			MDB_prefix_stride_entry tmp;
+			if (old->pgno == P_INVALID)
+				continue;
+			tmp = *old;
+			unsigned int mask = newcap - 1;
+			unsigned int hash = mdb_prefix_stride_hash(tmp.pgno);
+			unsigned int idx = hash & mask;
+			while (fresh[idx].pgno != P_INVALID)
+				idx = (idx + 1) & mask;
+			fresh[idx] = tmp;
+		}
+		free(cache->entries);
+	}
+	cache->entries = fresh;
+	cache->capacity = newcap;
+	return MDB_SUCCESS;
 }
 
 static int
@@ -2726,34 +2763,35 @@ mdb_prefix_stride_entry_acquire(MDB_prefix_stride_cache *cache, pgno_t pgno,
 	if (!cache || !out)
 		return EINVAL;
 
-	unsigned int slot = 0;
 	MDB_prefix_stride_entry *entry =
-	    mdb_prefix_stride_entry_lookup(cache, pgno, &slot);
+	    mdb_prefix_stride_entry_find_slot(cache->entries, cache->capacity,
+	    pgno);
 	if (entry) {
 		*out = entry;
 		return MDB_SUCCESS;
 	}
 
-	if (cache->count == cache->capacity) {
-		unsigned int newcap = cache->capacity ? cache->capacity << 1 : 8;
-		MDB_prefix_stride_entry *grown = realloc(cache->entries,
-		    newcap * sizeof(MDB_prefix_stride_entry));
-		if (!grown)
-			return ENOMEM;
-		cache->entries = grown;
-		cache->capacity = newcap;
+	if (!cache->capacity ||
+	    cache->count + 1 > (cache->capacity * 3) / 4) {
+		int grc = mdb_prefix_stride_cache_grow(cache);
+		if (grc != MDB_SUCCESS)
+			return grc;
 	}
 
-	if (slot < cache->count) {
-		memmove(&cache->entries[slot + 1], &cache->entries[slot],
-		    (cache->count - slot) * sizeof(MDB_prefix_stride_entry));
+	unsigned int mask = cache->capacity - 1;
+	unsigned int hash = mdb_prefix_stride_hash(pgno);
+	unsigned int idx = hash & mask;
+	for (;;) {
+		entry = &cache->entries[idx];
+		if (entry->pgno == P_INVALID) {
+			memset(entry, 0, sizeof(*entry));
+			entry->pgno = pgno;
+			cache->count++;
+			*out = entry;
+			return MDB_SUCCESS;
+		}
+		idx = (idx + 1) & mask;
 	}
-	entry = &cache->entries[slot];
-	memset(entry, 0, sizeof(*entry));
-	entry->pgno = pgno;
-	cache->count++;
-	*out = entry;
-	return MDB_SUCCESS;
 }
 
 static int
@@ -2951,9 +2989,9 @@ mdb_prefix_stride_entry_invalidate(MDB_txn *txn, pgno_t pgno)
 	if (!txn)
 		return;
 	MDB_prefix_stride_cache *cache = &txn->mt_prefix.stride_cache;
-	unsigned int slot = 0;
 	MDB_prefix_stride_entry *entry =
-	    mdb_prefix_stride_entry_lookup(cache, pgno, &slot);
+	    mdb_prefix_stride_entry_find_slot(cache->entries, cache->capacity,
+	    pgno);
 	if (entry)
 		entry->valid = 0;
 }
