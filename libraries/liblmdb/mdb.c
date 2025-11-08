@@ -4317,6 +4317,9 @@ static int	mdb_cursor_last(MDB_cursor *mc, MDB_val *key, MDB_val *data);
 static void	mdb_cursor_init(MDB_cursor *mc, MDB_txn *txn, MDB_dbi dbi, MDB_xcursor *mx);
 static void	mdb_xcursor_init0(MDB_cursor *mc);
 static void	mdb_xcursor_init2(MDB_cursor *mc, MDB_xcursor *src_mx, int force);
+#ifdef MDB_VL32
+static void mdb_cursor_unref(MDB_cursor *mc);
+#endif
 
 static int	mdb_drop0(MDB_cursor *mc, int subs);
 static void mdb_default_cmp(MDB_txn *txn, MDB_dbi dbi);
@@ -4626,6 +4629,9 @@ mdb_prefix_count(MDB_txn *txn, MDB_dbi dbi, const MDB_val *key,
 
 done:
 	mdb_cursor_leaf_cache_clear(&mc.mc_leaf_cache);
+#ifdef MDB_VL32
+	mdb_cursor_unref(&mc);
+#endif
 	return rc;
 }
 
