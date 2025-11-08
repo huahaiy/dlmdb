@@ -4544,11 +4544,15 @@ mdb_adjust_counted_parents(MDB_cursor *mc, MDB_page *leaf,
 			if (NODEPGNO(node) == leaf->mp_pgno) {
 				slot_matched = 1;
 				before = mdb_node_get_count(parent, node);
-				if (!split_performed && value_delta) {
-					int64_t tmp = (int64_t)before + value_delta;
-					if (tmp < 0)
-						tmp = 0;
-					after = (uint64_t)tmp;
+				if (!split_performed) {
+					if (value_delta) {
+						int64_t tmp = (int64_t)before + value_delta;
+						if (tmp < 0)
+							tmp = 0;
+						after = (uint64_t)tmp;
+					} else {
+						return;
+					}
 				} else {
 					leaf_total = mdb_page_subtree_count(leaf);
 					after = leaf_total;
