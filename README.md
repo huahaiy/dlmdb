@@ -86,36 +86,36 @@ int rc = mdb_count_range(txn, dbi, &low, &high, MDB_RANGE_INCLUDE_LOWER, &total)
 per key:
 
 ```
-./count_bench --entries 50000 --queries 100 --span 5000 --dups 100 --shuffle
-Benchmark with 50000 entries, 100 queries, span 5000
+./count_bench --entries 100000 --queries 200 --span 10000 --dups 20 --shuffle
+Benchmark with 100000 entries, 200 queries, span 10000
 Insert order: shuffled
 
 == Plain DB Inserts ==
-  plain:   25.44 ms (0.51 us/op)
-  counted: 25.04 ms (0.50 us/op)
-  overhead: -0.40 ms (-1.58%)
+  plain:   54.28 ms (0.54 us/op)
+  counted: 55.31 ms (0.55 us/op)
+  overhead: 1.03 ms (1.89%)
 
 == Range Count (keys) ==
-  naive cursor: 5.15 ms (51.49 us/op)
-  counted API:  0.07 ms (0.71 us/op)
-  speedup: 72.52x
+  naive cursor: 30.01 ms (150.06 us/op)
+  counted API:  0.18 ms (0.88 us/op)
+  speedup: 170.52x
 
 == Rank Lookup ==
-  naive (sampled 100): 18.87 ms (188.72 us/op)
-  cursor API:        0.02 ms (0.17 us/op)
-  mdb_get_rank:      0.02 ms (0.18 us/op)
-  speedup: 1110.12x
+  naive (sampled 128): 70.69 ms (552.30 us/op)
+  cursor API:        0.09 ms (0.43 us/op)
+  mdb_get_rank:      0.05 ms (0.23 us/op)
+  speedup: 1269.67x
 
 == Dupsort Inserts ==
-  plain:   1826.91 ms (0.37 us/op)
-  counted: 1828.93 ms (0.37 us/op)
-  overhead: 2.02 ms (0.11%)
+  plain:   960.70 ms (0.48 us/op)
+  counted: 979.46 ms (0.49 us/op)
+  overhead: 18.75 ms (1.95%)
 
 == Dupsort Range Count ==
-  dup/key: 100
-  cursor (mdb_cursor_count): 38.61 ms (386.07 us/op)
-  counted API:              0.10 ms (1.04 us/op)
-  speedup: 371.22x
+  dup/key: 20
+  cursor (mdb_cursor_count): 74.21 ms (371.04 us/op)
+  counted API:              0.23 ms (1.15 us/op)
+  speedup: 324.05x
 ```
 
 In short: counted metadata adds negligible write-time overhead while delivering
@@ -141,80 +141,96 @@ cursor API; the optimization is completely internal to the engine.
 ### Prefix compression performance
 
 `compress_bench` measures workloads with and without prefix compression. With
-1,000,000 entries, 64-byte values, 32-byte shared prefixes, a 2 GiB map, and
+1,000,000 entries, 64-byte values, 16-byte shared prefixes, and
 duplicate-heavy traffic:
 
 ```
-./compress_bench -n 1000000 -r 500000 -v 64 -p 32 -m 2048  -U 200000 -X 200000 -D 20
-
+./compress_bench -n 1000000 -r 500000 -v 64 -p 16 -m 4096  -U 500000 -X 500000 -D 20
 === plain (plain, unique) ===
-Insert: 960.479 ms (0.960 us/op, 1041147 op/s over 1000000 ops)
-Update: 192.540 ms (0.963 us/op, 1038745 op/s over 200000 ops)
-Delete: 279.387 ms (1.397 us/key, 715853 key/s over 200000 keys)
-Reinsert: 232.080 ms (1.160 us/key, 861772 key/s over 200000 keys)
-Random Read (cold): 373.584 ms (0.747 us/op, 1338387 op/s over 500000 ops)
-Random Read (warm): 363.248 ms (0.726 us/op, 1376470 op/s over 500000 ops)
-Range Scan (cold): 6.883 ms (0.027 us/key, 37193084 key/s over 256000 keys)
-Range Scan (warm): 3.833 ms (0.015 us/key, 66788416 key/s over 256000 keys)
-Map: 509.12 MiB used / 2.00 GiB configured
+Entries: 1000000, Value bytes: 64, Prefix bytes: 16
+Insert: 892.050 ms (0.892 us/op, 1121013 op/s over 1000000 ops)
+Update: 429.478 ms (0.859 us/op, 1164204 op/s over 500000 ops)
+Delete: 664.230 ms (1.328 us/key, 752751 key/s over 500000 keys)
+Reinsert: 506.389 ms (1.013 us/key, 987383 key/s over 500000 keys)
+Random Read (cold): 385.790 ms (0.772 us/op, 1296042 op/s over 500000 ops)
+Random Read (warm): 376.617 ms (0.753 us/op, 1327609 op/s over 500000 ops)
+Range Scan (cold): 6.989 ms (0.027 us/key, 36628988 key/s over 256000 keys)
+Range Scan (warm): 4.172 ms (0.016 us/key, 61361457 key/s over 256000 keys)
+Files: data 440.25 MiB, lock 0.00 B (total 440.25 MiB)
+Map: 440.25 MiB used / 4.00 GiB configured
+Tree: depth=3, pages(branch=33, leaf=9348, overflow=0), page size=16384
 
 === prefix (prefix, unique) ===
-Insert: 1055.974 ms (1.056 us/op, 946993 op/s over 1000000 ops)
-Update: 190.974 ms (0.955 us/op, 1047263 op/s over 200000 ops)
-Delete: 355.270 ms (1.776 us/key, 562952 key/s over 200000 keys)
-Reinsert: 241.767 ms (1.209 us/key, 827243 key/s over 200000 keys)
-Random Read (cold): 389.688 ms (0.779 us/op, 1283078 op/s over 500000 ops)
-Random Read (warm): 368.862 ms (0.738 us/op, 1355520 op/s over 500000 ops)
-Range Scan (cold): 6.506 ms (0.025 us/key, 39348294 key/s over 256000 keys)
-Range Scan (warm): 4.489 ms (0.018 us/key, 57028291 key/s over 256000 keys)
-Map: 331.83 MiB used / 2.00 GiB configured
+Entries: 1000000, Value bytes: 64, Prefix bytes: 16
+Insert: 901.957 ms (0.902 us/op, 1108700 op/s over 1000000 ops)
+Update: 378.016 ms (0.756 us/op, 1322695 op/s over 500000 ops)
+Delete: 764.350 ms (1.529 us/key, 654151 key/s over 500000 keys)
+Reinsert: 504.187 ms (1.008 us/key, 991696 key/s over 500000 keys)
+Random Read (cold): 364.227 ms (0.728 us/op, 1372770 op/s over 500000 ops)
+Random Read (warm): 332.968 ms (0.666 us/op, 1501646 op/s over 500000 ops)
+Range Scan (cold): 6.535 ms (0.026 us/key, 39173680 key/s over 256000 keys)
+Range Scan (warm): 4.461 ms (0.017 us/key, 57386236 key/s over 256000 keys)
+Files: data 331.89 MiB, lock 0.00 B (total 331.89 MiB)
+Map: 331.89 MiB used / 4.00 GiB configured
+Tree: depth=3, pages(branch=33, leaf=7040, overflow=0), page size=16384
 
 === plain-dups (plain, dupsort) ===
-Insert: 1335.676 ms (1.336 us/op, 748685 op/s over 1000000 ops)
-Update: 421.925 ms (2.110 us/op, 474018 op/s over 200000 ops)
-Delete: 265.496 ms (1.327 us/key, 753307 key/s over 200000 keys)
-Reinsert: 337.803 ms (1.689 us/key, 592061 key/s over 200000 keys)
-Random Read (cold): 473.842 ms (0.948 us/op, 1055204 op/s over 500000 ops)
-Random Read (warm): 406.730 ms (0.813 us/op, 1229317 op/s over 500000 ops)
-Range Scan (cold): 6.411 ms (0.025 us/key, 39931368 key/s over 256000 keys)
-Range Scan (warm): 4.827 ms (0.019 us/key, 53035011 key/s over 256000 keys)
-Map: 344.14 MiB used / 2.00 GiB configured
+Entries: 1000000, Value bytes: 64, Prefix bytes: 16, Duplicates/key target: 20 (~50000 unique keys)
+Insert: 1221.752 ms (1.222 us/op, 818497 op/s over 1000000 ops)
+Update: 970.830 ms (1.942 us/op, 515023 op/s over 500000 ops)
+Delete: 612.807 ms (1.226 us/key, 815918 key/s over 500000 keys)
+Reinsert: 706.770 ms (1.414 us/key, 707444 key/s over 500000 keys)
+Random Read (cold): 384.830 ms (0.770 us/op, 1299275 op/s over 500000 ops)
+Random Read (warm): 373.916 ms (0.748 us/op, 1337199 op/s over 500000 ops)
+Range Scan (cold): 6.538 ms (0.026 us/key, 39155705 key/s over 256000 keys)
+Range Scan (warm): 4.442 ms (0.017 us/key, 57631697 key/s over 256000 keys)
+Files: data 339.59 MiB, lock 0.00 B (total 339.59 MiB)
+Map: 339.59 MiB used / 4.00 GiB configured
+Tree: depth=3, pages(branch=33, leaf=7206, overflow=0), page size=16384
 
 === prefix-dups (prefix, dupsort) ===
-Insert: 1407.319 ms (1.407 us/op, 710571 op/s over 1000000 ops)
-Update: 509.726 ms (2.549 us/op, 392368 op/s over 200000 ops)
-Delete: 252.931 ms (1.265 us/key, 790729 key/s over 200000 keys)
-Reinsert: 347.707 ms (1.739 us/key, 575197 key/s over 200000 keys)
-Random Read (cold): 354.284 ms (0.709 us/op, 1411297 op/s over 500000 ops)
-Random Read (warm): 340.684 ms (0.681 us/op, 1467636 op/s over 500000 ops)
-Range Scan (cold): 5.095 ms (0.020 us/key, 50245339 key/s over 256000 keys)
-Range Scan (warm): 4.315 ms (0.017 us/key, 59327926 key/s over 256000 keys)
-Map: 74.14 MiB used / 2.00 GiB configured
+Entries: 1000000, Value bytes: 64, Prefix bytes: 16, Duplicates/key target: 20 (~50000 unique keys)
+Insert: 1025.675 ms (1.026 us/op, 974968 op/s over 1000000 ops)
+Update: 762.434 ms (1.525 us/op, 655794 op/s over 500000 ops)
+Delete: 361.905 ms (0.724 us/key, 1381578 key/s over 500000 keys)
+Reinsert: 476.998 ms (0.954 us/key, 1048222 key/s over 500000 keys)
+Random Read (cold): 308.160 ms (0.616 us/op, 1622534 op/s over 500000 ops)
+Random Read (warm): 297.377 ms (0.595 us/op, 1681367 op/s over 500000 ops)
+Range Scan (cold): 5.128 ms (0.020 us/key, 49921997 key/s over 256000 keys)
+Range Scan (warm): 4.360 ms (0.017 us/key, 58715596 key/s over 256000 keys)
+Files: data 77.44 MiB, lock 0.00 B (total 77.44 MiB)
+Map: 77.44 MiB used / 4.00 GiB configured
+Tree: depth=3, pages(branch=9, leaf=1679, overflow=0), page size=16384
 
 --- Relative to plain ---
-Insert time: 1.099x (960.479 ms -> 1055.974 ms)
-Update time: 0.992x (192.540 ms -> 190.974 ms)
-Delete time: 1.272x (279.387 ms -> 355.270 ms)
-Reinsert time: 1.042x (232.080 ms -> 241.767 ms)
-Random read (warm): 1.015x
-Random read (cold): 1.043x
-Range scan (warm): 1.171x
-Map used: 0.652x (509.12 MiB -> 331.83 MiB)
-Leaf pages: 0.652x (10810 -> 7049)
+Insert time: 1.011x (892.050 ms -> 901.957 ms)
+Update time: 0.880x (429.478 ms -> 378.016 ms)
+Delete time: 1.151x (664.230 ms -> 764.350 ms)
+Reinsert time: 0.996x (506.389 ms -> 504.187 ms)
+Random read (warm): 0.884x
+Random read (cold): 0.944x
+Range scan (warm): 1.069x
+Data size: 0.754x (461635584 -> 348012544 bytes)
+Map used: 0.754x (440.25 MiB -> 331.89 MiB)
+Leaf pages: 0.753x (9348 -> 7040)
 
 --- Relative to plain-dups ---
-Insert time: 1.054x (1335.676 ms -> 1407.319 ms)
-Update time: 1.208x (421.925 ms -> 509.726 ms)
-Delete time: 0.953x (265.496 ms -> 252.931 ms)
-Reinsert time: 1.029x (337.803 ms -> 347.707 ms)
-Random read (warm): 0.838x
-Random read (cold): 0.748x
-Range scan (warm): 0.894x
-Map used: 0.215x (344.14 MiB -> 74.14 MiB)
-Leaf pages: 0.218x (7302 -> 1590)
+Insert time: 0.840x (1221.752 ms -> 1025.675 ms)
+Update time: 0.785x (970.830 ms -> 762.434 ms)
+Delete time: 0.591x (612.807 ms -> 361.905 ms)
+Reinsert time: 0.675x (706.770 ms -> 476.998 ms)
+Random read (warm): 0.795x
+Random read (cold): 0.801x
+Range scan (warm): 0.982x
+Data size: 0.228x (356089856 -> 81199104 bytes)
+Map used: 0.228x (339.59 MiB -> 77.44 MiB)
+Leaf pages: 0.233x (7206 -> 1679)
 
 ```
 
 For this highly redundant data set, prefix compression therefore shrinks on-disk
-footprint by ~35 % for regular database, and ~75 % for DUPSORT database, while
-keeping read/write throughput on par with the uncompressed baseline.
+footprint by ~25 % for regular database and ~75 % for DUPSORT database, while
+keeping read/write throughput on par with the uncompressed baseline. In fact,
+compressed performance is generally slightly better than the uncompressed cases
+in DUPSORT workloads. As Datalevin's triple storage uses this format, we did
+more optimizations.
