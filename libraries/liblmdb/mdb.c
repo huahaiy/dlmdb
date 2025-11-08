@@ -1543,7 +1543,6 @@ typedef struct MDB_prefix_scratch {
 	size_t		encodedbuf_size;/**< allocated bytes for encoded keys */
 	MDB_prefix_measure_cache measure_cache; /**< cached measure descriptors */
 	MDB_prefix_stride_cache stride_cache; /**< cached decoded length metadata */
-	MDB_prefix_metrics metrics; /**< instrumentation counters for prefix reads */
 } MDB_prefix_scratch;
 
 typedef struct MDB_cursor_leaf_cache {
@@ -1902,7 +1901,6 @@ mdb_cursor_try_seq_fastpath(MDB_cursor *mc, MDB_page *mp, MDB_node *node,
 	mc->mc_key_last = idx;
 	mc->mc_seq_shared = shared;
 	mc->mc_seq_keybuf_valid = 1;
-	scratch->metrics.leaf_decode_cache_hits++;
 	*out = mc->mc_key;
 	return 1;
 }
@@ -2071,7 +2069,6 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 
 			if (!prefix_enabled || idx == 0) {
 				if (prefix_enabled && idx == 0) {
-					scratch->metrics.leaf_decode_cache_hits++;
 					mc->mc_key_pgno = mp->mp_pgno;
 					mc->mc_key_last = idx;
 					mc->mc_key.mv_size = node->mn_ksize;
@@ -2130,7 +2127,6 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 				}
 				if (!cache->decoded_ready[idx]) {
 					MDB_val *slot = &cache->decoded_vals[idx];
-					int fast_path = node->mn_ksize > 0 && (encoded[0] & 0x80) == 0;
 					int drc = mdb_leaf_decode_key(&cache->decoded_vals[0],
 					    encoded, node->mn_ksize,
 					    slot, slot->mv_data, cache->decoded_stride, 0,
@@ -2138,12 +2134,6 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 					if (drc != MDB_SUCCESS)
 						return drc;
 					cache->decoded_ready[idx] = 1;
-					scratch->metrics.leaf_decode_calls++;
-					scratch->metrics.leaf_decode_cache_misses++;
-					if (fast_path)
-						scratch->metrics.leaf_decode_fastpath++;
-				} else {
-					scratch->metrics.leaf_decode_cache_hits++;
 				}
 				*out = cache->decoded_vals[idx];
 				mc->mc_seq_shared = shared_hint;
@@ -2168,13 +2158,6 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 		mc->mc_seq_cached_idx = (indx_t)~0;
 		mc->mc_seq_cached_shared = 0;
 		mc->mc_seq_cached_used = 0;
-		if (prefix_enabled) {
-			int fast_path = node->mn_ksize > 0 && (encoded[0] & 0x80) == 0;
-			scratch->metrics.leaf_decode_calls++;
-			scratch->metrics.leaf_decode_cache_misses++;
-			if (fast_path)
-				scratch->metrics.leaf_decode_fastpath++;
-		}
 		*out = mc->mc_key;
 		return MDB_SUCCESS;
 	}
@@ -3364,8 +3347,6 @@ mdb_cursor_leaf_cache_prepare(MDB_cursor *mc, MDB_page *mp)
 	cache->decoded_stride = stride;
 	cache->decoded_source = source;
 
-	if (total > 0)
-		scratch->metrics.leaf_cache_pages++;
 	return MDB_SUCCESS;
 
 fail:
@@ -3400,7 +3381,6 @@ mdb_prefix_scratch_clear(MDB_prefix_scratch *scratch)
 	scratch->keybuf_size = 0;
 	scratch->encodedbuf_size = 0;
 	memset(&scratch->measure_cache, 0, sizeof(scratch->measure_cache));
-	memset(&scratch->metrics, 0, sizeof(scratch->metrics));
 }
 
 static MDB_xcursor *
@@ -15726,18 +15706,6 @@ cleanup:
 		MDB_CURSOR_UNREF(&mc, 1);
 	}
 	return rc;
-}
-
-int ESECT
-mdb_prefix_metrics(MDB_txn *txn, MDB_prefix_metrics *out, int reset)
-{
-	if (!txn || !out)
-		return EINVAL;
-	MDB_prefix_scratch *scratch = &txn->mt_prefix;
-	*out = scratch->metrics;
-	if (reset)
-		memset(&scratch->metrics, 0, sizeof(scratch->metrics));
-	return MDB_SUCCESS;
 }
 
 static int
