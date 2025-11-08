@@ -999,10 +999,6 @@ enum {
  * Each non-metapage up to #MDB_meta.%mm_last_pg is reachable exactly once
  * in the snapshot: Either used by a database or listed in a freeDB record.
  */
-#if !defined(MISALIGNED_OK)
-#pragma pack(push, 1)
-#endif
-
 typedef struct MDB_page {
 #define	mp_pgno	mp_p.p_pgno
 #define	mp_next	mp_p.p_next
@@ -1041,7 +1037,7 @@ typedef struct MDB_page {
 		uint32_t	pb_pages;	/**< number of overflow pages */
 	} mp_pb;
 	indx_t		mp_ptrs[0];		/**< dynamic size */
-} MDB_page;
+} MDB_page __attribute__((aligned(1)));
 
 /** Alternate page header, for 2-byte aligned access */
 typedef struct MDB_page2 {
@@ -1053,11 +1049,30 @@ typedef struct MDB_page2 {
 	indx_t		mp2_ptrs[0];
 } MDB_page2;
 
-#if !defined(MISALIGNED_OK)
-#pragma pack(pop)
+static pgno_t
+mdb_page_pgno_get(const MDB_page *mp)
+{
+#ifdef MISALIGNED_OK
+	return mp->mp_pgno;
+#else
+	pgno_t pgno;
+	memcpy(&pgno, &mp->mp_pgno, sizeof(pgno));
+	return pgno;
 #endif
+}
 
-#define MP_PGNO(p)	(((MDB_page2 *)(void *)(p))->mp2_p)
+static void
+mdb_page_pgno_set(MDB_page *mp, pgno_t pgno)
+{
+#ifdef MISALIGNED_OK
+	mp->mp_pgno = pgno;
+#else
+	memcpy(&mp->mp_pgno, &pgno, sizeof(pgno));
+#endif
+}
+
+#define MP_PGNO(p)	mdb_page_pgno_get((const MDB_page *)(p))
+#define MP_SETPGNO(p,v)	mdb_page_pgno_set((MDB_page *)(p), (v))
 #define MP_PAD(p)	(((MDB_page2 *)(void *)(p))->mp2_pad)
 #define MP_FLAGS(p)	(((MDB_page2 *)(void *)(p))->mp2_flags)
 #define MP_LOWER(p)	(((MDB_page2 *)(void *)(p))->mp2_lower)
@@ -1192,32 +1207,6 @@ typedef struct MDB_node {
 	/** The size of a key in a node */
 #define NODEKSZ(node)	 ((node)->mn_ksize)
 
-	/** Copy a page number from src to dst */
-#ifdef MISALIGNED_OK
-#define COPY_PGNO(dst,src)	dst = src
-#undef MP_PGNO
-#define MP_PGNO(p)	((p)->mp_pgno)
-#else
-#if MDB_SIZE_MAX > 0xffffffffU
-#define COPY_PGNO(dst,src)	do { \
-	unsigned short *s, *d;	\
-	s = (unsigned short *)&(src);	\
-	d = (unsigned short *)&(dst);	\
-	*d++ = *s++;	\
-	*d++ = *s++;	\
-	*d++ = *s++;	\
-	*d = *s;	\
-} while (0)
-#else
-#define COPY_PGNO(dst,src)	do { \
-	unsigned short *s, *d;	\
-	s = (unsigned short *)&(src);	\
-	d = (unsigned short *)&(dst);	\
-	*d++ = *s++;	\
-	*d = *s;	\
-} while (0)
-#endif
-#endif
 	/** The address of a key in a LEAF2 page.
 	 *	LEAF2 pages are used for #MDB_DUPFIXED sorted-duplicate sub-DBs.
 	 *	There are no node headers, keys are stored contiguously.
@@ -1848,7 +1837,7 @@ mdb_cursor_try_seq_fastpath(MDB_cursor *mc, MDB_page *mp, MDB_node *node,
 		return 0;
 
 	if (mc->mc_seq_keybuf_valid &&
-	    mc->mc_seq_pgno == mp->mp_pgno &&
+	    mc->mc_seq_pgno == MP_PGNO(mp) &&
 	    mc->mc_seq_idx != (indx_t)~0 &&
 	    mc->mc_seq_idx + 1 == idx) {
 		prev_shared = mc->mc_seq_shared;
@@ -1860,7 +1849,7 @@ mdb_cursor_try_seq_fastpath(MDB_cursor *mc, MDB_page *mp, MDB_node *node,
 		shared = first;
 		used = 1;
 	} else if (mc->mc_seq_cache_valid &&
-		   mc->mc_seq_cached_pgno == mp->mp_pgno &&
+		   mc->mc_seq_cached_pgno == MP_PGNO(mp) &&
 		   mc->mc_seq_cached_idx == idx) {
 		shared = mc->mc_seq_cached_shared;
 		used = mc->mc_seq_cached_used;
@@ -1875,7 +1864,7 @@ mdb_cursor_try_seq_fastpath(MDB_cursor *mc, MDB_page *mp, MDB_node *node,
 	if (used > encoded_len)
 		return 0;
 
-	mc->mc_seq_cached_pgno = mp->mp_pgno;
+	mc->mc_seq_cached_pgno = MP_PGNO(mp);
 	mc->mc_seq_cached_idx = idx;
 	mc->mc_seq_cached_shared = shared;
 	mc->mc_seq_cached_used = used;
@@ -1908,7 +1897,7 @@ mdb_cursor_try_seq_fastpath(MDB_cursor *mc, MDB_page *mp, MDB_node *node,
 
 	mc->mc_key.mv_data = dst;
 	mc->mc_key.mv_size = needed;
-	mc->mc_key_pgno = mp->mp_pgno;
+	mc->mc_key_pgno = MP_PGNO(mp);
 	mc->mc_key_last = idx;
 	mc->mc_seq_shared = shared;
 	mc->mc_seq_keybuf_valid = 1;
@@ -1951,7 +1940,7 @@ mdb_cursor_seq_cmp_refresh(MDB_cursor *mc, MDB_page *mp, const MDB_val *search_k
 		return 0;
 	}
 
-	if (mc->mc_seq_cmp_pgno == mp->mp_pgno &&
+	if (mc->mc_seq_cmp_pgno == MP_PGNO(mp) &&
 	    mc->mc_seq_cmp_keyptr == search_key->mv_data &&
 	    mc->mc_seq_cmp_keysize == search_key->mv_size) {
 		return mc->mc_seq_cmp_prefix;
@@ -1976,7 +1965,7 @@ mdb_cursor_seq_cmp_refresh(MDB_cursor *mc, MDB_page *mp, const MDB_val *search_k
 	while (prefix < limit && trunk_bytes[prefix] == key_bytes[prefix])
 		++prefix;
 
-	mc->mc_seq_cmp_pgno = mp->mp_pgno;
+	mc->mc_seq_cmp_pgno = MP_PGNO(mp);
 	mc->mc_seq_cmp_keyptr = search_key->mv_data;
 	mc->mc_seq_cmp_keysize = search_key->mv_size;
 	mc->mc_seq_cmp_prefix = prefix;
@@ -2080,7 +2069,7 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 
 			if (!prefix_enabled || idx == 0) {
 				if (prefix_enabled && idx == 0) {
-					mc->mc_key_pgno = mp->mp_pgno;
+	mc->mc_key_pgno = MP_PGNO(mp);
 					mc->mc_key_last = idx;
 					mc->mc_key.mv_size = node->mn_ksize;
 					mc->mc_key.mv_data = (void *)encoded;
@@ -2130,7 +2119,7 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 				return prc;
 			MDB_cursor_leaf_cache *cache = &mc->mc_leaf_cache;
 			if (idx < cache->decoded_count &&
-			    cache->decoded_pgno == mp->mp_pgno) {
+			    cache->decoded_pgno == MP_PGNO(mp)) {
 				if (!cache->decoded_slots_ready) {
 					int mrc = mdb_cursor_leaf_cache_materialize(mc, mp);
 					if (mrc != MDB_SUCCESS)
@@ -2160,7 +2149,7 @@ mdb_cursor_read_key_at(MDB_cursor *mc, MDB_page *mp, indx_t idx, MDB_val *out)
 		if (rc != MDB_SUCCESS)
 			return rc;
 
-		mc->mc_key_pgno = mp->mp_pgno;
+		mc->mc_key_pgno = MP_PGNO(mp);
 		mc->mc_key_last = idx;
 		mc->mc_seq_shared = shared_hint;
 		mc->mc_seq_keybuf_valid = 1;
@@ -3332,7 +3321,7 @@ MDB_cursor_leaf_cache *cache = &mc->mc_leaf_cache;
 	int rc;
 	const MDB_page *source = IS_SUBP(mp) ? mp : NULL;
 
-	if (cache->decoded_pgno == mp->mp_pgno &&
+	if (cache->decoded_pgno == MP_PGNO(mp) &&
 	    cache->decoded_gen == txn->mt_txnid &&
 	    cache->decoded_count == total &&
 	    cache->decoded_source == source)
@@ -3377,7 +3366,7 @@ MDB_cursor_leaf_cache *cache = &mc->mc_leaf_cache;
 	cache->decoded_slots_ready = 0;
 	cache->decoded_prefix_count = 0;
 
-	cache->decoded_pgno = mp->mp_pgno;
+	cache->decoded_pgno = MP_PGNO(mp);
 	cache->decoded_gen = txn->mt_txnid;
 	cache->decoded_count = total;
 	cache->decoded_stride = stride;
@@ -3796,7 +3785,7 @@ mdb_prefix_inline_measure_after_insert(MDB_cursor *mc, MDB_page *mp,
 		measure_cache->entries = entries;
 		measure_cache->keybuf = key_storage;
 		measure_cache->cursor = mc;
-		measure_cache->pgno = mp->mp_pgno;
+		measure_cache->pgno = MP_PGNO(mp);
 		measure_cache->count = new_total;
 		measure_cache->insert = insert;
 		measure_cache->node_flags = node_flags;
@@ -3858,7 +3847,7 @@ mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp,
 	if (measure_cache && measure_cache->valid &&
 	    measure_cache->entries == entries &&
 	    measure_cache->cursor == mc &&
-	    measure_cache->pgno == mp->mp_pgno &&
+	    measure_cache->pgno == MP_PGNO(mp) &&
 	    measure_cache->count == new_total &&
 	    measure_cache->insert == insert &&
 	    measure_cache->node_flags == node_flags &&
@@ -4439,7 +4428,7 @@ mdb_leaf_prefix_contribution(MDB_cursor *mc, MDB_page *mp, indx_t limit)
 		MDB_cursor_leaf_cache *cache = &mc->mc_leaf_cache;
 		int prc = MDB_SUCCESS;
 
-		if (cache->decoded_pgno != mp->mp_pgno ||
+	if (cache->decoded_pgno != MP_PGNO(mp) ||
 		    cache->decoded_gen != txn->mt_txnid ||
 		    cache->decoded_count != (unsigned int)count) {
 			prc = mdb_cursor_leaf_cache_prepare(mc, mp);
@@ -4972,7 +4961,7 @@ static pgno_t
 mdb_dbg_pgno(MDB_page *mp)
 {
 	pgno_t ret;
-	COPY_PGNO(ret, MP_PGNO(mp));
+	ret = MP_PGNO(mp);
 	return ret;
 }
 
@@ -11458,7 +11447,7 @@ more:
 				fp = olddata.mv_data;
 				if (flags == MDB_CURRENT) {
 					MP_FLAGS(fp) |= P_DIRTY;
-					COPY_PGNO(MP_PGNO(fp), MP_PGNO(mp));
+					MP_SETPGNO(fp, MP_PGNO(mp));
 					mc->mc_xcursor->mx_cursor.mc_pg[0] = fp;
 					flags |= F_DUPDATA;
 					goto put_sub;
@@ -11530,7 +11519,7 @@ more:
 
 				if (grow == 0 && !force_subdb) {
 					MP_FLAGS(fp) |= P_DIRTY;
-					COPY_PGNO(MP_PGNO(fp), MP_PGNO(mp));
+					MP_SETPGNO(fp, MP_PGNO(mp));
 					mc->mc_xcursor->mx_cursor.mc_pg[0] = fp;
 					flags |= F_DUPDATA;
 					do_sub = 1;
@@ -11908,7 +11897,7 @@ mdb_prefix_inline_build_pair(MDB_cursor *mc, MDB_page *mp, size_t capacity,
 	MP_LOWER(mp) = (indx_t)(PAGEHDRSZ - PAGEBASE);
 	MP_UPPER(mp) = (indx_t)(capacity - PAGEBASE);
 	MP_PAD(mp) = 0;
-	COPY_PGNO(MP_PGNO(mp), mc->mc_pg[mc->mc_top]->mp_pgno);
+	MP_SETPGNO(mp, MP_PGNO(mc->mc_pg[mc->mc_top]));
 	items[0] = *first;
 	items[1] = *second;
 
@@ -12459,7 +12448,7 @@ mdb_node_add(MDB_cursor *mc, indx_t indx,
 			mdb_cassert(mc, data->mv_size <= env->me_psize);
 			if (data->mv_data != scratch)
 				memcpy(scratch, data->mv_data, data->mv_size);
-			COPY_PGNO(MP_PGNO(scratch), mp->mp_pgno);
+			MP_SETPGNO(scratch, MP_PGNO(mp));
 			MP_FLAGS(scratch) |= P_DIRTY;
 			data->mv_data = scratch;
 		}
@@ -12746,7 +12735,7 @@ mdb_node_shrink(MDB_page *mp, indx_t indx)
 		len = PAGEHDRSZ;
 	}
 	MP_UPPER(sp) = MP_LOWER(sp);
-	COPY_PGNO(MP_PGNO(sp), mp->mp_pgno);
+	MP_SETPGNO(sp, MP_PGNO(mp));
 	SETDSZ(node, nsize);
 
 	/* Shift <lower nodes...initial part of subpage> upward */
@@ -12850,7 +12839,7 @@ mdb_xcursor_init1(MDB_cursor *mc, MDB_node *node)
 		mx->mx_db.md_leaf_pages = 1;
 		mx->mx_db.md_overflow_pages = 0;
 		mx->mx_db.md_entries = NUMKEYS(fp);
-		COPY_PGNO(mx->mx_db.md_root, MP_PGNO(fp));
+			mx->mx_db.md_root = MP_PGNO(fp);
 		mx->mx_cursor.mc_snum = 1;
 		mx->mx_cursor.mc_top = 0;
 		mx->mx_cursor.mc_flags |= C_INITIALIZED;
