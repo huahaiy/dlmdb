@@ -1305,6 +1305,20 @@ mdb_leaf_encoded_size(const MDB_val *trunk, const MDB_val *key, size_t *shared_o
 }
 
 static size_t
+mdb_leaf_encode_key_fast(const MDB_val *key, size_t shared,
+	unsigned char *dest)
+{
+	if (shared > key->mv_size)
+		shared = key->mv_size;
+	size_t header = mdb_varint_encode(shared, dest);
+	size_t suffix_len = key->mv_size - shared;
+	if (suffix_len)
+		memcpy(dest + header,
+		    (const unsigned char *)key->mv_data + shared, suffix_len);
+	return header + suffix_len;
+}
+
+static size_t
 mdb_leaf_encode_key(const MDB_val *trunk, const MDB_val *key,
 	unsigned char *dest, size_t *shared_out)
 {
@@ -1315,13 +1329,10 @@ mdb_leaf_encode_key(const MDB_val *trunk, const MDB_val *key,
 		return key->mv_size;
 	}
 	size_t shared = mdb_leaf_shared_prefix(trunk, key);
-	size_t header = mdb_varint_encode(shared, dest);
-	memcpy(dest + header,
-	    (const unsigned char *)key->mv_data + shared,
-	    key->mv_size - shared);
+	size_t total = mdb_leaf_encode_key_fast(key, shared, dest);
 	if (shared_out)
 		*shared_out = shared;
-	return header + (key->mv_size - shared);
+	return total;
 }
 
 static int
@@ -12208,6 +12219,8 @@ mdb_node_add(MDB_cursor *mc, indx_t indx,
 	uint64_t	 child_count = count_hint;
 	DKBUF;
 	MDB_val	trunk = {0, NULL};
+	size_t	trunk_shared = 0;
+	int	trunk_shared_valid = 0;
 	size_t	key_bytes = 0;
 	unsigned char old_trunk_buf[MDB_KEYBUF_MAX];
 	unsigned char decoded_trunk_buf[MDB_KEYBUF_MAX];
@@ -12249,9 +12262,17 @@ mdb_node_add(MDB_cursor *mc, indx_t indx,
 					MDB_node *tr = NODEPTR(mp, 0);
 					trunk.mv_size = tr->mn_ksize;
 					trunk.mv_data = NODEKEY(mp, tr);
+					trunk_shared_valid = 1;
+				} else {
+					trunk_shared_valid = 0;
 				}
 			}
-			key_bytes = mdb_leaf_encoded_size(prefix_enabled ? &trunk : NULL, key, NULL);
+			if (prefix_enabled && trunk.mv_data)
+				key_bytes = mdb_leaf_encoded_size(&trunk, key, &trunk_shared);
+			else {
+				key_bytes = mdb_leaf_encoded_size(NULL, key, NULL);
+				trunk_shared_valid = 0;
+			}
 		} else {
 			key_bytes = key->mv_size;
 		}
@@ -12439,8 +12460,13 @@ update:
 	mdb_node_set_count(mp, node, 0);
 	if (key) {
 		if (IS_LEAF(mp)) {
-			size_t wrote = mdb_leaf_encode_key(prefix_enabled ? &trunk : NULL,
-			    key, NODEKEY(mp, node), NULL);
+			size_t wrote;
+			if (prefix_enabled && trunk_shared_valid)
+				wrote = mdb_leaf_encode_key_fast(key, trunk_shared,
+				    NODEKEY(mp, node));
+			else
+				wrote = mdb_leaf_encode_key(prefix_enabled ? &trunk : NULL,
+				    key, NODEKEY(mp, node), NULL);
 			mdb_cassert(mc, wrote == key_bytes);
 		} else {
 			memcpy(NODEKEY(mp, node), key->mv_data, key->mv_size);
