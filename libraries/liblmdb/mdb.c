@@ -1514,6 +1514,8 @@ typedef struct MDB_prefix_measure_cache {
 	size_t key_bytes;
 	size_t insert_key_size;
 	size_t insert_data_size;
+	MDB_page *snapshot;
+	size_t snapshot_bytes;
 	unsigned int valid;
 } MDB_prefix_measure_cache;
 
@@ -3635,8 +3637,11 @@ mdb_prefix_inline_measure_after_insert(MDB_cursor *mc, MDB_page *mp,
 	unsigned short node_flags =
 	    (unsigned short)(new_flags & (F_BIGDATA|F_DUPDATA|F_SUBDATA));
 	size_t needed = 0;
-	if (measure_cache)
+	if (measure_cache) {
 		measure_cache->valid = 0;
+		measure_cache->snapshot = NULL;
+		measure_cache->snapshot_bytes = 0;
+	}
 
 	if (insert > total)
 		insert = total;
@@ -3792,6 +3797,8 @@ mdb_prefix_inline_measure_after_insert(MDB_cursor *mc, MDB_page *mp,
 		measure_cache->key_bytes = total_key_bytes;
 		measure_cache->insert_key_size = new_key ? new_key->mv_size : 0;
 		measure_cache->insert_data_size = new_data ? new_data->mv_size : 0;
+		measure_cache->snapshot = snapshot;
+		measure_cache->snapshot_bytes = current_capacity;
 		measure_cache->valid = 1;
 	}
 	if (needed_out)
@@ -3829,27 +3836,17 @@ mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp,
 		insert = total;
 	new_total = total + 1;
 
-	rc = mdb_prefix_ensure_snapshot(txn, env->me_psize, &snapshot);
-	if (rc != MDB_SUCCESS)
-		return rc;
-	mdb_prefix_snapshot_capture(snapshot, mp, capacity);
-
 	rc = mdb_prefix_ensure_entries(txn, new_total, &entries);
 	if (rc != MDB_SUCCESS)
 		return rc;
 
 	int have_old_trunk = old_trunk && old_trunk->mv_data;
-	const MDB_node *snapshot_trunk = (total > 0) ? NODEPTR(snapshot, 0) : NULL;
-	MDB_val trunk_ref = {0, NULL};
-	if (have_old_trunk) {
-		trunk_ref = *old_trunk;
-	} else if (snapshot_trunk) {
-		trunk_ref.mv_size = snapshot_trunk->mn_ksize;
-		trunk_ref.mv_data = NODEKEY(snapshot, snapshot_trunk);
-	}
-	const unsigned char *trunk_bytes = (const unsigned char *)trunk_ref.mv_data;
-	size_t trunk_len = trunk_ref.mv_size;
+	const MDB_node *snapshot_trunk = NULL;
+	MDB_val trunk_ref = (MDB_val){0, NULL};
+	const unsigned char *trunk_bytes = NULL;
+	size_t trunk_len = 0;
 
+	int cache_match = 0;
 	if (measure_cache && measure_cache->valid &&
 	    measure_cache->entries == entries &&
 	    measure_cache->cursor == mc &&
@@ -3861,11 +3858,38 @@ mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp,
 	    measure_cache->is_sub == ((mc->mc_flags & C_SUB) ? 1U : 0U) &&
 	    measure_cache->insert_key_size == (new_key ? new_key->mv_size : 0) &&
 	    measure_cache->insert_data_size == (new_data ? new_data->mv_size : 0)) {
+		cache_match = 1;
 		reuse_cache = 1;
 		total_key_bytes = measure_cache->key_bytes;
+		if (measure_cache->snapshot &&
+		    measure_cache->snapshot_bytes == capacity)
+			snapshot = measure_cache->snapshot;
 	}
-	if (measure_cache)
+
+	if (!snapshot) {
+		rc = mdb_prefix_ensure_snapshot(txn, env->me_psize, &snapshot);
+		if (rc != MDB_SUCCESS)
+			return rc;
+		mdb_prefix_snapshot_capture(snapshot, mp, capacity);
+	}
+
+	if (have_old_trunk) {
+		trunk_ref = *old_trunk;
+	} else if (total > 0) {
+		snapshot_trunk = NODEPTR(snapshot, 0);
+		trunk_ref.mv_size = snapshot_trunk->mn_ksize;
+		trunk_ref.mv_data = NODEKEY(snapshot, snapshot_trunk);
+	}
+	trunk_bytes = (const unsigned char *)trunk_ref.mv_data;
+	trunk_len = trunk_ref.mv_size;
+
+	if (!cache_match)
+		reuse_cache = 0;
+	if (measure_cache) {
 		measure_cache->valid = 0;
+		measure_cache->snapshot = NULL;
+		measure_cache->snapshot_bytes = 0;
+	}
 
 	MDB_prefix_rebuild_entry *insert_entry = &entries[insert];
 	insert_entry->flags = node_flags;
@@ -14150,6 +14174,8 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 		mdb_prefix_stride_entry_invalidate(mc->mc_txn, mp->mp_pgno);
 	if (mc->mc_txn) {
 		mc->mc_txn->mt_prefix.measure_cache.valid = 0;
+		mc->mc_txn->mt_prefix.measure_cache.snapshot = NULL;
+		mc->mc_txn->mt_prefix.measure_cache.snapshot_bytes = 0;
 	}
 	newindx = mc->mc_ki[mc->mc_top];
 	nkeys = NUMKEYS(mp);
