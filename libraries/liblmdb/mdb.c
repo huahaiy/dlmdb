@@ -6713,6 +6713,8 @@ mdb_txn_end(MDB_txn *txn, unsigned mode)
 		}
 		txn->mt_numdbs = 0;		/* prevent further DBI activity */
 		txn->mt_flags |= MDB_TXN_FINISHED;
+		if (mode & MDB_END_RESET)
+			mdb_prefix_scratch_clear(&txn->mt_prefix);
 
 	} else if (!F_ISSET(txn->mt_flags, MDB_TXN_FINISHED)) {
 		pgno_t *pghead = env->me_pghead;
@@ -15570,7 +15572,7 @@ mdb_count_all(MDB_txn *txn, MDB_dbi dbi, unsigned flags, uint64_t *out)
 
 	MDB_db *db = &txn->mt_dbs[dbi];
 	unsigned char *dbflag = &txn->mt_dbflags[dbi];
-    MDB_xcursor mx = (MDB_xcursor){0}, *mxp = NULL;
+	MDB_xcursor mx = (MDB_xcursor){0}, *mxp = NULL;
 
 	if (!(db->md_flags & MDB_COUNTED))
 		return MDB_INCOMPATIBLE;
@@ -15578,11 +15580,13 @@ mdb_count_all(MDB_txn *txn, MDB_dbi dbi, unsigned flags, uint64_t *out)
 		memset(&mx, 0, sizeof(mx));
 		mxp = &mx;
 	}
-		if (*dbflag & DB_STALE) {
-			MDB_cursor mc = (MDB_cursor){0};
+	if (*dbflag & DB_STALE) {
+		MDB_cursor mc = (MDB_cursor){0};
 		mdb_cursor_init(&mc, txn, dbi, mxp);
 		/* Refresh pointer after cursor init updates metadata. */
 		db = &txn->mt_dbs[dbi];
+		mdb_cursor_leaf_cache_clear(&mc.mc_leaf_cache);
+		MDB_CURSOR_UNREF(&mc, 1);
 	}
 
 	*out = db->md_entries;
