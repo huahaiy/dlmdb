@@ -3498,20 +3498,42 @@ mdb_leaf_rebuild_after_trunk_delete(MDB_cursor *mc, MDB_page *mp, indx_t removed
 	key_cursor = key_storage;
 	out = 0;
 	for (i = 0; i < total; ++i) {
-		MDB_node *src;
-		MDB_val full;
+		MDB_prefix_rebuild_entry *entry;
 		if (i == removed)
 			continue;
-		src = NODEPTR(snapshot, i);
-		full.mv_data = key_cursor;
-		full.mv_size = entries[out].key.mv_size;
-		rc = mdb_leaf_decode_key(old_trunk, NODEKEY(snapshot, src),
-		    src->mn_ksize, &full, key_cursor, entries[out].key.mv_size, 0, NULL);
-		if (rc != MDB_SUCCESS)
-			return rc;
-		entries[out].key.mv_data = key_cursor;
-		key_cursor += entries[out].key.mv_size;
-		entries[out].encoded_ksize = 0;
+		entry = &entries[out];
+		entry->key.mv_data = key_cursor;
+		if (entry->key.mv_size) {
+			int copied = 0;
+			if (entry->encoded_key && entry->encoded_len == entry->key.mv_size &&
+			    entry->shared_prefix == UINT16_MAX) {
+				memcpy(key_cursor, entry->encoded_key, entry->encoded_len);
+				copied = 1;
+			} else if (entry->encoded_key && entry->shared_prefix != UINT16_MAX &&
+			    entry->encoded_used <= entry->encoded_len &&
+			    old_trunk && old_trunk->mv_data &&
+			    entry->shared_prefix <= old_trunk->mv_size) {
+				size_t shared = entry->shared_prefix;
+				size_t suffix_len = entry->encoded_len - entry->encoded_used;
+				if (shared)
+					memcpy(key_cursor, old_trunk->mv_data, shared);
+				if (suffix_len)
+					memcpy(key_cursor + shared,
+					    entry->encoded_key + entry->encoded_used,
+					    suffix_len);
+				copied = 1;
+			}
+			if (!copied) {
+				MDB_val full = { entry->key.mv_size, key_cursor };
+				rc = mdb_leaf_decode_key(old_trunk, entry->encoded_key,
+				    entry->encoded_len, &full, key_cursor, entry->key.mv_size, 0,
+				    NULL);
+				if (rc != MDB_SUCCESS)
+					return rc;
+			}
+		}
+		key_cursor += entry->key.mv_size;
+		entry->encoded_ksize = 0;
 		++out;
 	}
 
