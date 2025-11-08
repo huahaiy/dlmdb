@@ -28,6 +28,23 @@
 
 static int verbose;
 
+#if defined(__has_feature)
+# if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) || __has_feature(memory_sanitizer)
+#  define MTEST4_SANITIZED 1
+# endif
+#endif
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__) || defined(__SANITIZE_MEMORY__)
+# define MTEST4_SANITIZED 1
+#endif
+#ifndef MTEST4_FIXEDMAP_FLAGS
+# ifdef MTEST4_SANITIZED
+#  define MTEST4_FIXEDMAP_FLAGS 0
+# else
+#  define MTEST4_FIXEDMAP_FLAGS MDB_FIXEDMAP
+# endif
+#endif
+#define MTEST4_ENV_FLAGS (MTEST4_FIXEDMAP_FLAGS | MDB_NOSYNC | MDB_NOLOCK)
+
 int main(int argc,char * argv[])
 {
 	int i = 0, j = 0, rc;
@@ -58,7 +75,7 @@ int main(int argc,char * argv[])
 	E(mdb_env_create(&env));
 	E(mdb_env_set_mapsize(env, 10485760));
 	E(mdb_env_set_maxdbs(env, 4));
-	E(mdb_env_open(env, "./testdb", MDB_FIXEDMAP|MDB_NOSYNC, 0664));
+	E(mdb_env_open(env, "./testdb", MTEST4_ENV_FLAGS, 0664));
 
 	E(mdb_txn_begin(env, NULL, 0, &txn));
 	E(mdb_dbi_open(txn, "id4", MDB_CREATE|MDB_DUPSORT|MDB_DUPFIXED, &dbi));

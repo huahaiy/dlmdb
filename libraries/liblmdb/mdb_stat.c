@@ -34,7 +34,7 @@ static void prstat(MDB_stat *ms)
 
 static void usage(char *prog)
 {
-	fprintf(stderr, "usage: %s [-V] [-n] [-e] [-r[r]] [-f[f[f]]] [-v] [-a|-s subdb] dbpath\n", prog);
+	fprintf(stderr, "usage: %s [-V] [-n] [-e] [-r[r]] [-f[f[f]]] [-v] [-L] [-a|-s subdb] dbpath\n", prog);
 	exit(EXIT_FAILURE);
 }
 
@@ -65,7 +65,7 @@ int main(int argc, char *argv[])
 	 * -V: print version and exit
 	 * (default) print stat of only the main DB
 	 */
-	while ((i = getopt(argc, argv, "Vaefnrs:v")) != EOF) {
+	while ((i = getopt(argc, argv, "Vaefnrs:vL")) != EOF) {
 		switch(i) {
 		case 'V':
 			printf("%s\n", MDB_VERSION_STRING);
@@ -90,6 +90,9 @@ int main(int argc, char *argv[])
 			break;
 		case 'r':
 			rdrinfo++;
+			break;
+		case 'L':
+			envflags |= MDB_NOLOCK;
 			break;
 		case 's':
 			if (alldbs)

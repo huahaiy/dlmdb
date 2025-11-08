@@ -59,7 +59,7 @@ clean:
 
 test:	all
 	rm -rf testdb && mkdir testdb
-	./mtest && ./mdb_stat testdb
+	./mtest && ./mdb_stat -L testdb
 	./mtest2
 	./mtest3
 	./mtest4

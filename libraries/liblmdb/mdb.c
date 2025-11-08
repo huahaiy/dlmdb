@@ -999,6 +999,10 @@ enum {
  * Each non-metapage up to #MDB_meta.%mm_last_pg is reachable exactly once
  * in the snapshot: Either used by a database or listed in a freeDB record.
  */
+#if !defined(MISALIGNED_OK)
+#pragma pack(push, 1)
+#endif
+
 typedef struct MDB_page {
 #define	mp_pgno	mp_p.p_pgno
 #define	mp_next	mp_p.p_next
@@ -1048,6 +1052,10 @@ typedef struct MDB_page2 {
 	indx_t		mp2_upper;
 	indx_t		mp2_ptrs[0];
 } MDB_page2;
+
+#if !defined(MISALIGNED_OK)
+#pragma pack(pop)
+#endif
 
 #define MP_PGNO(p)	(((MDB_page2 *)(void *)(p))->mp2_p)
 #define MP_PAD(p)	(((MDB_page2 *)(void *)(p))->mp2_pad)
@@ -1150,12 +1158,12 @@ typedef struct MDB_node {
 	/** Size of a node in a branch page with a given key.
 	 *	This is just the node header plus the key, there is no data.
 	 */
-#define INDXSIZE(k)	 (NODESIZE + ((k) == NULL ? 0 : (k)->mv_size))
+#define INDXSIZE(k)	 (NODESIZE + ((k) == NULL ? 0 : EVEN((k)->mv_size)))
 
 	/** Size of a node in a leaf page with a given key and data.
 	 *	This is node header plus key plus data size.
 	 */
-#define LEAFSIZE(k, d)	 (NODESIZE + (k)->mv_size + (d)->mv_size)
+#define LEAFSIZE(k, d)	 (NODESIZE + EVEN((k)->mv_size) + (d)->mv_size)
 
 	/** Address of node \b i in page \b p */
 #define NODEPTR(p, i)	 ((MDB_node *)((char *)(p) + MP_PTRS(p)[i] + PAGEBASE))
@@ -1165,7 +1173,7 @@ typedef struct MDB_node {
 		((IS_BRANCH(mp) && IS_COUNTED(mp)) ? (ptrdiff_t)sizeof(uint64_t) : 0))
 
 	/** Address of the data for a node */
-#define NODEDATA(node)	 (void *)((char *)(node)->mn_data + (node)->mn_ksize)
+#define NODEDATA(node)	 (void *)((char *)(node)->mn_data + EVEN((node)->mn_ksize))
 
 	/** Get the page number pointed to by a branch node */
 #define NODEPGNO(node) \
@@ -4081,7 +4089,7 @@ mdb_leaf_rebuild_measure(MDB_env *env, MDB_txn *txn,
 		if (key_bytes > UINT16_MAX)
 			return MDB_BAD_VALSIZE;
 
-		node_bytes = NODESIZE + key_bytes + entries[i].data_payload;
+		node_bytes = NODESIZE + EVEN(key_bytes) + entries[i].data_payload;
 		node_bytes = EVEN(node_bytes);
 
 		if (SIZE_MAX - used < node_bytes) {
@@ -4202,7 +4210,7 @@ mdb_leaf_rebuild_apply(MDB_cursor *mc, MDB_page *mp,
 				max_decoded = entry->key.mv_size;
 
 			key_bytes = entry->encoded_ksize;
-			node_bytes = NODESIZE + key_bytes + entry->data_payload;
+			node_bytes = NODESIZE + EVEN(key_bytes) + entry->data_payload;
 			node_bytes = EVEN(node_bytes);
 
 			if (node_bytes > ofs)
@@ -4403,8 +4411,9 @@ mdb_leaf_entry_contribution(const MDB_page *mp, const MDB_node *node)
 	if (!(node->mn_flags & F_DUPDATA))
 		return 1;
 	if (node->mn_flags & F_SUBDATA) {
-		const MDB_db *db = (const MDB_db *)NODEDATA(node);
-		return db->md_entries;
+		MDB_db dbcopy;
+		memcpy(&dbcopy, NODEDATA(node), sizeof(dbcopy));
+		return dbcopy.md_entries;
 	}
 	const MDB_page *sub = (const MDB_page *)NODEDATA(node);
 	return mdb_leaf_count(sub);
@@ -11961,7 +11970,7 @@ mdb_prefix_inline_build_pair(MDB_cursor *mc, MDB_page *mp, size_t capacity,
 
 			for (unsigned int i = 0; i < 2; ++i) {
 				size_t key_bytes = items[i].mv_size;
-				size_t node_bytes = NODESIZE + key_bytes;
+				size_t node_bytes = NODESIZE + EVEN(key_bytes);
 			MDB_node *node;
 
 			node_bytes = EVEN(node_bytes);
@@ -12222,7 +12231,7 @@ mdb_leaf_size(MDB_env *env, MDB_page *mp, indx_t indx, MDB_val *key, MDB_val *da
 	}
 
 	key_bytes = mdb_leaf_encoded_size(trunk.mv_data ? &trunk : NULL, key, NULL);
-	sz = NODESIZE + key_bytes + data->mv_size;
+	sz = NODESIZE + EVEN(key_bytes) + data->mv_size;
 	if (sz > env->me_nodemax) {
 		/* put on overflow page */
 		sz -= data->mv_size - sizeof(pgno_t);
@@ -12293,6 +12302,7 @@ mdb_node_add(MDB_cursor *mc, indx_t indx,
 	size_t	trunk_shared = 0;
 	int	trunk_shared_valid = 0;
 	size_t	key_bytes = 0;
+	size_t	key_pad = 0;
 	unsigned char old_trunk_buf[MDB_KEYBUF_MAX];
 	unsigned char decoded_trunk_buf[MDB_KEYBUF_MAX];
 	MDB_val	old_trunk = {0, NULL};
@@ -12347,7 +12357,11 @@ mdb_node_add(MDB_cursor *mc, indx_t indx,
 		} else {
 			key_bytes = key->mv_size;
 		}
-		node_size += key_bytes;
+		size_t key_bytes_aligned = EVEN(key_bytes);
+		key_pad = key_bytes_aligned - key_bytes;
+		node_size += key_bytes_aligned;
+	} else {
+		key_pad = 0;
 	}
 	if (prefix_enabled && IS_LEAF(mp) && !IS_LEAF2(mp) && indx == 0 && NUMKEYS(mp) > 0) {
 		MDB_node *old = NODEPTR(mp, 0);
@@ -12465,7 +12479,7 @@ mdb_node_add(MDB_cursor *mc, indx_t indx,
 				if (rc != MDB_SUCCESS)
 					return rc;
 			}
-			node_bytes = NODESIZE + replaced->mn_ksize;
+			node_bytes = NODESIZE + EVEN(replaced->mn_ksize);
 			if (IS_BRANCH(mp) && IS_COUNTED(mp))
 				node_bytes += sizeof(uint64_t);
 			if (IS_LEAF(mp)) {
@@ -12541,6 +12555,10 @@ update:
 			mdb_cassert(mc, wrote == key_bytes);
 		} else {
 			memcpy(NODEKEY(mp, node), key->mv_data, key->mv_size);
+		}
+		if (key_pad) {
+			unsigned char *pad = (unsigned char *)NODEKEY(mp, node);
+			memset(pad + key_bytes, 0, key_pad);
 		}
 	}
 
@@ -12660,7 +12678,7 @@ mdb_node_del(MDB_cursor *mc, int ksize)
 	}
 
 	node = NODEPTR(mp, indx);
-	sz = NODESIZE + node->mn_ksize;
+	sz = NODESIZE + EVEN(node->mn_ksize);
 	if (IS_BRANCH(mp) && IS_COUNTED(mp))
 		sz += sizeof(uint64_t);
 	if (IS_LEAF(mp)) {
