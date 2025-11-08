@@ -5363,16 +5363,14 @@ mdb_prefix_pair_leq_cursor(MDB_cursor *mc,
 				    mc->mc_xcursor->mx_cursor.mc_dbx->md_cmp ?
 				    mc->mc_xcursor->mx_cursor.mc_dbx->md_cmp : dcmp;
 				MDB_cursor *dupcur = &mc->mc_xcursor->mx_cursor;
-				MDB_cursor dup_snapshot = (MDB_cursor){0};
+				MDB_cursor dup_work = (MDB_cursor){0};
 
-				mdb_cursor_copy(dupcur, &dup_snapshot);
-				dup_snapshot.mc_dbflag = dupcur->mc_dbflag;
+				mdb_cursor_copy(dupcur, &dup_work);
+				dup_work.mc_dbflag = dupcur->mc_dbflag;
 				rc = mdb_dup_prefix_count_internal(
-				    &dup_snapshot, dupcur,
+				    dupcur, &dup_work,
 				    dup_cmp, value, value_inclusive, &dup_total);
-				mdb_cursor_copy(&dup_snapshot, dupcur);
-				dupcur->mc_dbflag = dup_snapshot.mc_dbflag;
-				mdb_cursor_leaf_cache_clear(&dup_snapshot.mc_leaf_cache);
+				mdb_cursor_leaf_cache_clear(&dup_work.mc_leaf_cache);
 				if (rc != MDB_SUCCESS)
 					return rc;
 			}
