@@ -5323,8 +5323,41 @@ mdb_prefix_pair_leq_cursor(MDB_cursor *mc,
 	search = *key;
 	rc = mdb_cursor_set(mc, &search, &data, MDB_SET_RANGE, &exact);
 	if (rc == MDB_NOTFOUND) {
-		*out = db->md_entries;
-		return MDB_SUCCESS;
+		MDB_val edge_key = {0}, edge_data = {0};
+		int frc;
+
+		if (!db->md_entries) {
+			*out = 0;
+			return MDB_SUCCESS;
+		}
+
+		frc = mdb_cursor_get(mc, &edge_key, &edge_data, MDB_LAST);
+		if (frc == MDB_SUCCESS) {
+			int cmp_last = kcmp(&edge_key, (MDB_val *)key);
+			if (cmp_last < 0 || (cmp_last == 0 && key_inclusive)) {
+				*out = db->md_entries;
+				return MDB_SUCCESS;
+			}
+		} else if (frc != MDB_NOTFOUND) {
+			return frc;
+		}
+
+		frc = mdb_cursor_get(mc, &edge_key, &edge_data, MDB_FIRST);
+		if (frc == MDB_SUCCESS) {
+			int cmp_first = kcmp(&edge_key, (MDB_val *)key);
+			if (cmp_first > 0 || (cmp_first == 0 && !key_inclusive)) {
+				*out = 0;
+				return MDB_SUCCESS;
+			}
+			/* Otherwise treat as high-end search. */
+			*out = db->md_entries;
+			return MDB_SUCCESS;
+		} else if (frc == MDB_NOTFOUND) {
+			*out = 0;
+			return MDB_SUCCESS;
+		} else {
+			return frc;
+		}
 	}
 	if (rc != MDB_SUCCESS)
 		return rc;
