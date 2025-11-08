@@ -1519,10 +1519,11 @@ typedef struct MDB_prefix_measure_cache {
 
 typedef struct MDB_prefix_stride_entry {
 	pgno_t			pgno;
-	size_t			*lengths;
+	uint32_t		*lengths;
 	unsigned int	length_cap;
 	unsigned int	count;
 	size_t			max_len;
+	unsigned int	max_valid;
 	unsigned int	valid;
 } MDB_prefix_stride_entry;
 
@@ -2684,6 +2685,7 @@ mdb_prefix_stride_cache_clear(MDB_prefix_stride_cache *cache)
 		entry->length_cap = 0;
 		entry->count = 0;
 		entry->max_len = 0;
+		entry->max_valid = 1;
 		entry->valid = 0;
 		entry->pgno = P_INVALID;
 	}
@@ -2788,6 +2790,32 @@ mdb_prefix_stride_entry_acquire(MDB_prefix_stride_cache *cache, pgno_t pgno,
 	}
 }
 
+static uint32_t
+mdb_prefix_stride_pack_length(size_t len)
+{
+	if (len > UINT32_MAX)
+		return UINT32_MAX;
+	return (uint32_t)len;
+}
+
+static size_t
+mdb_prefix_stride_entry_max(MDB_prefix_stride_entry *entry)
+{
+	if (!entry || !entry->count)
+		return 0;
+	if (entry->max_valid)
+		return entry->max_len;
+	size_t max_len = entry->lengths ? entry->lengths[0] : 0;
+	for (unsigned int i = 1; i < entry->count; ++i) {
+		size_t len = entry->lengths ? entry->lengths[i] : 0;
+		if (len > max_len)
+			max_len = len;
+	}
+	entry->max_len = max_len;
+	entry->max_valid = 1;
+	return max_len;
+}
+
 static int
 mdb_prefix_stride_entry_reserve(MDB_prefix_stride_entry *entry,
 	unsigned int need)
@@ -2806,7 +2834,7 @@ mdb_prefix_stride_entry_reserve(MDB_prefix_stride_entry *entry,
 		newcap <<= 1;
 	}
 
-	size_t *buf = realloc(entry->lengths, sizeof(size_t) * newcap);
+	uint32_t *buf = realloc(entry->lengths, sizeof(uint32_t) * newcap);
 	if (!buf)
 		return ENOMEM;
 	entry->lengths = buf;
@@ -2855,6 +2883,7 @@ mdb_prefix_stride_entry_rebuild(MDB_cursor *mc, MDB_page *mp,
 
 	if (!total) {
 		entry->max_len = 0;
+		entry->max_valid = 1;
 		entry->valid = 1;
 		mdb_prefix_leaf_store_stride(mc, mp, 0);
 		return MDB_SUCCESS;
@@ -2862,7 +2891,7 @@ mdb_prefix_stride_entry_rebuild(MDB_cursor *mc, MDB_page *mp,
 
 	MDB_node *trunk = NODEPTR(mp, 0);
 	size_t trunk_len = trunk ? trunk->mn_ksize : 0;
-	entry->lengths[0] = trunk_len;
+	entry->lengths[0] = mdb_prefix_stride_pack_length(trunk_len);
 	max_len = trunk_len;
 
 	for (unsigned int i = 1; i < total; ++i) {
@@ -2870,12 +2899,13 @@ mdb_prefix_stride_entry_rebuild(MDB_cursor *mc, MDB_page *mp,
 		const unsigned char *encoded = NODEKEY(mp, node);
 		size_t len = mdb_prefix_decoded_length(trunk_len, encoded,
 		    node->mn_ksize);
-		entry->lengths[i] = len;
+		entry->lengths[i] = mdb_prefix_stride_pack_length(len);
 		if (len > max_len)
 			max_len = len;
 	}
 
 	entry->max_len = max_len;
+	entry->max_valid = 1;
 	entry->valid = 1;
 	mdb_prefix_leaf_store_stride(mc, mp, max_len);
 	return MDB_SUCCESS;
@@ -2933,13 +2963,15 @@ mdb_prefix_stride_apply_insert(MDB_prefix_stride_entry *entry, MDB_cursor *mc,
 		indx = entry->count;
 	if (entry->count > (unsigned int)indx) {
 		memmove(&entry->lengths[indx + 1], &entry->lengths[indx],
-		    (entry->count - indx) * sizeof(size_t));
+		    (entry->count - indx) * sizeof(uint32_t));
 	}
-	entry->lengths[indx] = keylen;
+	entry->lengths[indx] = mdb_prefix_stride_pack_length(keylen);
 	entry->count++;
-	if (keylen > entry->max_len)
+	if (keylen >= entry->max_len) {
 		entry->max_len = keylen;
-	mdb_prefix_leaf_store_stride(mc, mp, entry->max_len);
+		entry->max_valid = 1;
+	}
+	mdb_prefix_leaf_store_stride(mc, mp, mdb_prefix_stride_entry_max(entry));
 	return MDB_SUCCESS;
 }
 
@@ -2955,26 +2987,21 @@ mdb_prefix_stride_apply_delete(MDB_prefix_stride_entry *entry, MDB_cursor *mc,
 	size_t removed = entry->lengths[indx];
 	if (indx + 1 < entry->count) {
 		memmove(&entry->lengths[indx], &entry->lengths[indx + 1],
-		    (entry->count - indx - 1) * sizeof(size_t));
+		    (entry->count - indx - 1) * sizeof(uint32_t));
 	}
 	if (entry->count)
 		entry->count--;
 
 	if (!entry->count) {
 		entry->max_len = 0;
+		entry->max_valid = 1;
 		mdb_prefix_leaf_store_stride(mc, mp, 0);
 		return;
 	}
 
-	if (removed >= entry->max_len) {
-		size_t max_len = entry->lengths[0];
-		for (unsigned int i = 1; i < entry->count; ++i) {
-			if (entry->lengths[i] > max_len)
-				max_len = entry->lengths[i];
-		}
-		entry->max_len = max_len;
-	}
-	mdb_prefix_leaf_store_stride(mc, mp, entry->max_len);
+	if (removed >= entry->max_len)
+		entry->max_valid = 0;
+	mdb_prefix_leaf_store_stride(mc, mp, mdb_prefix_stride_entry_max(entry));
 }
 
 static void
