@@ -3315,7 +3315,7 @@ mdb_cursor_leaf_cache_prepare(MDB_cursor *mc, MDB_page *mp)
 {
 	MDB_txn *txn = mc->mc_txn;
 	MDB_env *env = txn->mt_env;
-MDB_cursor_leaf_cache *cache = &mc->mc_leaf_cache;
+	MDB_cursor_leaf_cache *cache = &mc->mc_leaf_cache;
 	unsigned int total = NUMKEYS(mp);
 	int prefix_enabled = (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) != 0;
 	int rc;
@@ -3448,22 +3448,22 @@ mdb_prefix_page_capacity(MDB_cursor *mc, MDB_page *mp)
 }
 
 static int mdb_prefix_inline_build_pair(MDB_cursor *mc, MDB_page *mp, size_t capacity,
-    const MDB_val *first, const MDB_val *second);
+		    const MDB_val *first, const MDB_val *second);
 
 static int mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp,
-    const MDB_val *old_trunk, indx_t insert, const MDB_val *new_key,
-    MDB_val *new_data, unsigned int new_flags, MDB_page *ofp);
+		    const MDB_val *old_trunk, indx_t insert, const MDB_val *new_key,
+		    MDB_val *new_data, unsigned int new_flags, MDB_page *ofp);
 static int mdb_leaf_rebuild_measure(MDB_env *env, MDB_txn *txn,
-    MDB_prefix_rebuild_entry *entries, unsigned int count, size_t capacity,
-    size_t *used_out);
+		    MDB_prefix_rebuild_entry *entries, unsigned int count, size_t capacity,
+		    size_t *used_out);
 static int mdb_leaf_rebuild_apply(MDB_cursor *mc, MDB_page *mp,
-    MDB_prefix_rebuild_entry *entries, unsigned int count, size_t capacity);
+		    MDB_prefix_rebuild_entry *entries, unsigned int count, size_t capacity);
 static void mdb_leaf_refresh_xcursor(MDB_cursor *mc, MDB_page *mp, indx_t idx);
 static void mdb_xcursor_init1(MDB_cursor *mc, MDB_node *node);
 
 static int
 mdb_leaf_rebuild_after_trunk_delete(MDB_cursor *mc, MDB_page *mp, indx_t removed,
-    const MDB_val *old_trunk)
+	const MDB_val *old_trunk)
 {
 	MDB_env *env = mc->mc_txn->mt_env;
 	MDB_txn *txn = mc->mc_txn;
@@ -3612,8 +3612,8 @@ mdb_leaf_rebuild_after_trunk_delete(MDB_cursor *mc, MDB_page *mp, indx_t removed
 
 static int
 mdb_prefix_inline_measure_after_insert(MDB_cursor *mc, MDB_page *mp,
-    size_t current_capacity, unsigned int insert, const MDB_val *new_key,
-    MDB_val *new_data, unsigned int new_flags, size_t *needed_out)
+	size_t current_capacity, unsigned int insert, const MDB_val *new_key,
+	MDB_val *new_data, unsigned int new_flags, size_t *needed_out)
 {
 	MDB_env *env = mc->mc_txn->mt_env;
 	MDB_txn *txn = mc->mc_txn;
@@ -3805,8 +3805,8 @@ mdb_prefix_inline_measure_after_insert(MDB_cursor *mc, MDB_page *mp,
 
 static int
 mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp,
-    const MDB_val *old_trunk, indx_t insert, const MDB_val *new_key,
-    MDB_val *new_data, unsigned int new_flags, MDB_page *ofp)
+	const MDB_val *old_trunk, indx_t insert, const MDB_val *new_key,
+	MDB_val *new_data, unsigned int new_flags, MDB_page *ofp)
 {
 	MDB_env *env = mc->mc_txn->mt_env;
 	MDB_txn *txn = mc->mc_txn;
@@ -4026,8 +4026,8 @@ mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp,
 
 static int
 mdb_leaf_rebuild_measure(MDB_env *env, MDB_txn *txn,
-    MDB_prefix_rebuild_entry *entries, unsigned int count, size_t capacity,
-    size_t *used_out)
+	MDB_prefix_rebuild_entry *entries, unsigned int count, size_t capacity,
+	size_t *used_out)
 {
 	size_t lower_base;
 	size_t used;
@@ -4151,7 +4151,7 @@ mdb_leaf_rebuild_measure(MDB_env *env, MDB_txn *txn,
 
 static int
 mdb_leaf_rebuild_apply(MDB_cursor *mc, MDB_page *mp,
-    MDB_prefix_rebuild_entry *entries, unsigned int count, size_t capacity)
+	MDB_prefix_rebuild_entry *entries, unsigned int count, size_t capacity)
 {
 	unsigned int i;
 	size_t lower_base;
@@ -5814,21 +5814,21 @@ mdb_page_alloc(MDB_cursor *mc, int num, MDB_page **mp)
 	MDB_page *np;
 	txnid_t oldest = 0, last;
 	MDB_cursor_op op;
-    MDB_cursor m2 = (MDB_cursor){0};
-    MDB_xcursor m2x = (MDB_xcursor){0};
-    int found_old = 0;
+	MDB_cursor m2 = (MDB_cursor){0};
+	MDB_xcursor m2x = (MDB_xcursor){0};
+	int found_old = 0;
 
-    rc = MDB_SUCCESS;
+	rc = MDB_SUCCESS;
 
 	/* If there are any loose pages, just use them */
-    if (num == 1 && txn->mt_loose_pgs) {
-        np = txn->mt_loose_pgs;
-        txn->mt_loose_pgs = NEXT_LOOSE_PAGE(np);
-        txn->mt_loose_count--;
-        DPRINTF(("db %d use loose page %"Yu, DDBI(mc), np->mp_pgno));
-        *mp = np;
-        goto done;
-    }
+	if (num == 1 && txn->mt_loose_pgs) {
+		np = txn->mt_loose_pgs;
+		txn->mt_loose_pgs = NEXT_LOOSE_PAGE(np);
+		txn->mt_loose_count--;
+		DPRINTF(("db %d use loose page %"Yu, DDBI(mc), np->mp_pgno));
+		*mp = np;
+		goto done;
+	}
 
 	*mp = NULL;
 
@@ -5977,17 +5977,17 @@ search_done:
 	} else {
 		txn->mt_next_pgno = pgno + num;
 	}
-    np->mp_pgno = pgno;
-    mdb_page_dirty(txn, np);
-    *mp = np;
-    rc = MDB_SUCCESS;
-    goto done;
+	np->mp_pgno = pgno;
+	mdb_page_dirty(txn, np);
+	*mp = np;
+	rc = MDB_SUCCESS;
+	goto done;
 
 fail:
-    mdb_txn_mark_error(txn, rc);
+	mdb_txn_mark_error(txn, rc);
 done:
-    mdb_cursor_leaf_cache_clear(&m2.mc_leaf_cache);
-    return rc;
+	mdb_cursor_leaf_cache_clear(&m2.mc_leaf_cache);
+	return rc;
 }
 
 /** Copy the used portions of a non-overflow page.
@@ -6638,15 +6638,15 @@ renew:
 MDB_env *
 mdb_txn_env(MDB_txn *txn)
 {
-	if(!txn) return NULL;
+	if (!txn) return NULL;
 	return txn->mt_env;
 }
 
 mdb_size_t
 mdb_txn_id(MDB_txn *txn)
 {
-    if(!txn) return 0;
-    return txn->mt_txnid;
+	if (!txn) return 0;
+	return txn->mt_txnid;
 }
 
 /** Export or close DBI handles opened in this txn. */
@@ -10245,10 +10245,10 @@ mdb_node_read(MDB_cursor *mc, MDB_node *leaf, MDB_val *data)
 
 int
 mdb_get(MDB_txn *txn, MDB_dbi dbi,
-    MDB_val *key, MDB_val *data)
+	MDB_val *key, MDB_val *data)
 {
-MDB_cursor	mc = (MDB_cursor){0};
-MDB_xcursor	mx = (MDB_xcursor){0};
+	MDB_cursor	mc = (MDB_cursor){0};
+	MDB_xcursor	mx = (MDB_xcursor){0};
 	int exact = 0, rc;
 	DKBUF;
 
@@ -10550,7 +10550,7 @@ mdb_cursor_prev(MDB_cursor *mc, MDB_val *key, MDB_val *data, MDB_cursor_op op)
 /** Set the cursor on a specific data item. */
 static int
 mdb_cursor_set(MDB_cursor *mc, MDB_val *key, MDB_val *data,
-    MDB_cursor_op op, int *exactp)
+	MDB_cursor_op op, int *exactp)
 {
 	int		 rc;
 	MDB_page	*mp;
@@ -10906,7 +10906,7 @@ mdb_cursor_last(MDB_cursor *mc, MDB_val *key, MDB_val *data)
 
 int
 mdb_cursor_get(MDB_cursor *mc, MDB_val *key, MDB_val *data,
-    MDB_cursor_op op)
+	MDB_cursor_op op)
 {
 	int		 rc;
 	int		 exact = 0;
@@ -11118,8 +11118,8 @@ mdb_cursor_touch(MDB_cursor *mc)
 
 	if (mc->mc_dbi >= CORE_DBS && !(*mc->mc_dbflag & (DB_DIRTY|DB_DUPDATA))) {
 		/* Touch DB record of named DB */
-            MDB_cursor mc2 = (MDB_cursor){0};
-            MDB_xcursor mcx = (MDB_xcursor){0};
+		MDB_cursor mc2 = (MDB_cursor){0};
+		MDB_xcursor mcx = (MDB_xcursor){0};
 		if (TXN_DBI_CHANGED(mc->mc_txn, mc->mc_dbi))
 			return MDB_BAD_DBI;
 		mdb_cursor_init(&mc2, mc->mc_txn, MAIN_DBI, &mcx);
@@ -11143,7 +11143,7 @@ mdb_cursor_touch(MDB_cursor *mc)
 
 static int
 _mdb_cursor_put(MDB_cursor *mc, MDB_val *key, MDB_val *data,
-    unsigned int flags)
+	unsigned int flags)
 {
 	MDB_env		*env;
 	MDB_node	*leaf = NULL;
@@ -11883,7 +11883,7 @@ bad_sub:
 
 static int
 mdb_prefix_inline_build_pair(MDB_cursor *mc, MDB_page *mp, size_t capacity,
-    const MDB_val *first, const MDB_val *second)
+	const MDB_val *first, const MDB_val *second)
 {
 	MDB_val items[2];
 	MDB_cmp_func *dcmp;
@@ -12012,7 +12012,7 @@ mdb_prefix_inline_build_pair(MDB_cursor *mc, MDB_page *mp, size_t capacity,
 
 int
 mdb_cursor_put(MDB_cursor *mc, MDB_val *key, MDB_val *data,
-    unsigned int flags)
+	unsigned int flags)
 {
 	DKBUF;
 	DDBUF;
@@ -12274,8 +12274,8 @@ mdb_branch_size(MDB_env *env, MDB_page *mp, MDB_val *key)
  */
 static int
 mdb_node_add(MDB_cursor *mc, indx_t indx,
-    MDB_val *key, MDB_val *data, pgno_t pgno, unsigned int flags,
-    MDB_page *child_hint, uint64_t count_hint)
+	MDB_val *key, MDB_val *data, pgno_t pgno, unsigned int flags,
+	MDB_page *child_hint, uint64_t count_hint)
 {
 	size_t		 node_size = NODESIZE;
 	ssize_t		 room;
@@ -13301,10 +13301,10 @@ mdb_node_move(MDB_cursor *csrc, MDB_cursor *cdst, int fromleft)
 	uint64_t child_hint = MDB_COUNT_HINT_NONE;
 	if (counted && IS_BRANCH(dstpg) && IS_COUNTED(dstpg))
 		child_hint = moved_total;
-rc = mdb_node_add(cdst, cdst->mc_ki[cdst->mc_top], &key, &data, srcpg, flags,
-    NULL, child_hint);
-if (rc != MDB_SUCCESS)
-    return rc;
+	rc = mdb_node_add(cdst, cdst->mc_ki[cdst->mc_top], &key, &data, srcpg, flags,
+		NULL, child_hint);
+	if (rc != MDB_SUCCESS)
+		return rc;
 
 	/* Delete the node from the source page.
 	 */
@@ -14082,7 +14082,7 @@ done:
 
 int
 mdb_del(MDB_txn *txn, MDB_dbi dbi,
-    MDB_val *key, MDB_val *data)
+	MDB_val *key, MDB_val *data)
 {
 	DKBUF;
 	DDBUF;
@@ -14107,8 +14107,8 @@ static int
 mdb_del0(MDB_txn *txn, MDB_dbi dbi,
 	MDB_val *key, MDB_val *data, unsigned flags)
 {
-MDB_cursor mc = (MDB_cursor){0};
-MDB_xcursor mx = (MDB_xcursor){0};
+	MDB_cursor mc = (MDB_cursor){0};
+	MDB_xcursor mx = (MDB_xcursor){0};
 	MDB_cursor_op op;
 	MDB_val rdata, *xdata;
 	int		 rc, exact = 0;
@@ -14721,10 +14721,10 @@ done:
 
 int
 mdb_put(MDB_txn *txn, MDB_dbi dbi,
-    MDB_val *key, MDB_val *data, unsigned int flags)
+	MDB_val *key, MDB_val *data, unsigned int flags)
 {
-MDB_cursor mc = (MDB_cursor){0};
-MDB_xcursor mx = (MDB_xcursor){0};
+	MDB_cursor mc = (MDB_cursor){0};
+	MDB_xcursor mx = (MDB_xcursor){0};
 	int rc;
 	DKBUF;
 	DDBUF;
@@ -15661,7 +15661,7 @@ mdb_count_range(MDB_txn *txn, MDB_dbi dbi,
 
 static int
 mdb_count_values_until(MDB_txn *txn, MDB_dbi dbi, MDB_cmp_func *key_cmp,
-    const MDB_val *limit_key, int inclusive, uint64_t *out)
+	const MDB_val *limit_key, int inclusive, uint64_t *out)
 {
 	MDB_cursor mc = {0};
 	MDB_xcursor mx = {0};
@@ -15715,8 +15715,8 @@ done:
 
 int ESECT
 mdb_range_count_values(MDB_txn *txn, MDB_dbi dbi,
-    const MDB_val *key_low, const MDB_val *key_high, unsigned key_flags,
-    uint64_t *out)
+	const MDB_val *key_low, const MDB_val *key_high, unsigned key_flags,
+	uint64_t *out)
 {
 	MDB_db *db;
 	MDB_cmp_func *key_cmp;
@@ -16025,8 +16025,8 @@ int ESECT
 mdb_get_rank(MDB_txn *txn, MDB_dbi dbi, uint64_t rank,
 	MDB_val *key, MDB_val *data)
 {
-MDB_cursor mc = (MDB_cursor){0};
-MDB_xcursor mx = (MDB_xcursor){0};
+	MDB_cursor mc = (MDB_cursor){0};
+	MDB_xcursor mx = (MDB_xcursor){0};
 	int rc;
 
 	if (!TXN_DBI_EXIST(txn, dbi, DB_USRVALID))
