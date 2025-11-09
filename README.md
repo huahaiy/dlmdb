@@ -82,7 +82,7 @@ int rc = mdb_count_range(txn, dbi, &low, &high, MDB_RANGE_INCLUDE_LOWER, &total)
 ## Counted DB Benchmark
 
 `count_bench` exercises both naive cursor scans and the counted APIs. With
-50,000 entries, 100 sampled queries, a span of 5,000 keys, and 100 duplicates
+100,000 entries, 200 sampled queries, a span of 10,000 keys, and 20 duplicates
 per key:
 
 ```
