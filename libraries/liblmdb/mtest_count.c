@@ -1838,6 +1838,99 @@ test_random_access_plain(MDB_env *env)
 }
 
 static void
+test_rank_sampling_plain_stride(MDB_env *env)
+{
+    const uint64_t total = 768;
+    const uint64_t stride = 53;
+    MDB_txn *txn;
+    MDB_dbi dbi;
+    MDB_cursor *cur;
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "rank stride begin");
+    CHECK(mdb_dbi_open(txn, "rank_stride_plain",
+            MDB_CREATE | MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi),
+          "rank stride open");
+
+    for (uint64_t i = 0; i < total; ++i) {
+        char keybuf[32];
+        char databuf[32];
+        snprintf(keybuf, sizeof(keybuf), "rs%05" PRIu64, i);
+        snprintf(databuf, sizeof(databuf), "rv%05" PRIu64, i);
+        MDB_val key = {strlen(keybuf), keybuf};
+        MDB_val data = {strlen(databuf), databuf};
+        CHECK(mdb_put(txn, dbi, &key, &data, MDB_APPEND), "rank stride put");
+    }
+
+    CHECK(mdb_txn_commit(txn), "rank stride commit");
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "rank stride rd");
+    CHECK(mdb_cursor_open(txn, dbi, &cur), "rank stride cursor");
+
+    uint64_t target = 0;
+    for (int sample = 0; sample < 8; ++sample) {
+        uint64_t current = target;
+        MDB_val got_key, got_data;
+        CHECK(mdb_cursor_get_rank(cur, current, &got_key, &got_data, 0),
+              "rank stride sequential get");
+        char expect_key[32];
+        char expect_data[32];
+        snprintf(expect_key, sizeof(expect_key), "rs%05" PRIu64, current);
+        snprintf(expect_data, sizeof(expect_data), "rv%05" PRIu64, current);
+        expect_val_eq(&got_key, expect_key, "rank stride sequential key");
+        expect_val_eq(&got_data, expect_data, "rank stride sequential data");
+        target += stride;
+        if (target >= total)
+            target = total - 1;
+    }
+
+    uint64_t repeat_rank = stride * 3;
+    MDB_val repeat_key, repeat_data;
+    CHECK(mdb_cursor_get_rank(cur, repeat_rank, &repeat_key, &repeat_data, 0),
+          "rank stride repeat first");
+    char repeat_expect[32];
+    char repeat_data_expect[32];
+    snprintf(repeat_expect, sizeof(repeat_expect), "rs%05" PRIu64, repeat_rank);
+    snprintf(repeat_data_expect, sizeof(repeat_data_expect), "rv%05" PRIu64, repeat_rank);
+    expect_val_eq(&repeat_key, repeat_expect, "rank stride repeat key first");
+    expect_val_eq(&repeat_data, repeat_data_expect, "rank stride repeat data first");
+
+    CHECK(mdb_cursor_get_rank(cur, repeat_rank, &repeat_key, &repeat_data, 0),
+          "rank stride repeat second");
+    expect_val_eq(&repeat_key, repeat_expect, "rank stride repeat key second");
+    expect_val_eq(&repeat_data, repeat_data_expect, "rank stride repeat data second");
+
+    uint64_t far_rank = total - 2;
+    MDB_val far_key, far_data;
+    CHECK(mdb_cursor_get_rank(cur, far_rank, &far_key, &far_data, 0),
+          "rank stride far get");
+    char far_expect[32];
+    char far_data_expect[32];
+    snprintf(far_expect, sizeof(far_expect), "rs%05" PRIu64, far_rank);
+    snprintf(far_data_expect, sizeof(far_data_expect), "rv%05" PRIu64, far_rank);
+    expect_val_eq(&far_key, far_expect, "rank stride far key");
+    expect_val_eq(&far_data, far_data_expect, "rank stride far data");
+
+    MDB_val tail_key, tail_data;
+    uint64_t tail_rank = total - 1;
+    CHECK(mdb_cursor_get_rank(cur, tail_rank, &tail_key, &tail_data, 0),
+          "rank stride tail get");
+    char tail_expect[32];
+    char tail_data_expect[32];
+    snprintf(tail_expect, sizeof(tail_expect), "rs%05" PRIu64, tail_rank);
+    snprintf(tail_data_expect, sizeof(tail_data_expect), "rv%05" PRIu64, tail_rank);
+    expect_val_eq(&tail_key, tail_expect, "rank stride tail key");
+    expect_val_eq(&tail_data, tail_data_expect, "rank stride tail data");
+
+    mdb_cursor_close(cur);
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "rank stride drop begin");
+    CHECK(mdb_drop(txn, dbi, 1), "rank stride drop");
+    CHECK(mdb_txn_commit(txn), "rank stride drop commit");
+    mdb_dbi_close(env, dbi);
+}
+
+static void
 test_random_access_dupsort(MDB_env *env)
 {
     const int dup_counts[] = {1, 3, 5, 2, 4};
@@ -3699,6 +3792,7 @@ main(void)
     test_count_all_dupsort(env);
     test_count_all_persistence();
     test_random_access_plain(env);
+    test_rank_sampling_plain_stride(env);
     test_random_access_dupsort(env);
     test_overwrite_stability(env);
     test_cursor_deletions(env);

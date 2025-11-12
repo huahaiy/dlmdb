@@ -1727,6 +1727,7 @@ struct MDB_cursor {
 #define C_WRITEMAP	MDB_TXN_WRITEMAP /**< Copy of txn flag */
 #define C_LEAFCACHE	0x80		/**< Cursor supports leaf decode caching */
 #define C_SEQEXPECT	0x100		/**< Cursor expects sequential decode reuse */
+#define C_RANKVALID	0x200		/**< Cursor cache for rank traversal is valid */
 /** Read-only cursor into the txn's original snapshot in the map.
  *	Set for read-only txns, and in #mdb_page_alloc() for #FREE_DBI when
  *	#MDB_DEVEL & 2. Only implements code which is necessary for this.
@@ -1760,9 +1761,22 @@ struct MDB_cursor {
 	const void	*mc_seq_cmp_keyptr;	/**< cached search key pointer for prefix compare skip */
 	size_t		mc_seq_cmp_keysize;	/**< cached search key size for prefix compare skip */
 	size_t		mc_seq_cmp_prefix;	/**< cached shared prefix between search key and trunk */
-	pgno_t		mc_seq_cmp_pgno;	/**< leaf page the compare cache applies to */
+pgno_t		mc_seq_cmp_pgno;	/**< leaf page the compare cache applies to */
 	MDB_cursor_leaf_cache mc_leaf_cache; /**< cursor-local decoded leaf cache */
+	uint64_t	mc_rank_base[CURSOR_STACK]; /**< cached subtree prefixes for rank traversal */
+	uint64_t	mc_rank_cached; /**< cached absolute rank of current cursor position */
+	uint64_t	mc_rank_offset; /**< cached duplicate offset for current entry */
 };
+
+static void
+mdb_cursor_rank_invalidate(MDB_cursor *mc)
+{
+	if (!mc)
+		return;
+	mc->mc_flags &= ~C_RANKVALID;
+	mc->mc_rank_cached = 0;
+	mc->mc_rank_offset = 0;
+}
 
 static void
 mdb_cursor_seq_invalidate(MDB_cursor *mc)
@@ -1782,6 +1796,7 @@ mdb_cursor_seq_invalidate(MDB_cursor *mc)
 	mc->mc_seq_cmp_keysize = 0;
 	mc->mc_seq_cmp_prefix = 0;
 	mc->mc_seq_cmp_pgno = P_INVALID;
+	mdb_cursor_rank_invalidate(mc);
 }
 
 	/** Context for sorted-dup records.
@@ -10918,6 +10933,9 @@ mdb_cursor_get(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 	if (mc->mc_txn->mt_flags & MDB_TXN_BLOCKED)
 		return MDB_BAD_TXN;
 
+	if (op != MDB_GET_CURRENT)
+		mdb_cursor_rank_invalidate(mc);
+
 	switch (op) {
 	case MDB_GET_CURRENT:
 		if (!(mc->mc_flags & C_INITIALIZED)) {
@@ -12934,6 +12952,7 @@ mdb_cursor_init(MDB_cursor *mc, MDB_txn *txn, MDB_dbi dbi, MDB_xcursor *mx)
 	mc->mc_key_pgno = P_INVALID;
 	mc->mc_key_last = (indx_t)~0;
 	mdb_cursor_seq_invalidate(mc);
+	memset(mc->mc_rank_base, 0, sizeof(mc->mc_rank_base));
 	mdb_cursor_leaf_cache_reset(&mc->mc_leaf_cache);
 	if (txn->mt_dbs[dbi].md_flags & MDB_DUPSORT) {
 		mdb_tassert(txn, mx != NULL);
@@ -13720,6 +13739,9 @@ mdb_cursor_copy(const MDB_cursor *csrc, MDB_cursor *cdst)
 	cdst->mc_seq_cmp_keysize = 0;
 	cdst->mc_seq_cmp_prefix = 0;
 	cdst->mc_seq_cmp_pgno = P_INVALID;
+	memcpy(cdst->mc_rank_base, csrc->mc_rank_base, sizeof(csrc->mc_rank_base));
+	cdst->mc_rank_cached = csrc->mc_rank_cached;
+	cdst->mc_rank_offset = csrc->mc_rank_offset;
 	if (csrc->mc_key.mv_size && csrc->mc_key.mv_size <= MDB_KEYBUF_MAX) {
 		memcpy(cdst->mc_keybuf, csrc->mc_keybuf, csrc->mc_key.mv_size);
 		cdst->mc_key.mv_size = csrc->mc_key.mv_size;
@@ -15874,33 +15896,23 @@ done:
 }
 
 static int
-mdb_cursor_rank_search(MDB_cursor *mc, uint64_t rank, uint64_t *entry_offset)
+mdb_cursor_rank_descend(MDB_cursor *mc, uint64_t rank, uint64_t *entry_offset)
 {
 	MDB_page *mp;
 	MDB_node *node = NULL;
+	uint64_t remaining;
 	int rc;
-	uint64_t remaining = rank;
 
-	if (!mc || !mc->mc_db)
-		return EINVAL;
-	if (mc->mc_db->md_entries <= remaining)
+	if (!mc->mc_snum)
 		return MDB_NOTFOUND;
-
-	MDB_page *root = mc->mc_pg[0];
-	/* Inline duplicate subpages already have their leaf page loaded. */
-	if (!root || !IS_SUBP(root)) {
-		rc = mdb_page_search(mc, NULL, MDB_PS_ROOTONLY);
-		if (rc != MDB_SUCCESS)
-			return rc;
-	} else {
-		mc->mc_top = 0;
-		mc->mc_snum = 1;
-	}
-
-	mc->mc_flags |= C_INITIALIZED;
-	mc->mc_flags &= ~(C_EOF|C_DEL);
+	if (mc->mc_rank_base[mc->mc_top] > rank)
+		return MDB_CORRUPTED;
 
 	mp = mc->mc_pg[mc->mc_top];
+	if (!mp)
+		return MDB_CORRUPTED;
+	remaining = rank - mc->mc_rank_base[mc->mc_top];
+
 	while (IS_BRANCH(mp)) {
 		indx_t i, nkeys = NUMKEYS(mp);
 		if (!IS_COUNTED(mp))
@@ -15921,6 +15933,7 @@ mdb_cursor_rank_search(MDB_cursor *mc, uint64_t rank, uint64_t *entry_offset)
 		rc = mdb_cursor_push(mc, mp);
 		if (rc != MDB_SUCCESS)
 			return rc;
+		mc->mc_rank_base[mc->mc_top] = rank - remaining;
 	}
 
 	if (IS_LEAF2(mp)) {
@@ -15928,6 +15941,8 @@ mdb_cursor_rank_search(MDB_cursor *mc, uint64_t rank, uint64_t *entry_offset)
 		if (remaining >= nkeys)
 			return MDB_NOTFOUND;
 		mc->mc_ki[mc->mc_top] = (indx_t)remaining;
+		mc->mc_rank_cached = rank;
+		mc->mc_rank_offset = 0;
 		if (entry_offset)
 			*entry_offset = 0;
 		return MDB_SUCCESS;
@@ -15947,9 +15962,79 @@ mdb_cursor_rank_search(MDB_cursor *mc, uint64_t rank, uint64_t *entry_offset)
 	if (i == nkeys)
 		return MDB_NOTFOUND;
 	mc->mc_ki[mc->mc_top] = i;
+	mc->mc_rank_cached = rank;
+	mc->mc_rank_offset = remaining;
 	if (entry_offset)
 		*entry_offset = remaining;
 	return MDB_SUCCESS;
+}
+
+static int
+mdb_cursor_rank_search(MDB_cursor *mc, uint64_t rank, uint64_t *entry_offset)
+{
+	MDB_page *root;
+	int rc;
+
+	if (!mc || !mc->mc_db)
+		return EINVAL;
+	if (mc->mc_db->md_entries <= rank)
+		return MDB_NOTFOUND;
+
+	root = mc->mc_pg[0];
+	/* Inline duplicate subpages already have their leaf page loaded. */
+	if (!root || !IS_SUBP(root)) {
+		rc = mdb_page_search(mc, NULL, MDB_PS_ROOTONLY);
+		if (rc != MDB_SUCCESS)
+			return rc;
+	} else {
+		mc->mc_top = 0;
+		mc->mc_snum = 1;
+	}
+
+	mc->mc_rank_base[0] = 0;
+	mc->mc_flags |= C_INITIALIZED;
+	mc->mc_flags &= ~(C_EOF|C_DEL);
+
+	return mdb_cursor_rank_descend(mc, rank, entry_offset);
+}
+
+static int
+mdb_cursor_rank_resume(MDB_cursor *mc, uint64_t rank, uint64_t *entry_offset)
+{
+	int level;
+
+	if (!mc || !(mc->mc_flags & C_INITIALIZED) || !mc->mc_snum)
+		return MDB_NOTFOUND;
+	if (mc->mc_db->md_entries <= rank)
+		return MDB_NOTFOUND;
+	if (rank == mc->mc_rank_cached) {
+		if (entry_offset)
+			*entry_offset = mc->mc_rank_offset;
+		return MDB_SUCCESS;
+	}
+
+	for (level = mc->mc_top; level >= 0; --level) {
+		MDB_page *page = mc->mc_pg[level];
+		uint64_t base = mc->mc_rank_base[level];
+		uint64_t window;
+		if (!page)
+			return MDB_CORRUPTED;
+		if (rank < base)
+			continue;
+		window = rank - base;
+		if (window < mdb_page_subtree_count(page))
+			break;
+	}
+	if (level < 0)
+		return MDB_NOTFOUND;
+
+	while (mc->mc_top > level)
+		mdb_cursor_pop(mc);
+
+	mc->mc_flags |= C_INITIALIZED;
+	mc->mc_flags &= ~(C_EOF|C_DEL);
+
+	return mdb_cursor_rank_descend(mc, rank, entry_offset);
 }
 
 int ESECT
@@ -15971,13 +16056,26 @@ mdb_cursor_get_rank(MDB_cursor *mc, uint64_t rank,
 		return MDB_BAD_TXN;
 	if (!mc->mc_db->md_entries)
 		return MDB_NOTFOUND;
+	if (mc->mc_db->md_entries <= rank)
+		return MDB_NOTFOUND;
 
 	if (mc->mc_xcursor)
 		MDB_CURSOR_UNREF(&mc->mc_xcursor->mx_cursor, 0);
 
+	if ((mc->mc_flags & (C_RANKVALID|C_INITIALIZED)) == (C_RANKVALID|C_INITIALIZED) &&
+	    mc->mc_snum && rank >= mc->mc_rank_cached) {
+		rc = mdb_cursor_rank_resume(mc, rank, &dup_index);
+		if (rc == MDB_SUCCESS)
+			goto positioned;
+		if (rc != MDB_NOTFOUND)
+			return rc;
+	}
+
 	rc = mdb_cursor_rank_search(mc, rank, &dup_index);
 	if (rc != MDB_SUCCESS)
 		return rc;
+
+positioned:
 
 	mp = mc->mc_pg[mc->mc_top];
 	if (IS_LEAF2(mp)) {
@@ -16007,9 +16105,16 @@ mdb_cursor_get_rank(MDB_cursor *mc, uint64_t rank,
 		return MDB_CORRUPTED;
 	}
 
-	if (!key && !data)
+	if (!key && !data) {
+		mc->mc_flags |= C_RANKVALID;
 		return MDB_SUCCESS;
-	return mdb_cursor_get(mc, key, data, MDB_GET_CURRENT);
+	}
+	rc = mdb_cursor_get(mc, key, data, MDB_GET_CURRENT);
+	if (rc == MDB_SUCCESS)
+		mc->mc_flags |= C_RANKVALID;
+	else
+		mdb_cursor_rank_invalidate(mc);
+	return rc;
 }
 
 int ESECT

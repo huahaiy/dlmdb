@@ -9,6 +9,7 @@ features:
 * Order statistics.
   - Random access by rank, i.e. getting ith item efficiently.
   - Rank lookup for existing keys (and specific duplicates).
+  - Efficient sampling.
   - Efficient range count.
 * Prefix compression.
 
@@ -34,6 +35,10 @@ if (rc == MDB_SUCCESS) {
     /* key/data point to the ith entry in sorted order */
 }
 ```
+
+`mdb_cursor_get_rank` keeps the state of previous call, so successive calls continue
+search from the current position, which speeds up sparse sampling.
+
 ### Finding the rank of an existing key
 
 `mdb_get_key_rank` and `mdb_cursor_key_rank` provide the inverse operation. They
@@ -120,6 +125,39 @@ Insert order: shuffled
 
 In short: counted metadata adds negligible write-time overhead while delivering
 two to three orders of magnitude acceleration for range counts and rank lookups.
+
+### Sparse sampling
+
+`sample_bench` focuses on the sampling workload: reading a tiny subset of
+entries (e.g. 1 000 ranks out of 10 000 000) without materializing the skipped
+span. It builds a counted database (plain or dupsort) and compares two
+strategies:
+
+* **Warm sequential** – repeated `mdb_cursor_get_rank` calls using the cached
+  cursor state that the counted tree exposes. This is the optimized path.
+* **Stride scan (MDB_NEXT)** – a baseline that seeds the cursor once and then
+  advances via `MDB_NEXT` for every skipped record, i.e. a traditional cursor walk.
+
+Example runs on a single SSD-backed workstation (stride of 10 000, 1 000 samples):
+
+```
+./sample_bench --entries 10000000 --samples 1000 --batch 250000 --mode both \
+               --path ./bench_sample_plain
+Preparing 10000000 entries (batch 250000, stride 10000, samples 1000, dups 1)
+Population: 1789.28 ms (5.59 M entries/sec)
+Warm sequential: samples=1000 total=1.71 ms avg=1.71 us/op
+Stride scan (MDB_NEXT): samples=1000 total=92.36 ms avg=92.36 us/op
+
+./sample_bench --entries 10000000 --samples 1000 --batch 250000 --mode both \
+               --dups 8 --path ./bench_sample_dups
+Preparing 10000000 entries (batch 250000, stride 10000, samples 1000, dups 8)
+Population: 4444.42 ms (2.25 M entries/sec)
+Warm sequential: samples=1000 total=1.55 ms avg=1.55 us/op
+Stride scan (MDB_NEXT): samples=1000 total=153.60 ms avg=153.60 us/op
+```
+
+For both plain and dupsort databases, the counted cursor path is roughly two
+orders of magnitude faster than a sequential scan when sampling sparsely.
 
 ## Prefix Compression
 

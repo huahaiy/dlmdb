@@ -112,6 +112,9 @@ static void test_prefix_dupsort_trunk_key_shift_no_value_change(void);
 static void test_prefix_concurrent_reads(void);
 static void test_prefix_tuples_ave_range_hit(void);
 static void test_plain_tuples_get_both_range(void);
+static void test_prefix_dupsort_counted_dup_range_walk(void);
+static int pf_key_compare(const char *a, size_t alen,
+    const char *b, size_t blen);
 
 static void
 reset_dir(const char *dir)
@@ -1024,6 +1027,167 @@ test_plain_tuples_get_both_range(void)
 	cleanup_env_dir(env_dir);
 	free(expect_val);
 	free(target_key);
+}
+
+static void
+insert_counted_dup_range_batch(MDB_txn *txn, MDB_dbi dbi,
+    const char *const *prefixes, size_t prefix_count, size_t per_prefix_keys,
+    size_t dup_count, size_t serial_parity, int reverse_key_order)
+{
+	char keybuf[PF_KEY_MAX_LEN];
+	unsigned char valbuf[PF_VALUE_MAX_LEN];
+
+	for (size_t pref = 0; pref < prefix_count; ++pref) {
+		for (size_t key_iter = 0; key_iter < per_prefix_keys; ++key_iter) {
+			size_t key_idx = reverse_key_order ?
+			    (per_prefix_keys - 1 - key_iter) : key_iter;
+			int key_len = snprintf(keybuf, sizeof(keybuf), "%s-%04zu",
+			    prefixes[pref], key_idx);
+			if (key_len < 0 || (size_t)key_len >= sizeof(keybuf)) {
+				fprintf(stderr, "counted dup range: key overflow\n");
+				exit(EXIT_FAILURE);
+			}
+			MDB_val key = { (size_t)key_len, keybuf };
+			for (size_t dup = 0; dup < dup_count; ++dup) {
+				size_t serial = dup * 2 + serial_parity;
+				int val_len = snprintf((char *)valbuf, sizeof(valbuf),
+				    "value:%s:%04zu:%04zu:%08zx",
+				    prefixes[pref], key_idx, serial,
+				    (size_t)((key_idx + 1) * 1315423911ULL ^ serial));
+				if (val_len < 0 || (size_t)val_len >= sizeof(valbuf)) {
+					fprintf(stderr, "counted dup range: value overflow\n");
+					exit(EXIT_FAILURE);
+				}
+				size_t payload_len = (size_t)val_len;
+				size_t extra = 8 + (serial % 24);
+				if (payload_len + extra > sizeof(valbuf))
+					extra = sizeof(valbuf) - payload_len;
+				memset(valbuf + payload_len,
+				    (int)('a' + (serial % 26)), extra);
+				payload_len += extra;
+				MDB_val data = { payload_len, valbuf };
+				CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+			}
+		}
+	}
+}
+
+static void
+test_prefix_dupsort_counted_dup_range_walk(void)
+{
+	static const char *dir = "testdb_prefix_counted_dup_range_walk";
+	static const char *const prefixes[] = {
+		"range-alpha",
+		"range-beta",
+		"range-charlie"
+	};
+	const size_t prefix_count = ARRAY_SIZE(prefixes);
+	const size_t keys_per_prefix = 96;
+	const size_t dup_per_pass = 120;
+	const char *range_start = "range-beta-0024";
+	const char *range_end = "range-charlie-0014";
+	const size_t range_end_len = strlen(range_end);
+
+	MDB_env *env = create_env_with_mapsize(dir, 256UL * 1024 * 1024);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+	unsigned int flags = MDB_PREFIX_COMPRESSION | MDB_COUNTED | MDB_DUPSORT;
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, "counted-range", MDB_CREATE | flags, &dbi));
+	insert_counted_dup_range_batch(txn, dbi, prefixes, prefix_count,
+	    keys_per_prefix, dup_per_pass, 0, 0);
+	CHECK_CALL(mdb_txn_commit(txn));
+	mdb_dbi_close(env, dbi);
+
+	/* Insert odd-serial duplicates in reverse key order to trigger heavy splits. */
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, "counted-range", flags, &dbi));
+	insert_counted_dup_range_batch(txn, dbi, prefixes, prefix_count,
+	    keys_per_prefix, dup_per_pass, 1, 1);
+	CHECK_CALL(mdb_txn_commit(txn));
+	mdb_dbi_close(env, dbi);
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, "counted-range", flags, &dbi));
+
+	MDB_cursor *cur = NULL;
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+
+	MDB_val key = { strlen(range_start), (void *)range_start };
+	MDB_val data = { 0, NULL };
+	int rc = mdb_cursor_get(cur, &key, &data, MDB_SET_RANGE);
+	if (rc != MDB_SUCCESS) {
+		fprintf(stderr,
+		    "counted dup range: could not seek to start key %s (%s)\n",
+		    range_start, mdb_strerror(rc));
+		exit(EXIT_FAILURE);
+	}
+
+	size_t visited_keys = 0;
+	while (rc == MDB_SUCCESS) {
+		int cmp_end = pf_key_compare((const char *)key.mv_data,
+		    key.mv_size, range_end, range_end_len);
+		if (cmp_end > 0)
+			break;
+
+		mdb_size_t dupcount = 0;
+		CHECK_CALL(mdb_cursor_count(cur, &dupcount));
+		if (dupcount == 0) {
+			fprintf(stderr, "counted dup range: empty duplicate set\n");
+			exit(EXIT_FAILURE);
+		}
+
+		MDB_val dup_key = key;
+		MDB_val dup_data = data;
+		size_t success_steps = 0;
+		size_t guard = (size_t)dupcount + 4;
+		int step_rc = MDB_SUCCESS;
+
+		for (size_t step = 0; step < guard; ++step) {
+			step_rc = mdb_cursor_get(cur, &dup_key, &dup_data, MDB_NEXT_DUP);
+			if (step_rc == MDB_SUCCESS) {
+				success_steps++;
+				continue;
+			}
+			if (step_rc == MDB_NOTFOUND)
+				break;
+			CHECK(step_rc, "counted dup range: MDB_NEXT_DUP");
+		}
+
+		if (step_rc != MDB_NOTFOUND) {
+			fprintf(stderr,
+			    "counted dup range: cursor failed to finish duplicates "
+			    "for key %.*s (dupcount=%" PRIuPTR ")\n",
+			    (int)key.mv_size, (const char *)key.mv_data,
+			    (uintptr_t)dupcount);
+			exit(EXIT_FAILURE);
+		}
+		if (success_steps != (size_t)dupcount - 1) {
+			fprintf(stderr,
+			    "counted dup range: expected %" PRIuPTR
+			    " NEXT_DUP steps, saw %zu for key %.*s\n",
+			    (uintptr_t)(dupcount - 1), success_steps,
+			    (int)key.mv_size, (const char *)key.mv_data);
+			exit(EXIT_FAILURE);
+		}
+
+		visited_keys++;
+		rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT);
+	}
+
+	if (visited_keys == 0) {
+		fprintf(stderr,
+		    "counted dup range: range [%s, %s] visited no keys\n",
+		    range_start, range_end);
+		exit(EXIT_FAILURE);
+	}
+
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+	mdb_dbi_close(env, dbi);
+	mdb_env_close(env);
+	cleanup_env_dir(dir);
 }
 
 static void
@@ -3547,6 +3711,7 @@ main(void)
   test_cursor_buffer_sharing();
   test_prefix_dupsort_transitions();
   test_plain_tuples_get_both_range();
+  test_prefix_dupsort_counted_dup_range_walk();
   test_prefix_tuples_ave_range_hit();
 	test_prefix_dupsort_cursor_walk();
 	test_prefix_encoded_range_regression();
