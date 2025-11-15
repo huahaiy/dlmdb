@@ -1660,19 +1660,45 @@ int  mdb_cursor_put(MDB_cursor *cursor, MDB_val *key, MDB_val *data,
 	 */
 int  mdb_cursor_del(MDB_cursor *cursor, unsigned int flags);
 
-	/** @brief Return count of duplicates for current key.
-	 *
-	 * This call is only valid on databases that support sorted duplicate
-	 * data items #MDB_DUPSORT.
-	 * @param[in] cursor A cursor handle returned by #mdb_cursor_open()
+/** @brief Return count of duplicates for current key.
+ *
+ * This call is only valid on databases that support sorted duplicate
+ * data items #MDB_DUPSORT.
+ * @param[in] cursor A cursor handle returned by #mdb_cursor_open()
 	 * @param[out] countp Address where the count will be stored
 	 * @return A non-zero error value on failure and 0 on success. Some possible
 	 * errors are:
+ * <ul>
+ *	<li>EINVAL - cursor is not initialized, or an invalid parameter was specified.
+ * </ul>
+ */
+int  mdb_cursor_count(MDB_cursor *cursor, mdb_size_t *countp);
+
+	/** @brief Return a read-only view of all duplicate data items for the current key.
+	 *
+	 * This call materializes every duplicate value for the key at the cursor's
+	 * current position and returns a pointer to an array of #MDB_val entries.
+	 * The returned array is owned by LMDB; it remains valid until the cursor is
+	 * moved to a different key or the transaction ends.  This accelerated path
+	 * is only available for #MDB_DUPSORT databases whose duplicate items are
+	 * stored inline on the containing leaf page (the normal case). Keys whose
+	 * duplicates were promoted to sub-databases return #MDB_INCOMPATIBLE.
+	 * @param[in] cursor A cursor handle returned by #mdb_cursor_open()
+	 * @param[out] values On success, updated to point at \b countp read-only #MDB_val
+	 *	entries describing each duplicate value for the current key. The pointer
+	 *	becomes invalid after the cursor is repositioned.
+	 * @param[out] countp Address where the duplicate count will be stored
+	 * @return A non-zero error value on failure and 0 on success. Some possible
+	 * errors are:
 	 * <ul>
+	 *	<li>#MDB_NOTFOUND - the current key does not have duplicate data items.
+	 *	<li>#MDB_INCOMPATIBLE - the database does not support #MDB_DUPSORT or the
+	 *		key's duplicates are stored in a sub-database.
 	 *	<li>EINVAL - cursor is not initialized, or an invalid parameter was specified.
 	 * </ul>
 	 */
-int  mdb_cursor_count(MDB_cursor *cursor, mdb_size_t *countp);
+int  mdb_cursor_list_dup(MDB_cursor *cursor,
+		const MDB_val **values, mdb_size_t *countp);
 
 	/** @brief Compare two data items according to a particular database.
 	 *

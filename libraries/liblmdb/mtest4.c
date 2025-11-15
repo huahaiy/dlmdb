@@ -109,6 +109,29 @@ int main(int argc,char * argv[])
 	mdb_cursor_close(cursor);
 	mdb_txn_abort(txn);
 
+	/* Validate dupsort materialization helper */
+	E(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	E(mdb_cursor_open(txn, dbi, &cursor));
+	{
+		const MDB_val *dup_list = NULL;
+		mdb_size_t dupcount = 0;
+		strcpy(kval, "001");
+		key.mv_size = sizeof(int);
+		key.mv_data = kval;
+		E(mdb_cursor_get(cursor, &key, &data, MDB_SET));
+		E(mdb_cursor_list_dup(cursor, &dup_list, &dupcount));
+		CHECK(dupcount == (mdb_size_t)count, "mdb_cursor_list_dup");
+		for (i = 0; i < 3 && i < (int)dupcount; ++i) {
+			char expect[8];
+			sprintf(expect, "%07x", values[i]);
+			CHECK(dup_list[i].mv_size == sizeof(expect), "dup value size");
+			CHECK(memcmp(dup_list[i].mv_data, expect, sizeof(expect)) == 0,
+				"dup value contents");
+		}
+	}
+	mdb_cursor_close(cursor);
+	mdb_txn_abort(txn);
+
 	/* test all 3 branches of split code:
 	 * 1: new key in lower half
 	 * 2: new key at split point

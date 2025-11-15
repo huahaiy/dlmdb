@@ -13060,6 +13060,110 @@ mdb_cursor_count(MDB_cursor *mc, mdb_size_t *countp)
 	return MDB_SUCCESS;
 }
 
+static int
+mdb_cursor_list_dup_leaf2(MDB_cursor *mc, MDB_page *mp)
+{
+	MDB_cursor_leaf_cache *cache = &mc->mc_leaf_cache;
+	unsigned int total = cache->decoded_count;
+	unsigned int ksize = mp->mp_pad;
+
+	for (unsigned int i = 0; i < total; ++i) {
+		cache->decoded_vals[i].mv_size = ksize;
+		cache->decoded_vals[i].mv_data = LEAF2KEY(mp, i, ksize);
+		if (cache->decoded_ready)
+			cache->decoded_ready[i] = 1;
+	}
+	return MDB_SUCCESS;
+}
+
+static int
+mdb_cursor_list_dup_regular(MDB_cursor *mc, MDB_page *mp)
+{
+	MDB_cursor_leaf_cache *cache = &mc->mc_leaf_cache;
+	unsigned int total = cache->decoded_count;
+	int rc;
+
+	if (!total)
+		return MDB_SUCCESS;
+
+	rc = mdb_cursor_leaf_cache_materialize(mc, mp);
+	if (rc != MDB_SUCCESS)
+		return rc;
+
+	for (unsigned int i = 0; i < total; ++i) {
+		if (cache->decoded_ready && cache->decoded_ready[i])
+			continue;
+		MDB_node *node = NODEPTR(mp, i);
+		const unsigned char *encoded = NODEKEY(mp, node);
+		rc = mdb_leaf_decode_key(&cache->decoded_vals[0], encoded,
+		    node->mn_ksize, &cache->decoded_vals[i],
+		    cache->decoded_vals[i].mv_data, cache->decoded_stride, 0, NULL);
+		if (rc != MDB_SUCCESS)
+			return rc;
+		if (cache->decoded_ready)
+			cache->decoded_ready[i] = 1;
+	}
+	return MDB_SUCCESS;
+}
+
+int
+mdb_cursor_list_dup(MDB_cursor *mc, const MDB_val **values, mdb_size_t *countp)
+{
+	MDB_node *leaf;
+	MDB_cursor *mx;
+	MDB_page *dp;
+	MDB_cursor_leaf_cache *cache;
+	int rc;
+
+	if (mc == NULL || values == NULL || countp == NULL)
+		return EINVAL;
+
+	if (mc->mc_txn->mt_flags & MDB_TXN_BLOCKED)
+		return MDB_BAD_TXN;
+
+	if (mc->mc_xcursor == NULL || !(mc->mc_db->md_flags & MDB_DUPSORT))
+		return MDB_INCOMPATIBLE;
+
+	if (!(mc->mc_flags & C_INITIALIZED) || !mc->mc_snum)
+		return MDB_NOTFOUND;
+
+	if (mc->mc_flags & C_EOF) {
+		if (mc->mc_ki[mc->mc_top] >= NUMKEYS(mc->mc_pg[mc->mc_top]))
+			return MDB_NOTFOUND;
+		mc->mc_flags ^= C_EOF;
+	}
+
+	leaf = NODEPTR(mc->mc_pg[mc->mc_top], mc->mc_ki[mc->mc_top]);
+	if (!F_ISSET(leaf->mn_flags, F_DUPDATA))
+		return MDB_NOTFOUND;
+	if (F_ISSET(leaf->mn_flags, F_SUBDATA))
+		return MDB_INCOMPATIBLE;
+
+	mx = &mc->mc_xcursor->mx_cursor;
+	if (!(mx->mc_flags & C_INITIALIZED))
+		return EINVAL;
+
+	dp = mx->mc_pg[mx->mc_top];
+	if (!dp)
+		return MDB_CORRUPTED;
+
+	cache = &mx->mc_leaf_cache;
+	rc = mdb_cursor_leaf_cache_prepare(mx, dp);
+	if (rc != MDB_SUCCESS)
+		return rc;
+
+	if (IS_LEAF2(dp))
+		rc = mdb_cursor_list_dup_leaf2(mx, dp);
+	else
+		rc = mdb_cursor_list_dup_regular(mx, dp);
+	if (rc != MDB_SUCCESS)
+		return rc;
+
+	*countp = cache->decoded_count;
+	*values = cache->decoded_count ? cache->decoded_vals : NULL;
+	return MDB_SUCCESS;
+}
+
 void
 mdb_cursor_close(MDB_cursor *mc)
 {

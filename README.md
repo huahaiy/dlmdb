@@ -12,10 +12,12 @@ features:
   - Efficient sampling.
   - Efficient range count.
 * Prefix compression.
+* DUPSORT iteration optimization.
 
 These features are critical for Datalevin's high performance: the order
-statistics facilitate query planning, while prefix compression couples
-well with triplet storage.
+statistics facilitate query planning; prefix compression couples
+well with triple storage; and the dedicated optimization speeds up the most
+common index scan routines.
 
 ## Order-statistics API
 
@@ -272,3 +274,32 @@ keeping read/write throughput on par with the uncompressed baseline. In fact,
 compressed performance is generally slightly better than the uncompressed cases
 in DUPSORT workloads. As Datalevin's triple storage uses this format, we did
 more optimizations.
+
+## Dupsort Bulk Iteration
+
+Most Datalevin Datalog query workloads first seek to a key and then read every
+duplicate in that set (analog to reading a row in row based RDBMS). Walking
+`MDB_NEXT_DUP` for each value is cache-unfriendly, so LMDB now exposes
+`mdb_cursor_list_dup()`: once a cursor is positioned on a key,
+`mdb_cursor_list_dup(cursor, &vals, &count)` materializes all inline duplicates
+into the cursor’s leaf cache and returns a read-only array of `MDB_val`
+structures. When the duplicates were promoted to a sub-database (very large
+dupsets) the call falls back to `MDB_INCOMPATIBLE`, signalling the caller to use
+the classic loop. Prefix-compressed counted databases benefit automatically
+because the decoded-leaf cache is already hot.
+
+`dup_iter_bench` compares the fast path with the old per-duplicate loop:
+
+```
+cd libraries/liblmdb
+make dup_iter_bench
+./dup_iter_bench --keys 20000 --dups 20 --runs 5
+Benchmark configuration: keys=20000 dups/key=20 runs=5
+Total key visits: 100000, total duplicates read: 2000000
+mdb_cursor_list_dup: 19.270 ms (0.193 us/key, 9.635 ns/value)
+MDB_NEXT_DUP loop:   34.006 ms (0.340 us/key, 17.003 ns/value)
+```
+
+By keeping duplicate iteration inside the cache and avoiding repeated cursor
+jumps, `mdb_cursor_list_dup` cuts the inner-loop cost roughly in half for common
+key/dups iteration.
