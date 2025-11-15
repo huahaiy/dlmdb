@@ -406,6 +406,48 @@ naive_count(MDB_txn *txn, MDB_dbi dbi,
 }
 
 static uint64_t
+naive_count_keys_only(MDB_txn *txn, MDB_dbi dbi,
+                      const MDB_val *low, const MDB_val *high,
+                      int lower_incl, int upper_incl,
+                      MDB_cmp_func *cmp_func)
+{
+    MDB_cursor *cur;
+    MDB_val key, data;
+    uint64_t total = 0;
+    int rc = mdb_cursor_open(txn, dbi, &cur);
+    CHECK(rc, "naive_count_keys cursor_open");
+
+    if (!cmp_func)
+        cmp_func = cmp_key;
+
+    rc = mdb_cursor_get(cur, &key, &data, MDB_FIRST);
+    while (rc == MDB_SUCCESS) {
+        int include = 1;
+        if (low) {
+            int cmp = cmp_func(&key, low);
+            if (cmp < 0 || (cmp == 0 && !lower_incl))
+                include = 0;
+        }
+        if (high) {
+            int cmp = cmp_func(&key, high);
+            if (cmp > 0 || (cmp == 0 && !upper_incl)) {
+                include = 0;
+                if (cmp > 0 || (cmp == 0 && !upper_incl))
+                    break;
+            }
+        }
+        if (include)
+            total++;
+        rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT_NODUP);
+    }
+    if (rc != MDB_NOTFOUND)
+        CHECK(rc, "naive_count_keys cursor_next");
+
+    mdb_cursor_close(cur);
+    return total;
+}
+
+static uint64_t
 naive_count_values(MDB_txn *txn, MDB_dbi dbi,
                    const MDB_val *key_low, const MDB_val *key_high,
                    int key_lower_incl, int key_upper_incl,
@@ -1303,6 +1345,163 @@ test_range_count_values(MDB_env *env)
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "dup range drop begin");
     CHECK(mdb_drop(txn, dbi, 0), "dup range drop");
     CHECK(mdb_txn_commit(txn), "dup range drop commit");
+    mdb_dbi_close(env, dbi);
+}
+
+static void
+test_range_count_keys_dupsort(MDB_env *env)
+{
+    MDB_txn *txn;
+    MDB_dbi dbi;
+    MDB_val key, data;
+    char keybuf[16];
+    char valbuf[16];
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "dup keys range begin");
+    CHECK(mdb_dbi_open(txn, "dup_key_ranges",
+                       MDB_CREATE | MDB_DUPSORT | MDB_COUNTED | MDB_PREFIX_COMPRESSION,
+                       &dbi),
+          "dup keys range open");
+
+    for (int i = 0; i < 6; ++i) {
+        snprintf(keybuf, sizeof(keybuf), "k%02d", i);
+        key.mv_data = keybuf;
+        key.mv_size = strlen(keybuf);
+        int dupcount = (i % 3) + 1;
+        for (int j = 0; j < dupcount; ++j) {
+            snprintf(valbuf, sizeof(valbuf), "v%d%d", i, j);
+            data.mv_data = valbuf;
+            data.mv_size = strlen(valbuf);
+            CHECK(mdb_put(txn, dbi, &key, &data, 0), "dup keys range put");
+        }
+    }
+    CHECK(mdb_txn_commit(txn), "dup keys range commit");
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "dup keys read begin");
+
+    MDB_val key_low = { 3, (void *)"k01" };
+    MDB_val key_high = { 3, (void *)"k04" };
+    uint64_t counted = 0;
+    uint64_t naive = 0;
+
+    naive = naive_count_keys_only(txn, dbi, &key_low, &key_high, 1, 1, cmp_key);
+    CHECK(mdb_range_count_keys(txn, dbi, &key_low, &key_high,
+                               MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL, &counted),
+          "dup keys closed range");
+    expect_eq(counted, naive, "dup keys closed range match");
+
+    naive = naive_count_keys_only(txn, dbi, &key_low, &key_high, 0, 1, cmp_key);
+    CHECK(mdb_range_count_keys(txn, dbi, &key_low, &key_high,
+                               MDB_COUNT_UPPER_INCL, &counted),
+          "dup keys lower exclusive");
+    expect_eq(counted, naive, "dup keys lower exclusive match");
+
+    naive = naive_count_keys_only(txn, dbi, &key_low, &key_high, 1, 0, cmp_key);
+    CHECK(mdb_range_count_keys(txn, dbi, &key_low, &key_high,
+                               MDB_COUNT_LOWER_INCL, &counted),
+          "dup keys upper exclusive");
+    expect_eq(counted, naive, "dup keys upper exclusive match");
+
+    MDB_val between_low = { 4, (void *)"k015" };
+    MDB_val between_high = { 3, (void *)"k03" };
+    naive = naive_count_keys_only(txn, dbi, &between_low, &between_high, 1, 1, cmp_key);
+    CHECK(mdb_range_count_keys(txn, dbi, &between_low, &between_high,
+                               MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL, &counted),
+          "dup keys mid gap range");
+    expect_eq(counted, naive, "dup keys mid gap range match");
+
+    naive = naive_count_keys_only(txn, dbi, NULL, NULL, 0, 0, cmp_key);
+    CHECK(mdb_range_count_keys(txn, dbi, NULL, NULL, 0, &counted),
+          "dup keys full range");
+    expect_eq(counted, naive, "dup keys full range match");
+
+    MDB_val head_high = { 3, (void *)"k02" };
+    naive = naive_count_keys_only(txn, dbi, NULL, &head_high, 0, 1, cmp_key);
+    CHECK(mdb_range_count_keys(txn, dbi, NULL, &head_high,
+                               MDB_COUNT_UPPER_INCL, &counted),
+          "dup keys head inclusive");
+    expect_eq(counted, naive, "dup keys head inclusive match");
+
+    naive = naive_count_keys_only(txn, dbi, NULL, &head_high, 0, 0, cmp_key);
+    CHECK(mdb_range_count_keys(txn, dbi, NULL, &head_high, 0, &counted),
+          "dup keys head exclusive");
+    expect_eq(counted, naive, "dup keys head exclusive match");
+
+    MDB_val tail_low = { 3, (void *)"k03" };
+    naive = naive_count_keys_only(txn, dbi, &tail_low, NULL, 1, 0, cmp_key);
+    CHECK(mdb_range_count_keys(txn, dbi, &tail_low, NULL,
+                               MDB_COUNT_LOWER_INCL, &counted),
+          "dup keys tail inclusive");
+    expect_eq(counted, naive, "dup keys tail inclusive match");
+
+    naive = naive_count_keys_only(txn, dbi, &tail_low, NULL, 0, 0, cmp_key);
+    CHECK(mdb_range_count_keys(txn, dbi, &tail_low, NULL, 0, &counted),
+          "dup keys tail exclusive");
+    expect_eq(counted, naive, "dup keys tail exclusive match");
+
+    MDB_val low_outside = { 3, (void *)"k99" };
+    naive = naive_count_keys_only(txn, dbi, &low_outside, NULL, 1, 0, cmp_key);
+    CHECK(mdb_range_count_keys(txn, dbi, &low_outside, NULL,
+                               MDB_COUNT_LOWER_INCL, &counted),
+          "dup keys low outside");
+    expect_eq(counted, naive, "dup keys low outside zero");
+
+    MDB_val high_outside = { 3, (void *)"a00" };
+    naive = naive_count_keys_only(txn, dbi, NULL, &high_outside, 0, 1, cmp_key);
+    CHECK(mdb_range_count_keys(txn, dbi, NULL, &high_outside,
+                               MDB_COUNT_UPPER_INCL, &counted),
+          "dup keys high outside");
+    expect_eq(counted, naive, "dup keys high outside zero");
+
+    MDB_val reverse_low = { 3, (void *)"k04" };
+    MDB_val reverse_high = { 3, (void *)"k02" };
+    naive = naive_count_keys_only(txn, dbi, &reverse_low, &reverse_high, 1, 1, cmp_key);
+    CHECK(mdb_range_count_keys(txn, dbi, &reverse_low, &reverse_high,
+                               MDB_COUNT_LOWER_INCL | MDB_COUNT_UPPER_INCL, &counted),
+          "dup keys reversed bounds");
+    expect_eq(counted, naive, "dup keys reversed bounds zero");
+
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "dup keys mutate begin");
+    key.mv_data = "k06";
+    key.mv_size = 3;
+    for (int j = 0; j < 2; ++j) {
+        snprintf(valbuf, sizeof(valbuf), "z%d", j);
+        data.mv_data = valbuf;
+        data.mv_size = strlen(valbuf);
+        CHECK(mdb_put(txn, dbi, &key, &data, 0), "dup keys insert new");
+    }
+    key.mv_data = "k01";
+    key.mv_size = 3;
+    CHECK(mdb_del(txn, dbi, &key, NULL), "dup keys delete k01");
+    CHECK(mdb_txn_commit(txn), "dup keys mutate commit");
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "dup keys reread begin");
+
+    MDB_val missing_low = { 3, (void *)"k01" };
+    naive = naive_count_keys_only(txn, dbi, &missing_low, NULL, 1, 0, cmp_key);
+    CHECK(mdb_range_count_keys(txn, dbi, &missing_low, NULL,
+                               MDB_COUNT_LOWER_INCL, &counted),
+          "dup keys missing lower bound");
+    expect_eq(counted, naive, "dup keys missing lower bound match");
+
+    MDB_val new_high = { 3, (void *)"k06" };
+    naive = naive_count_keys_only(txn, dbi, NULL, &new_high, 0, 0, cmp_key);
+    CHECK(mdb_range_count_keys(txn, dbi, NULL, &new_high, 0, &counted),
+          "dup keys upper exclusive new");
+    expect_eq(counted, naive, "dup keys upper exclusive new match");
+
+    naive = naive_count_keys_only(txn, dbi, NULL, NULL, 0, 0, cmp_key);
+    CHECK(mdb_range_count_keys(txn, dbi, NULL, NULL, 0, &counted),
+          "dup keys post mutate total");
+    expect_eq(counted, naive, "dup keys post mutate total match");
+
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "dup keys drop begin");
+    CHECK(mdb_drop(txn, dbi, 0), "dup keys drop");
+    CHECK(mdb_txn_commit(txn), "dup keys drop commit");
     mdb_dbi_close(env, dbi);
 }
 
@@ -3786,6 +3985,7 @@ main(void)
     test_range_outside_bounds(env);
     test_custom_comparator(env);
     test_range_count_values(env);
+    test_range_count_keys_dupsort(env);
     test_range_count_values_raw(env);
     test_range_count_values_many_env();
     test_count_all_plain(env);

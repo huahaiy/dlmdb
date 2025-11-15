@@ -15786,6 +15786,120 @@ mdb_count_range(MDB_txn *txn, MDB_dbi dbi,
 }
 
 static int
+mdb_range_count_keys_dupsort(MDB_txn *txn, MDB_dbi dbi, MDB_cmp_func *key_cmp,
+	const MDB_val *key_low, const MDB_val *key_high,
+	int lower_incl, int upper_incl, uint64_t *out)
+{
+	MDB_cursor mc = {0};
+	MDB_xcursor mx = {0};
+	MDB_val work_key = {0};
+	MDB_val work_data = {0};
+	uint64_t total = 0;
+	int rc;
+
+	if (!out || !key_cmp)
+		return EINVAL;
+
+	mdb_cursor_init(&mc, txn, dbi, &mx);
+
+	if (key_low) {
+		work_key = *key_low;
+		rc = mdb_cursor_get(&mc, &work_key, &work_data, MDB_SET_RANGE);
+	} else {
+		rc = mdb_cursor_get(&mc, &work_key, &work_data, MDB_FIRST);
+	}
+	if (rc == MDB_NOTFOUND) {
+		*out = 0;
+		rc = MDB_SUCCESS;
+		goto done;
+	}
+	if (rc != MDB_SUCCESS)
+		goto done;
+
+	if (key_low && !lower_incl) {
+		int cmp = key_cmp(&work_key, (MDB_val *)key_low);
+		while (cmp == 0) {
+			rc = mdb_cursor_get(&mc, &work_key, &work_data, MDB_NEXT_NODUP);
+			if (rc == MDB_NOTFOUND) {
+				*out = 0;
+				rc = MDB_SUCCESS;
+				goto done;
+			}
+			if (rc != MDB_SUCCESS)
+				goto done;
+			cmp = key_cmp(&work_key, (MDB_val *)key_low);
+		}
+	}
+
+	for (;;) {
+		if (key_high) {
+			int cmp = key_cmp(&work_key, (MDB_val *)key_high);
+			if (cmp > 0 || (cmp == 0 && !upper_incl))
+				break;
+		}
+		total++;
+		rc = mdb_cursor_get(&mc, &work_key, &work_data, MDB_NEXT_NODUP);
+		if (rc == MDB_NOTFOUND)
+			break;
+		if (rc != MDB_SUCCESS)
+			goto done;
+	}
+
+	*out = total;
+	rc = MDB_SUCCESS;
+
+done:
+	mdb_cursor_leaf_cache_clear(&mc.mc_leaf_cache);
+	MDB_CURSOR_UNREF(&mc, 1);
+	return rc;
+}
+
+int ESECT
+mdb_range_count_keys(MDB_txn *txn, MDB_dbi dbi,
+	const MDB_val *key_low, const MDB_val *key_high,
+	unsigned flags, uint64_t *out)
+{
+	MDB_db *db;
+	MDB_cmp_func *key_cmp;
+	int lower_incl = (flags & MDB_COUNT_LOWER_INCL) != 0;
+	int upper_incl = (flags & MDB_COUNT_UPPER_INCL) != 0;
+
+	if (!out || !TXN_DBI_EXIST(txn, dbi, DB_VALID))
+		return EINVAL;
+	if (txn->mt_flags & MDB_TXN_BLOCKED)
+		return MDB_BAD_TXN;
+	if (flags & ~MDB_COUNT_ALLOWED_FLAGS)
+		return EINVAL;
+
+	db = &txn->mt_dbs[dbi];
+	if (!(db->md_flags & MDB_COUNTED))
+		return MDB_INCOMPATIBLE;
+
+	if (!db->md_entries) {
+		*out = 0;
+		return MDB_SUCCESS;
+	}
+
+	key_cmp = txn->mt_dbxs[dbi].md_cmp;
+	if (!key_cmp)
+		return MDB_PROBLEM;
+
+	if (key_low && key_high) {
+		int cmp = key_cmp((MDB_val *)key_low, (MDB_val *)key_high);
+		if (cmp > 0 || (cmp == 0 && !(lower_incl && upper_incl))) {
+			*out = 0;
+			return MDB_SUCCESS;
+		}
+	}
+
+	if (!(db->md_flags & MDB_DUPSORT))
+		return mdb_count_range(txn, dbi, key_low, key_high, flags, out);
+
+	return mdb_range_count_keys_dupsort(txn, dbi, key_cmp,
+	    key_low, key_high, lower_incl, upper_incl, out);
+}
+
+static int
 mdb_count_values_until(MDB_txn *txn, MDB_dbi dbi, MDB_cmp_func *key_cmp,
 	const MDB_val *limit_key, int inclusive, uint64_t *out)
 {

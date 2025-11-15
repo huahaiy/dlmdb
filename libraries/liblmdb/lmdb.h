@@ -1213,6 +1213,23 @@ int mdb_dbi_flags(MDB_txn *txn, MDB_dbi dbi, unsigned int *flags);
 int mdb_count_all(MDB_txn *txn, MDB_dbi dbi, unsigned flags, uint64_t *out);
 int mdb_count_range(MDB_txn *txn, MDB_dbi dbi,
 	const MDB_val *low, const MDB_val *high, unsigned flags, uint64_t *out);
+/** @brief Return the number of distinct keys within a key range.
+ *
+ * Works with DBIs opened with #MDB_COUNTED. For dupsort databases only unique
+ * keys are counted regardless of how many duplicate values are present. For
+ * plain databases the result matches #mdb_count_range().
+ *
+ * @param[in] txn A transaction handle returned by #mdb_txn_begin()
+ * @param[in] dbi A database handle returned by #mdb_dbi_open()
+ * @param[in] key_low Optional inclusive or exclusive lower bound key
+ * @param[in] key_high Optional inclusive or exclusive upper bound key
+ * @param[in] flags Bitmask composed of #MDB_COUNT_LOWER_INCL and/or
+ * 	#MDB_COUNT_UPPER_INCL
+ * @param[out] out Destination for the resulting count of distinct keys
+ */
+int mdb_range_count_keys(MDB_txn *txn, MDB_dbi dbi,
+	const MDB_val *key_low, const MDB_val *key_high,
+	unsigned flags, uint64_t *out);
 int mdb_range_count_values(MDB_txn *txn, MDB_dbi dbi,
 	const MDB_val *key_low, const MDB_val *key_high, unsigned key_flags,
 	uint64_t *out);
