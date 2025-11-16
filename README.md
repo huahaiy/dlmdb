@@ -64,18 +64,22 @@ not want to leave the cursor's current position.
 ## Range Counting API
 
 Counting records without walking the entire tree is more efficient than counting
-while materializing the data. DLMDB exposes three helpers that are backed by the
+while materializing the data. DLMDB exposes four helpers that are backed by the
 same counted-branch metadata used for the rank APIs:
 
 * `mdb_count_all(txn, dbi, flags, &total)` – Returns the total number of
   key/value pairs in a counted database. Works for both plain and dupsort DBIs.
 * `mdb_count_range(txn, dbi, &low, &high, flags, &total)` – Counts entries with
   keys between two bounds. Flags let you toggle inclusive/exclusive endpoints.
+* `mdb_range_count_keys(txn, dbi, &key_low, &key_high, flags, &total)` – Counts
+  only distinct keys between optional bounds. On dupsort DBIs this ignores the
+  number of duplicate values and accepts `MDB_COUNT_{LOWER,UPPER}_INCL` flags to
+  control whether each boundary participates.
 * `mdb_range_count_values(txn, dbi, &key_low, &key_high, key_flags, &total)` –
   Specialised for dupsort data: it counts individual values across a key range,
   honouring duplicate ordering.
 
-All three execute in logarithmic time by traversing the B+tree once to the
+All four execute in logarithmic time by traversing the B+tree once to the
 relevant boundary nodes and aggregating the precomputed subtree counts stored on
 each branch page.
 
