@@ -44,13 +44,16 @@ search from the current position, which speeds up sparse sampling.
 ### Finding the rank of an existing key
 
 `mdb_get_key_rank` and `mdb_cursor_key_rank` provide the inverse operation. They
-return the zero-based rank of a key/value pair.
+return the zero-based rank of a key/value pair. These helpers work for both
+plain and dupsort DBIs opened with `MDB_COUNTED`: passing a NULL `data` on a
+dupsort DB returns the rank of the first duplicate for that key, while passing
+`data` counts through the duplicate run up to (and including) that value.
 
 ```c
 MDB_val key = {strlen("alpha"), "alpha"};
 uint64_t rank = 0;
 /* Plain database: `data` parameter may be NULL */
-int rc = mdb_get_key_rank(txn, plain_counted_dbi, &key, NULL, &rank**;
+int rc = mdb_get_key_rank(txn, plain_counted_dbi, &key, NULL, &rank);
 
 /* DUPSORT database: */
 MDB_val dup = {strlen("payload-005"), "payload-005"};
