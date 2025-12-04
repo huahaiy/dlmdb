@@ -32,6 +32,15 @@
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
+#if defined(_MSC_VER)
+/* Suppress warnings for MSVC */
+#pragma warning(disable: 4244) /* conversion from 'type1' to 'type2', possible loss of data */
+#pragma warning(disable: 4267) /* conversion from 'size_t' to 'type', possible loss of data */
+#pragma warning(disable: 4018) /* signed/unsigned mismatch */
+#pragma warning(disable: 4996) /* deprecated function */
+#pragma warning(disable: 4102) /* unreferenced label */
+#endif
+
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE 1
 #endif
@@ -743,7 +752,7 @@ static txnid_t mdb_debug_start;
 #define EVEN(n)		(((n) + 1U) & -2) /* sign-extending -2 to match n+1U */
 
 	/** Least significant 1-bit of \b n.  n must be of an unsigned type. */
-#define LOW_BIT(n)		((n) & (-(n)))
+#define LOW_BIT(n)		((n) & (~(n) + 1))
 
 	/** (log2(\b p2) % \b n), for p2 = power of 2 and 0 < n < 8. */
 #define LOG2_MOD(p2, n)	(7 - 86 / ((p2) % ((1U<<(n))-1) + 11))
@@ -4850,13 +4859,12 @@ char *
 mdb_strerror(int err)
 {
 #ifdef _WIN32
-	/** HACK: pad 4KB on stack over the buf. Return system msgs in buf.
-	 *	This works as long as no function between the call to mdb_strerror
-	 *	and the actual use of the message uses more than 4K of stack.
+	/** Use Thread Local Storage for the buffer to avoid returning a stack pointer.
 	 */
 #define MSGSIZE	1024
 #define PADSIZE	4096
-	char buf[MSGSIZE+PADSIZE], *ptr = buf;
+	static __declspec(thread) char buf[MSGSIZE+PADSIZE];
+	char *ptr = buf;
 #endif
 	int i;
 	if (!err)
