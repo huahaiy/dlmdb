@@ -39,6 +39,8 @@
 #pragma warning(disable: 4018) /* signed/unsigned mismatch */
 #pragma warning(disable: 4996) /* deprecated function */
 #pragma warning(disable: 4102) /* unreferenced label */
+#pragma warning(disable: 4146) /* unary minus operator applied to unsigned type */
+#pragma warning(disable: 4333) /* right shift by too large amount */
 #endif
 
 #ifndef _GNU_SOURCE
@@ -752,7 +754,7 @@ static txnid_t mdb_debug_start;
 #define EVEN(n)		(((n) + 1U) & -2) /* sign-extending -2 to match n+1U */
 
 	/** Least significant 1-bit of \b n.  n must be of an unsigned type. */
-#define LOW_BIT(n)		((n) & (~(n) + 1))
+#define LOW_BIT(n)		((n) & (-(n)))
 
 	/** (log2(\b p2) % \b n), for p2 = power of 2 and 0 < n < 8. */
 #define LOG2_MOD(p2, n)	(7 - 86 / ((p2) % ((1U<<(n))-1) + 11))
@@ -761,8 +763,12 @@ static txnid_t mdb_debug_start;
 	 */
 
 	/** Should be alignment of \b type. Ensure it is a power of 2. */
+#if defined(_MSC_VER)
+#define ALIGNOF2(type) __alignof(type)
+#else
 #define ALIGNOF2(type) \
 	LOW_BIT(offsetof(struct { char ch_; type align_; }, align_))
+#endif
 
 	/**	Used for offsets within a single page.
 	 *	Since memory pages are typically 4 or 8KB in size, 12-13 bits,

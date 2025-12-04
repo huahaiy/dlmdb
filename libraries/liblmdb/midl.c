@@ -16,6 +16,12 @@
  * <http://www.OpenLDAP.org/license.html>.
  */
 
+#if defined(_MSC_VER)
+/* Suppress warnings for MSVC */
+#pragma warning(disable: 4267) /* conversion from 'size_t' to 'type', possible loss of data */
+#pragma warning(disable: 4018) /* signed/unsigned mismatch */
+#endif
+
 #include <limits.h>
 #include <string.h>
 #include <stdlib.h>
