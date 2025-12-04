@@ -275,6 +275,14 @@ union semun {
 #define CALL_CONV
 #endif
 
+#ifdef __GNUC__
+#define MDB_ALIGNED(n) __attribute__((aligned(n)))
+#elif defined(_MSC_VER)
+#define MDB_ALIGNED(n) __declspec(align(n))
+#else
+#define MDB_ALIGNED(n)
+#endif
+
 /** @defgroup internal	LMDB Internals
  *	@{
  */
@@ -1037,7 +1045,7 @@ typedef struct MDB_page {
 		uint32_t	pb_pages;	/**< number of overflow pages */
 	} mp_pb;
 	indx_t		mp_ptrs[0];		/**< dynamic size */
-} MDB_page __attribute__((aligned(1)));
+} MDB_page MDB_ALIGNED(1);
 
 /** Alternate page header, for 2-byte aligned access */
 typedef struct MDB_page2 {
