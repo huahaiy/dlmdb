@@ -277,8 +277,6 @@ union semun {
 
 #ifdef __GNUC__
 #define MDB_ALIGNED(n) __attribute__((aligned(n)))
-#elif defined(_MSC_VER)
-#define MDB_ALIGNED(n) __declspec(align(n))
 #else
 #define MDB_ALIGNED(n)
 #endif
