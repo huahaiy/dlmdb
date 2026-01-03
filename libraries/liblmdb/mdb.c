@@ -52,6 +52,7 @@
 #ifdef _WIN32
 #include <malloc.h>
 #include <windows.h>
+#include <signal.h>
 #include <wchar.h>				/* get wcscpy() */
 
 /* We use native NT APIs to setup the memory map, so that we can
@@ -2291,9 +2292,22 @@ struct MDB_env {
 #define MDB_ERPAGE_MAX	(MDB_ERPAGE_SIZE-1)
 	unsigned int me_rpcheck;
 #endif
+	volatile sig_atomic_t me_interrupt; /**< interrupt requested */
 	void		*me_userctx;	 /**< User-settable context */
 	MDB_assert_func *me_assert_func; /**< Callback for assertion failures */
 };
+
+static int
+mdb_txn_check_interrupt(MDB_txn *txn)
+{
+	if (!txn)
+		return MDB_BAD_TXN;
+	if (txn->mt_env->me_interrupt) {
+		mdb_txn_mark_error(txn, EINTR);
+		return EINTR;
+	}
+	return MDB_SUCCESS;
+}
 
 	/** Nested transaction */
 typedef struct MDB_ntxn {
@@ -9965,10 +9979,18 @@ done:
 static int
 mdb_page_search_root(MDB_cursor *mc, MDB_val *key, int flags)
 {
-	MDB_page	*mp = mc->mc_pg[mc->mc_top];
+	MDB_page	*mp;
 	int rc;
 	DKBUF;
 
+	if (mc->mc_txn->mt_flags & MDB_TXN_BLOCKED)
+		return MDB_BAD_TXN;
+
+	rc = mdb_txn_check_interrupt(mc->mc_txn);
+	if (rc)
+		return rc;
+
+	mp = mc->mc_pg[mc->mc_top];
 	while (IS_BRANCH(mp)) {
 		MDB_node	*node;
 		indx_t		i;
@@ -10049,10 +10071,19 @@ ready:
 static int
 mdb_page_search_lowest(MDB_cursor *mc)
 {
-	MDB_page	*mp = mc->mc_pg[mc->mc_top];
-	MDB_node	*node = NODEPTR(mp, 0);
+	MDB_page	*mp;
+	MDB_node	*node;
 	int rc;
 
+	if (mc->mc_txn->mt_flags & MDB_TXN_BLOCKED)
+		return MDB_BAD_TXN;
+
+	rc = mdb_txn_check_interrupt(mc->mc_txn);
+	if (rc)
+		return rc;
+
+	mp = mc->mc_pg[mc->mc_top];
+	node = NODEPTR(mp, 0);
 	if ((rc = mdb_page_get(mc, NODEPGNO(node), &mp, NULL)) != 0)
 		return rc;
 
@@ -10085,46 +10116,50 @@ mdb_page_search(MDB_cursor *mc, MDB_val *key, int flags)
 	if (mc->mc_txn->mt_flags & MDB_TXN_BLOCKED) {
 		DPUTS("transaction may not be used now");
 		return MDB_BAD_TXN;
-	} else {
-		/* Make sure we're using an up-to-date root */
-		if (*mc->mc_dbflag & DB_STALE) {
-					MDB_cursor mc2 = (MDB_cursor){0};
-				if (TXN_DBI_CHANGED(mc->mc_txn, mc->mc_dbi))
+	}
+
+	rc = mdb_txn_check_interrupt(mc->mc_txn);
+	if (rc)
+		return rc;
+
+	/* Make sure we're using an up-to-date root */
+	if (*mc->mc_dbflag & DB_STALE) {
+				MDB_cursor mc2 = (MDB_cursor){0};
+			if (TXN_DBI_CHANGED(mc->mc_txn, mc->mc_dbi))
+				return MDB_BAD_DBI;
+			mdb_cursor_init(&mc2, mc->mc_txn, MAIN_DBI, NULL);
+			rc = mdb_page_search(&mc2, &mc->mc_dbx->md_name, 0);
+			if (rc)
+				return rc;
+			{
+				MDB_val data;
+				int exact = 0;
+				uint16_t flags;
+				MDB_node *leaf = mdb_node_search(&mc2,
+					&mc->mc_dbx->md_name, &exact);
+				if (!exact)
 					return MDB_BAD_DBI;
-				mdb_cursor_init(&mc2, mc->mc_txn, MAIN_DBI, NULL);
-				rc = mdb_page_search(&mc2, &mc->mc_dbx->md_name, 0);
+				if ((leaf->mn_flags & (F_DUPDATA|F_SUBDATA)) != F_SUBDATA)
+					return MDB_INCOMPATIBLE; /* not a named DB */
+				rc = mdb_node_read(&mc2, leaf, &data);
 				if (rc)
 					return rc;
-				{
-					MDB_val data;
-					int exact = 0;
-					uint16_t flags;
-					MDB_node *leaf = mdb_node_search(&mc2,
-						&mc->mc_dbx->md_name, &exact);
-					if (!exact)
-						return MDB_BAD_DBI;
-					if ((leaf->mn_flags & (F_DUPDATA|F_SUBDATA)) != F_SUBDATA)
-						return MDB_INCOMPATIBLE; /* not a named DB */
-					rc = mdb_node_read(&mc2, leaf, &data);
-					if (rc)
-						return rc;
-					memcpy(&flags, ((char *) data.mv_data + offsetof(MDB_db, md_flags)),
-						sizeof(uint16_t));
-					/* The txn may not know this DBI, or another process may
-					 * have dropped and recreated the DB with other flags.
-					 */
-					if ((mc->mc_db->md_flags & PERSISTENT_FLAGS) != flags)
-						return MDB_INCOMPATIBLE;
-					memcpy(mc->mc_db, data.mv_data, sizeof(MDB_db));
-				}
-				*mc->mc_dbflag &= ~DB_STALE;
-		}
-		root = mc->mc_db->md_root;
+				memcpy(&flags, ((char *) data.mv_data + offsetof(MDB_db, md_flags)),
+					sizeof(uint16_t));
+				/* The txn may not know this DBI, or another process may
+				 * have dropped and recreated the DB with other flags.
+				 */
+				if ((mc->mc_db->md_flags & PERSISTENT_FLAGS) != flags)
+					return MDB_INCOMPATIBLE;
+				memcpy(mc->mc_db, data.mv_data, sizeof(MDB_db));
+			}
+			*mc->mc_dbflag &= ~DB_STALE;
+	}
+	root = mc->mc_db->md_root;
 
-		if (root == P_INVALID) {		/* Tree is empty. */
-			DPUTS("tree is empty");
-			return MDB_NOTFOUND;
-		}
+	if (root == P_INVALID) {		/* Tree is empty. */
+		DPUTS("tree is empty");
+		return MDB_NOTFOUND;
 	}
 
 	mdb_cassert(mc, root > 1);
@@ -10953,6 +10988,10 @@ mdb_cursor_get(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 	if (mc->mc_txn->mt_flags & MDB_TXN_BLOCKED)
 		return MDB_BAD_TXN;
 
+	rc = mdb_txn_check_interrupt(mc->mc_txn);
+	if (rc)
+		return rc;
+
 	if (op != MDB_GET_CURRENT)
 		mdb_cursor_rank_invalidate(mc);
 
@@ -11223,6 +11262,10 @@ _mdb_cursor_put(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 			return mc->mc_txn->mt_last_err;
 		return MDB_BAD_TXN;
 	}
+
+	rc = mdb_txn_check_interrupt(mc->mc_txn);
+	if (rc)
+		return rc;
 
 	if (key->mv_size-1 >= ENV_MAXKEY(env))
 		return MDB_BAD_VALSIZE;
@@ -15065,6 +15108,10 @@ mdb_env_cwalk(mdb_copy *my, pgno_t *pg, int flags)
 
 	toggle = my->mc_toggle;
 	while (mc.mc_snum > 0) {
+		if (my->mc_env->me_interrupt) {
+			rc = EINTR;
+			goto done;
+		}
 		unsigned n;
 		mp = mc.mc_pg[mc.mc_top];
 		n = NUMKEYS(mp);
@@ -15472,6 +15519,15 @@ mdb_env_get_flags(MDB_env *env, unsigned int *arg)
 		return EINVAL;
 
 	*arg = env->me_flags & (CHANGEABLE|CHANGELESS);
+	return MDB_SUCCESS;
+}
+
+int ESECT
+mdb_env_set_interrupt(MDB_env *env, int onoff)
+{
+	if (!env)
+		return EINVAL;
+	env->me_interrupt = onoff ? 1 : 0;
 	return MDB_SUCCESS;
 }
 

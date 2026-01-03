@@ -1,7 +1,7 @@
 # DLMDB
 
-This is the backing key value (KV) storage engine of
-[Datalevin](https://github.com/juji-io/datalevin) database, a simple, fast and
+This is the backing key-value (KV) storage engine of
+[Datalevin](https://github.com/juji-io/datalevin) database: a simple, fast and
 versatile Datalog database. Based on a fork of the esteemed
 [LMDB](https://www.symas.com/mdb), this KV engine supports these additional
 features:
@@ -13,6 +13,7 @@ features:
   - Efficient range count.
 * Prefix compression.
 * DUPSORT iteration optimization.
+* More robust interrupt handling.
 
 These features are critical for Datalevin's high performance: the order
 statistics facilitate query planning; prefix compression couples
@@ -138,7 +139,7 @@ two to three orders of magnitude acceleration for range counts and rank lookups.
 ### Sparse sampling
 
 `sample_bench` focuses on the sampling workload: reading a tiny subset of
-entries (e.g. 1 000 ranks out of 10 000 000) without materializing the skipped
+entries (e.g. 1000 ranks out of 10000000) without materializing the skipped
 span. It builds a counted database (plain or dupsort) and compares two
 strategies:
 
@@ -147,7 +148,7 @@ strategies:
 * **Stride scan (MDB_NEXT)** – a baseline that seeds the cursor once and then
   advances via `MDB_NEXT` for every skipped record, i.e. a traditional cursor walk.
 
-Example runs on a single SSD-backed workstation (stride of 10 000, 1 000 samples):
+Example runs on a single SSD-backed workstation (stride of 10000, 1000 samples):
 
 ```
 ./sample_bench --entries 10000000 --samples 1000 --batch 250000 --mode both \
@@ -310,3 +311,24 @@ MDB_NEXT_DUP loop:   34.006 ms (0.340 us/key, 17.003 ns/value)
 By keeping duplicate iteration inside the cache and avoiding repeated cursor
 jumps, `mdb_cursor_list_dup` cuts the inner-loop cost roughly in half for common
 key/dups iteration.
+
+## Interrupt handling
+
+Long-running reads can be interrupted safely by setting an environment flag.
+Call `mdb_env_set_interrupt(env, 1)` from a signal handler (e.g. SIGINT), and
+in-flight operations will return `EINTR` and mark the active transaction as
+failed. Abort/reset the transaction and clear the flag with
+`mdb_env_set_interrupt(env, 0)` before retrying work.
+
+```c
+static volatile sig_atomic_t got_sigint;
+static MDB_env *sig_env;
+
+static void on_sigint(int sig)
+{
+    (void)sig;
+    got_sigint = 1;
+    if (sig_env)
+        mdb_env_set_interrupt(sig_env, 1);
+}
+```

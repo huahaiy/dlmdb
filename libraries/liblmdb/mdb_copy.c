@@ -22,9 +22,16 @@
 #include <signal.h>
 #include "lmdb.h"
 
+static volatile sig_atomic_t gotsig;
+static volatile MDB_env *sig_env;
+
 static void
 sighandle(int sig)
 {
+	(void)sig;
+	gotsig = 1;
+	if (sig_env)
+		mdb_env_set_interrupt((MDB_env *)sig_env, 1);
 }
 
 int main(int argc,char * argv[])
@@ -66,6 +73,9 @@ int main(int argc,char * argv[])
 	act = "opening environment";
 	rc = mdb_env_create(&env);
 	if (rc == MDB_SUCCESS) {
+		sig_env = env;
+		if (gotsig)
+			mdb_env_set_interrupt(env, 1);
 		rc = mdb_env_open(env, argv[1], flags, 0600);
 	}
 	if (rc == MDB_SUCCESS) {
@@ -78,6 +88,7 @@ int main(int argc,char * argv[])
 	if (rc)
 		fprintf(stderr, "%s: %s failed, error %d (%s)\n",
 			progname, act, rc, mdb_strerror(rc));
+	sig_env = NULL;
 	mdb_env_close(env);
 
 	return rc ? EXIT_FAILURE : EXIT_SUCCESS;

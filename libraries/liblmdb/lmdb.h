@@ -970,6 +970,17 @@ int  mdb_env_set_userctx(MDB_env *env, void *ctx);
 	 */
 void *mdb_env_get_userctx(MDB_env *env);
 
+	/** @brief Set or clear an interrupt flag on the environment.
+	 *
+	 * When set, operations return EINTR and mark the active transaction
+	 * as failed. This function only updates a flag and is safe to call
+	 * from a signal handler.
+	 * @param[in] env An environment handle returned by #mdb_env_create()
+	 * @param[in] onoff Non-zero to set the interrupt flag, zero to clear it.
+	 * @return A non-zero error value on failure and 0 on success.
+	 */
+int  mdb_env_set_interrupt(MDB_env *env, int onoff);
+
 	/** @brief A callback function for most LMDB assert() failures,
 	 * called before printing the message and aborting.
 	 *
